@@ -3,42 +3,25 @@
 Clean Room — Privileged
 
 `asterctl` is a command-line utility for introspecting and controlling Aster
-nodes through a running `aster-agent`. Commands are added iteratively;
-currently it provides `status`, `publish`, `query`, and `subscribe`.
+nodes through a running `aster-agent`. 
 
-`status` calls `GetStatus` once, prints the response, and exits. It is the
-default command when no command name is supplied. `publish` calls `PublishEvent`
-once and prints its publication receipt. `query` reads matching Events,
-continuing RPC requests automatically until complete or the output limit is reached.
-`subscribe` calls `CreateEventSubscription` once, prints the subscription ID,
-and exits.
+Currently it provides `status`, `publish`, `query`, and `subscribe`.
+
+See man page for usage details
 
 ## Build and run
 
 ```sh
 cargo build --locked -p asterctl
 ./target/debug/asterctl --help
-./target/debug/asterctl --token-file /path/to/client.token status
-./target/debug/asterctl --token-file /path/to/client.token
-./target/debug/asterctl -t '<token>' -j
 man -l crates/asterctl/asterctl.1
-man -l crates/asterctl/asterctl-publish.1
-man -l crates/asterctl/asterctl-query.1
-man -l crates/asterctl/asterctl-subscribe.1
 ```
-
-Debian packages built from this source include `/usr/bin/asterctl` and the
-`asterctl(1)`, `asterctl-publish(1)`, `asterctl-query(1)`, and
-`asterctl-subscribe(1)` manuals on amd64 and arm64. Read them with
-`man asterctl`, `man asterctl-publish`, `man asterctl-query`, or
-`man asterctl-subscribe`. The Linux x86_64 bundle includes the binary, its SBOM,
-and all four manuals (read with `man -l ./asterctl.1`, for example).
-These build definitions do not establish Raspberry Pi or package qualification.
 
 ## Verification
 
 Run the CLI unit and process regressions with `cargo test --locked -p asterctl`.
-For a real-process compatibility smoke against the checked-in agent, run:
+
+For a compatibility smoke against the checked-in agent, run:
 
 ```sh
 cargo build --locked -p asterctl -p aster-agent \

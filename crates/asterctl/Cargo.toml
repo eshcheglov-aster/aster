@@ -1,6 +1,6 @@
 [package]
 name = "asterctl"
-description = "Command-line utility for introspecting and controlling Aster nodes"
+description = "CLI utility for introspecting and controlling Aster nodes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

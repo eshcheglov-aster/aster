@@ -221,32 +221,6 @@ provisioning, or the customer supervisor.
 
 ## Authenticate application calls
 
-Use [`asterctl`](../../crates/asterctl/README.md) for command-line introspection
-and control of Aster nodes. It provides `status` (the default command),
-`publish`, `query`, and `subscribe`. Exactly one of `--token` or `--token-file`
-is required:
-
-```sh
-asterctl --token-file /path/to/client.token status
-asterctl --token-file /path/to/client.token --json
-asterctl --token-file /path/to/client.token publish \
-  --topic chat.events --scope mission/team/alpha \
-  --operation-key auto "Hello, Aster!"
-asterctl --token-file /path/to/client.token query \
-  --topic chat.events --scope 'mission/team/*' --limit 100
-asterctl --token-file /path/to/client.token subscribe \
-  --scope 'mission/team/*' --operation-key=auto chat.events
-```
-
-Both mutating commands require `--operation-key KEY|auto`. With `auto`, the
-CLI writes and flushes the generated key to stderr before sending the RPC.
-JSON results also contain the actual key in `operation_key`, including when
-a subscription already exists (exit code `0`, with `inserted: false`).
-If an operation's outcome is unknown, repeat the identical request with that
-key; selecting `auto` again generates a new key. For automation, save an
-explicit key and the request before invoking the CLI. See
-[operation keys and manual recovery](../../crates/asterctl/README.md#operation-keys-and-manual-recovery).
-
 Rust callers can use the [compile-checked API examples](../../crates/aster-agent/README.md)
 for authenticated Connect and gRPC clients, borrowed and owned responses, and
 the development/migration server entry point. Enable the `aster-agent` `client`
