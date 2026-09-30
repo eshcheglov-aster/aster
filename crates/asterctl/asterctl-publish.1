@@ -1,0 +1,151 @@
+.\" Copyright 2026 Defense Unicorns, Inc.
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Clean Room — Privileged
+.TH ASTERCTL-PUBLISH 1 "2026-09-28" "Aster" "User Commands"
+.SH NAME
+asterctl-publish \- publish an Event to Aster
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B publish
+.BI \-\-topic " TOPIC"
+.BI \-\-scope " SCOPE"
+.BI \-\-operation\-key " KEY|auto"
+.RI [ PUBLISH-OPTIONS ]
+.RI [ MSG ]
+.YS
+.SH DESCRIPTION
+.B asterctl publish
+publishes an Event to the Aster system through a running Aster agent.
+.PP
+If
+.I MSG
+is supplied, use it as the payload.
+Otherwise, read the payload from standard input until EOF.
+When standard input is a terminal, instructions are printed to stderr before
+reading. Press Ctrl-D on an empty line to send, or Ctrl-C to cancel.
+No input instructions are printed for a pipe, an explicit MSG, or a tombstone.
+.PP
+The agent assigns the Event ID, publisher identity, and sequence numbers.
+.PP
+The payload may contain text, JSON, or arbitrary binary data.
+The agent limits the complete publication request to 1 MiB.
+.PP
+Exactly one of
+.B \-\-token
+or
+.B \-\-token\-file
+is required; see
+.BR asterctl (1).
+.SH OPTIONS
+.TP
+.BI \-\-topic " TOPIC"
+Required. Select the Event topic, for example chat.events.
+.IP
+Must contain 1\(en128 ASCII characters: letters, digits, periods,
+underscores, or hyphens.
+.IP
+The target node must be authorized to publish to this topic
+within the selected scope.
+.TP
+.BI \-\-scope " SCOPE"
+Required. Select the propagation and authorization scope.
+.IP
+Must contain 1\(en128 ASCII characters. Permitted characters are letters,
+digits, periods, underscores, hyphens, and slashes separating path segments.
+.IP
+Leading or trailing slashes, empty segments, and segments consisting of
+"." or ".." are not allowed.
+.IP
+Example: mission-1/team/alpha_2.
+.TP
+.BI \-\-priority " PRIORITY"
+Set the Event priority for scheduling and storage policy.
+.IP
+Values, from lowest to highest: routine, priority, immediate, flash.
+.IP
+Default: routine.
+.TP
+.BI \-\-logical\-key " KEY"
+Associate the Event with a UTF-8 text key.
+.IP
+Events may share a logical key. Publishing another Event with the same key
+does not replace earlier Events.
+.IP
+Maximum: 4096 bytes. Default: empty.
+.TP
+.BI \-\-predecessor " ID"
+Declare a causal dependency on another Event on the target node.
+The predecessor may belong to another topic.
+.IP
+ID is a Base64-encoded 32-byte Event ID.
+.IP
+Default: none.
+.TP
+.BI \-\-ttl\-ms " MILLISECONDS"
+Set the Event lifetime in milliseconds.
+.IP
+Must be a positive unsigned 64-bit integer. Zero is invalid.
+The lifetime does not restart when the Event is forwarded.
+.IP
+After expiry, the Event is withheld from queries, delivery, and forwarding.
+Storage maintenance subsequently removes its content.
+.IP
+Default: no expiry.
+.TP
+.B \-\-tombstone
+Publish an Event marked as a tombstone.
+.IP
+Requires an empty payload and cannot be combined with
+.BR \-\-ttl\-ms .
+.IP
+Default: false.
+.TP
+.BI \-\-operation\-key " KEY|auto"
+Use a UTF-8 key of 1\(en256 bytes, or
+.B auto
+to generate a new key.
+.IP
+For retries, use the actual key from the previous attempt and the same
+payload and publication parameters.
+.SH OUTPUT
+Prints the publication receipt to stdout.
+With \-\-json, the receipt also includes
+.BR operation_key .
+.PP
+Generated operation keys are also printed to stderr before sending the request.
+.SH EXIT STATUS
+.TP
+.B 0
+Publication succeeded, including an idempotent retry.
+.TP
+.B 1
+Command failed or the operation's outcome is unknown.
+.TP
+.B 2
+Invalid or missing arguments.
+.SH EXAMPLES
+Publish text:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token publish \e
+    \-\-topic chat.events \e
+    \-\-scope mission/team/alpha \e
+    \-\-operation\-key auto \e
+    "Hello, Aster!"
+.RE
+.fi
+.PP
+Publish a file:
+.PP
+.nf
+.RS
+cat "file.json" | asterctl \-\-token\-file ./client.token publish \e
+    \-\-topic chat.events \e
+    \-\-scope mission/team/alpha \e
+    \-\-operation\-key file-001
+.RE
+.fi
+.SH SEE ALSO
+.BR asterctl (1)

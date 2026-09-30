@@ -1,0 +1,138 @@
+.\" Copyright 2026 Defense Unicorns, Inc.
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Clean Room — Privileged
+.TH ASTERCTL 1 "2026-09-28" "Aster" "User Commands"
+.SH NAME
+asterctl \- introspect and control Aster nodes
+.SH SYNOPSIS
+.SY asterctl
+.RI [ OPTIONS ]
+.RB ( \-\-token
+.I TOKEN
+|
+.B \-\-token\-file
+.IR PATH )
+.RI [ COMMAND
+.RI [ COMMAND-OPTIONS ]]
+.YS
+.SY asterctl
+.B \-\-help
+.YS
+.SH DESCRIPTION
+.B asterctl
+is a command-line utility for introspecting and controlling Aster nodes.
+It communicates with a running
+.B aster-agent
+over RPC.
+.PP
+If
+.I COMMAND
+is omitted,
+.B status
+is used.
+.PP
+To run a command, exactly one of
+.B \-\-token
+or
+.B \-\-token\-file
+must be supplied.
+These options are mutually exclusive.
+No token is required for
+.BR \-\-help .
+.SH COMMANDS
+.TP
+.B status
+Display node status.
+The default text output groups node, peer, storage, publication operation, and
+delivery information with readable states, sizes, and durations.
+Use
+.B \-\-json
+for ProtoJSON output with exact RPC values.
+.TP
+.B publish
+Publish an Event. See
+.BR asterctl-publish (1)
+for payload input and publication options.
+.TP
+.B query
+Query stored Events. See
+.BR asterctl-query (1)
+for filtering and output limits.
+.TP
+.BI subscribe " TOPIC"
+Create a persistent Event subscription and print its ID. See
+.BR asterctl-subscribe (1)
+for subscription options.
+.SH OPTION SYNTAX
+Long options with values accept both
+.B \-\-name value
+and
+.BR \-\-name=value .
+Short options with values require a separate argument, for example
+.BR "\-p 8181" .
+Flags such as \-\-json, \-\-help, and \-\-tombstone take no value.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-j ", " \-\-json
+When supported by the command, print the response in JSON format.
+.TP
+.BR \-h ", " "\-\-host IP"
+Connect to the agent at the specified IPv4 or IPv6 address.
+Default: 127.0.0.1.
+.TP
+.BR \-p ", " "\-\-port PORT"
+Connect to the specified RPC port.
+Default: 8181.
+.TP
+.BI \-\-timeout " SECONDS"
+Set the client timeout for each RPC to an integer from 1 to 86400 seconds.
+Default: 10 seconds. Each query page gets its own deadline.
+The agent may enforce a shorter deadline; the current aster-agent caps each
+RPC at 30 seconds, even when the client requests more.
+This does not limit time spent reading a publication payload from stdin.
+.TP
+.B \-\-help
+Display usage information and exit.
+.TP
+.BR \-t ", " "\-\-token TOKEN"
+Use TOKEN to authenticate with the agent.
+Either this option or
+.B \-\-token\-file
+is required to run a command; they cannot be used together.
+.IP
+Command-line tokens may be visible in process listings or saved in shell
+history.
+Consider using
+.BR \-\-token\-file .
+.TP
+.BI \-\-token\-file " PATH"
+Read the API token from PATH.
+Either this option or
+.B \-\-token
+is required to run a command; they cannot be used together.
+.SH OPERATION KEYS
+Both publish and subscribe require
+.BR "\-\-operation\-key KEY|auto" .
+Use an explicit key or auto to generate one.
+For retries, use the actual key from the previous attempt and the same request.
+.SH OUTPUT
+Results go to stdout. Diagnostics go to stderr.
+Common RPC failures include local hints for checking the agent, endpoint,
+authentication, permissions, or timeout. Remote error text is not displayed.
+Generated operation keys are printed to stderr before sending the request.
+JSON results for publish and subscribe also include
+.BR operation_key .
+.SH EXIT STATUS
+.TP
+.B 0
+Successful completion, including an identical existing subscription.
+.TP
+.B 1
+Command failed.
+.TP
+.B 2
+Invalid command-line arguments.
+.SH SEE ALSO
+.BR asterctl-publish (1),
+.BR asterctl-query (1),
+.BR asterctl-subscribe (1)

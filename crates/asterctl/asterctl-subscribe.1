@@ -1,0 +1,77 @@
+.\" Copyright 2026 Defense Unicorns, Inc.
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Clean Room — Privileged
+.TH ASTERCTL-SUBSCRIBE 1 "2026-09-28" "Aster" "User Commands"
+.SH NAME
+asterctl-subscribe \- create an Event subscription
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B subscribe
+.BI \-\-scope " SCOPE"
+.BI \-\-operation\-key " KEY|auto"
+.I TOPIC
+.YS
+.SH DESCRIPTION
+Create a persistent Event subscription for TOPIC. Subscriptions remain active
+after the command exits and across agent restarts.
+.SH OPTIONS
+.TP
+.BI \-\-scope " SCOPE"
+Select the Event scope. Append '/*' to include sub-scopes.
+.TP
+.BI \-\-operation\-key " KEY|auto"
+Use a UTF-8 key of 1\(en256 bytes, or
+.B auto
+to generate a new key.
+.IP
+For retries, use the actual key from the previous attempt and the same
+subscription parameters.
+.SH OUTPUT
+Prints the Base64 subscription ID to stdout.
+.PP
+With \-\-json, prints subscriptionId, inserted, and operation_key.
+.PP
+Generated operation keys are also printed to stderr before sending the request.
+.PP
+If the subscription already exists for that key and the same parameters,
+the command succeeds and prints its ID to stdout. JSON reports inserted=false.
+Reusing the key with different parameters still fails.
+Earlier CLI versions returned status 1 for an identical existing subscription;
+it now returns status 0, consistently with publication retries.
+.SH EXIT STATUS
+.TP
+.B 0
+Subscription created or an identical existing subscription returned.
+.TP
+.B 1
+Command failed.
+.TP
+.B 2
+Invalid or missing arguments.
+.SH EXAMPLES
+Create a subscription with a generated key:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token subscribe \e
+    \-\-scope mission/team/alpha \e
+    \-\-operation\-key auto \e
+    chat.events
+.RE
+.fi
+.PP
+Use an explicit key and include sub-scopes:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token subscribe \e
+    \-\-scope 'mission/team/*' \e
+    \-\-operation\-key chat-reader \e
+    chat.events
+.RE
+.fi
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-query (1),
+.BR asterctl-publish (1)

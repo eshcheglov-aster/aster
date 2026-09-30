@@ -469,6 +469,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterctl"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "buffa",
+ "bytes",
+ "connectrpc",
+ "connectrpc-build",
+ "getrandom 0.4.3",
+ "http",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "async-io"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

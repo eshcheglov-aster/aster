@@ -29,6 +29,7 @@ capacity, or release authorization.
 | Application boundary | API | Guide |
 |---|---|---|
 | Local Connect, gRPC, or gRPC-Web client | Authenticated Event-only `aster.application.v1alpha1` service | [ConnectRPC agent](connect-agent.md) |
+| Command-line node introspection and control | `asterctl`; `status`, `publish`, `query`, and `subscribe` | [asterctl](../../crates/asterctl/README.md) |
 | Selected live or stopped Event in Rust | `SelectedEventHandle` or `SelectedEventNode` | [Event API](selected-event-api.md) |
 | Selected live or stopped control administration in Rust | `SelectedControlHandle` or `SelectedControlAdmin` | [Event control operations](selected-event-api.md#publish-controls-through-the-live-actor) |
 | Selected live or stopped State in Rust | `SelectedStateHandle` or `SelectedStateNode` | [State API](selected-state-api.md) |

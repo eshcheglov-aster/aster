@@ -1,0 +1,67 @@
+.\" Copyright 2026 Defense Unicorns, Inc.
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Clean Room — Privileged
+.TH ASTERCTL-QUERY 1 "2026-09-24" "Aster" "User Commands"
+.SH NAME
+asterctl-query \- query Events stored on an Aster node
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B query
+.RI [ QUERY-OPTIONS ]
+.YS
+.SH DESCRIPTION
+Query locally stored Events through a running Aster agent.
+.SH OPTIONS
+.TP
+.BI \-\-topic " TOPIC"
+Optional. Filter by exact Event topic.
+.TP
+.BI \-\-scope " SCOPE"
+Optional. Filter by exact Event scope.
+Use a trailing '/*' to include this scope and all sub-scopes.
+Example: \%'mission/team/*'.
+.TP
+.BI \-\-publisher " ID"
+Filter by publisher identity.
+ID is a Base64-encoded 32-byte node identity.
+.TP
+.BI \-\-logical\-key " KEY"
+Optional. Filter by exact logical key supplied as UTF-8 text.
+.TP
+.BI \-\-limit " NUMBER"
+Limit the number of Events to display.
+The number of matching Events returned may be smaller.
+.IP
+Default: unlimited.
+.SH EXIT STATUS
+.TP
+.B 0
+Query succeeded, including an empty result.
+.TP
+.B 1
+Authentication, RPC, or input/output failure.
+.TP
+.B 2
+Invalid command-line arguments.
+.SH EXAMPLES
+Query Events:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token query
+.RE
+.fi
+.PP
+Filter by topic and scope:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token query \e
+    \-\-topic chat.events \e
+    \-\-scope mission/team/alpha
+.RE
+.fi
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-publish (1)

@@ -34,14 +34,17 @@ sha256sum Cargo.lock > "$stage/Cargo.lock.sha256"
 python3 tools/check-netlink-packet-core-patch.py
 
 cargo build --frozen --release --target "$target" \
-    -p aster-node -p aster-agent --bin aster --bin aster-agent
+    -p aster-node -p aster-agent -p asterctl --bin aster --bin aster-agent --bin asterctl
 cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
     --target "$target"
 sha256sum -c "$stage/Cargo.lock.sha256"
 
 cp crates/aster-node/aster_bin.cdx.json "$bundle/aster.cdx.json"
 cp crates/aster-agent/aster-agent_bin.cdx.json "$bundle/aster-agent.cdx.json"
-for name in aster aster-agent; do
+cp crates/asterctl/asterctl_bin.cdx.json "$bundle/asterctl.cdx.json"
+cp crates/asterctl/asterctl.1 crates/asterctl/asterctl-publish.1 \
+    crates/asterctl/asterctl-query.1 crates/asterctl/asterctl-subscribe.1 "$bundle/"
+for name in aster aster-agent asterctl; do
     cp "$CARGO_TARGET_DIR/$target/release/$name" "$bundle/$name"
     "$bundle/$name" --help
     cdx-ev validate "$bundle/$name.cdx.json" --schema-type default
@@ -53,7 +56,7 @@ import json
 from pathlib import Path
 import sys
 
-for name in ("aster", "aster-agent"):
+for name in ("aster", "aster-agent", "asterctl"):
     document = json.loads((Path(sys.argv[1]) / (name + ".cdx.json")).read_text())
     if document.get("bomFormat") != "CycloneDX" or document.get("specVersion") != "1.5":
         raise SystemExit(f"{name}: expected CycloneDX 1.5")

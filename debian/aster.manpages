@@ -1,0 +1,4 @@
+crates/asterctl/asterctl.1
+crates/asterctl/asterctl-publish.1
+crates/asterctl/asterctl-query.1
+crates/asterctl/asterctl-subscribe.1

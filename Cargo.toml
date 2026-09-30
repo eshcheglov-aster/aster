@@ -6,6 +6,7 @@ members = [
   "crates/aster-negentropy",
   "crates/aster-iroh",
   "crates/aster-agent",
+  "crates/asterctl",
   "crates/aster-node",
   "crates/aster-core",
   "crates/aster-host",

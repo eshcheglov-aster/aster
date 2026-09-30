@@ -2,6 +2,7 @@
 # Copyright 2026 Defense Unicorns, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Check the actual package payload, ELF architecture and installed checksums."""
+import gzip
 import hashlib
 import io
 import json
@@ -27,7 +28,7 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         member = members[path]
         assert member.isfile(), path
         return tar.extractfile(member).read()
-    for name, directory in (("aster", "usr/bin"), ("aster-agent", "usr/bin"),
+    for name, directory in (("aster", "usr/bin"), ("aster-agent", "usr/bin"), ("asterctl", "usr/bin"),
                             ("aster-credential-admin", "usr/sbin")):
         path = directory + "/" + name
         binary = read(path)
@@ -44,11 +45,13 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         digest, name = line.split("  ", 1)
         assert hashlib.sha256(read(name)).hexdigest() == digest, name
         checked.add(name)
-    assert {"usr/bin/aster", "usr/bin/aster-agent", "usr/sbin/aster-credential-admin"} <= checked
+    assert {"usr/bin/aster", "usr/bin/aster-agent", "usr/bin/asterctl", "usr/sbin/aster-credential-admin"} <= checked
+    for page in ("asterctl", "asterctl-publish", "asterctl-query", "asterctl-subscribe"):
+        assert gzip.decompress(read(f"usr/share/man/man1/{page}.1.gz"))
     assert members["etc/aster/provisioning"].mode == 0o700
     assert members["var/lib/aster/provisioning-systemd"].mode == 0o700
     assert members["var/lib/aster-agent"].mode == 0o700
     assert "etc/aster/agent.json" not in members
     assert any(name.endswith("/systemd/system/aster-agent.service") for name in members)
     assert not any("non-production" in name or name.endswith(".bundle") for name in members)
-print("Package payload, ELF architecture, external SBOMs and checksums: OK")
+print("Package payload, manual page, ELF architecture, external SBOMs and checksums: OK")

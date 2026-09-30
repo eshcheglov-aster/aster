@@ -1,0 +1,40 @@
+NODE:
+  Identity:                AAECAw==
+  Mission authority:       /+4=
+  Sync:                    Last contact complete
+  Configured emission:     Normal
+  Effective emission:      Receive only
+  Authenticated contacts:  18,446,744,073,709,551,615
+  Failed contacts:         0
+
+PEERS (1):
+  Identity:                qg==
+  Authorization:           Active
+  Authenticated contacts:  9,007,199,254,740,993
+  Last contact:            Complete for last negotiated contact
+
+STORAGE:
+  Items:                   0 / 100
+  Payload:                 0 B / 4 KiB
+
+PUBLICATION OPERATIONS:
+  Capacity state:          OK
+  Rows:                    2 / 10,000
+  Size:                    48 B / 64 KiB
+  Active rows:             2
+  Retired rows:            0
+  Reverse index rows:      0
+  Profile boundary:        1,000
+  Profile remaining:       998
+  Profile warning:         No
+  Profile exhausted:       No
+  Ordinary remaining:      9,998
+  Emergency remaining:     100
+  Acceptance rate:         1.25 records/s
+  Estimated exhaustion:    0 s
+  Audit:                   Complete (2 / 2 rows scanned)
+
+DELIVERY:
+  Pending:                 0 / 10,000
+  Profile boundary:        1,000
+  Profile saturated:       No

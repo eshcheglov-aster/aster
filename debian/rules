@@ -39,9 +39,9 @@ override_dh_fixperms:
 
 override_dh_strip:
 	dh_strip --no-automatic-dbgsym
-	cd debian/aster && sha256sum usr/bin/aster usr/bin/aster-agent usr/sbin/aster-credential-admin > ../../target/deb-metadata/BINARY-SHA256SUMS
+	cd debian/aster && sha256sum usr/bin/aster usr/bin/aster-agent usr/bin/asterctl usr/sbin/aster-credential-admin > ../../target/deb-metadata/BINARY-SHA256SUMS
 
-# This package intentionally contains no documentation.
+# Manual pages are installed by dh_installman.
 override_dh_installdocs:
 
 override_dh_installchangelogs:

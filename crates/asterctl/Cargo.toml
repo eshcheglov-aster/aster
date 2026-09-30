@@ -1,0 +1,28 @@
+[package]
+name = "asterctl"
+description = "Command-line utility for introspecting and controlling Aster nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+buffa.workspace = true
+bytes.workspace = true
+connectrpc = { workspace = true, features = ["client", "json"] }
+getrandom.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[build-dependencies]
+connectrpc-build.workspace = true
+
+[lints]
+workspace = true
