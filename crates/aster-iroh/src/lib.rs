@@ -24,7 +24,10 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+mod response_delivery;
+#[cfg(test)]
+mod response_tests;
 #[cfg(feature = "nearby-discovery")]
 use iroh::address_lookup::{
     AddrFilter, AddressLookup, AddressLookupServices, EndpointData, EndpointInfo,
@@ -41,6 +44,7 @@ use iroh::{
 };
 #[cfg(feature = "nearby-discovery")]
 use iroh_mdns_address_lookup::{DiscoveryEvent as MdnsDiscoveryEvent, MdnsAddressLookup};
+use response_delivery::ResponseDelivery;
 #[cfg(feature = "nearby-discovery")]
 use swarm_discovery::{
     Discoverer as SwarmDiscoverer, DropGuard as SwarmDiscoveryGuard, IpClass as SwarmIpClass,
@@ -2108,6 +2112,18 @@ pub struct ReceiveUniTurn {
     eof: bool,
 }
 
+// A dropped responder operation must not make a partially written response or
+// an unobserved delivery error reusable as a successful session.
+struct ResponseOperation<'a>(Option<&'a iroh::endpoint::Connection>);
+
+impl Drop for ResponseOperation<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0 {
+            connection.close(2u8.into(), b"response failed or cancelled");
+        }
+    }
+}
+
 /// Authenticated, bounded opaque exchange channel.
 #[derive(Clone)]
 pub struct Connection {
@@ -2118,6 +2134,7 @@ pub struct Connection {
     path_witness: Arc<Mutex<PathWitness>>,
     security_profile: CarrierSecurityProfile,
     uni_turn_state: Arc<Mutex<UniTurnState>>,
+    response_delivery: Arc<tokio::sync::Mutex<ResponseDelivery>>,
 }
 
 impl Connection {
@@ -2176,6 +2193,7 @@ impl Connection {
             path_witness,
             security_profile,
             uni_turn_state: Arc::new(Mutex::new(UniTurnState::initial(uni_turn_role))),
+            response_delivery: Arc::new(tokio::sync::Mutex::new(ResponseDelivery::default())),
         }
     }
 
@@ -2425,6 +2443,12 @@ impl Connection {
 
     /// Accepts one opaque request, computes a synchronous response, and sends it.
     /// The returned boolean is the handler's explicit session-complete signal.
+    ///
+    /// Intermediate responses are handed to QUIC without waiting for each ACK;
+    /// bounded delivery completions and their errors are retained for subsequent
+    /// responses. A `true` response drains them before returning. Application
+    /// consumption still requires `finish_as_responder`. Cancelling or failing
+    /// a responder operation closes the connection.
     pub async fn respond_once<F>(&self, handler: F) -> Result<bool, CarrierError>
     where
         F: FnOnce(&[u8]) -> Result<(Vec<u8>, bool), CarrierError>,
@@ -2443,7 +2467,11 @@ impl Connection {
         F: FnOnce(&[u8]) -> Result<(Vec<u8>, bool), CarrierError>,
     {
         let request_maximum = self.max_exchange_bytes.min(total_limit);
+        let mut operation = ResponseOperation(Some(&self.inner));
         let result = timeout(self.exchange_timeout, async {
+            // Serialize clones as well: at most one additional response can be
+            // waiting for a slot in the bounded completion queue.
+            let mut delivery = self.response_delivery.lock().await;
             let (mut send, mut receive) = self
                 .inner
                 .accept_bi()
@@ -2463,21 +2491,35 @@ impl Connection {
                 .map_err(|error| CarrierError::Transport(error.to_string()))?;
             send.finish()
                 .map_err(|error| CarrierError::Transport(error.to_string()))?;
-            match send
-                .stopped()
-                .await
-                .map_err(|error| CarrierError::Transport(error.to_string()))?
-            {
-                None => {}
-                Some(code) => {
-                    return Err(CarrierError::Transport(format!(
-                        "peer stopped response stream with code {code}"
-                    )));
-                }
+            let stopped = timeout(self.exchange_timeout, send.stopped());
+            delivery
+                .submit(
+                    async move {
+                        match stopped
+                            .await
+                            .map_err(|_| CarrierError::Timeout("response acknowledgement"))?
+                            .map_err(|error| CarrierError::Transport(error.to_string()))?
+                        {
+                            None => Ok(()),
+                            Some(code) => Err(CarrierError::Transport(format!(
+                                "peer stopped response stream with code {code}"
+                            ))),
+                        }
+                    }
+                    .boxed(),
+                )
+                .await?;
+            // Preserve final-response delivery even for one-shot callers that
+            // drop the connection without the application completion handshake.
+            if complete {
+                delivery.drain().await?;
             }
             Ok(complete)
         })
         .await;
+        if matches!(&result, Ok(Ok(_))) {
+            operation.0 = None;
+        }
         match result {
             Ok(result) => result,
             Err(_) => {
@@ -2523,7 +2565,9 @@ impl Connection {
     /// Waits for proof that the initiator consumed the final response, then
     /// closes the completed connection without racing that response's read.
     pub async fn finish_as_responder(&self) -> Result<(), CarrierError> {
+        let _operation = ResponseOperation(Some(&self.inner));
         let result = timeout(self.exchange_timeout, async {
+            self.response_delivery.lock().await.drain().await?;
             let (_send, mut receive) = self
                 .inner
                 .accept_bi()
