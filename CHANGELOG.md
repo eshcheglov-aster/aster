@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rust `BlobPublishOptions` and live/stopped `publish_with_options`, preserving
+  durable `publish` calls. Publish/read results and Blob deliveries expose the
+  original optional TTL. Zero is invalid; positive TTL is explicitly unsupported
+  before source I/O or mutation until end-to-end finite Blob support lands.
+  This does not change protobuf, RPC, CLI, storage, or wire semantics.
+
 - Optional `before_acceptance_marker` filter for `QueryEvents` RPC call
 - `asterctl unsubscribe` command to remove an Event subscription by ID.
 - subsriptions option for asterctl to get Event subscriptions list

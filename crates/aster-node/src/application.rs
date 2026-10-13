@@ -69,10 +69,10 @@ pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
     BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryPage,
     BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobGcFailureCategory,
-    BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest, BlobPublicationId, BlobPublishRequest,
-    BlobPublishResult, BlobReadPage, BlobReadPageRequest, BlobReadRequest, BlobReadResult,
-    BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest, BlobTransferPhase,
-    BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
+    BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest, BlobPublicationId, BlobPublishOptions,
+    BlobPublishRequest, BlobPublishResult, BlobReadPage, BlobReadPageRequest, BlobReadRequest,
+    BlobReadResult, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
+    BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
     MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
     MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
     SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
@@ -113,6 +113,8 @@ const MAX_SELECTED_EVENT_PLAN_RETRIES: usize = 4;
 #[non_exhaustive]
 pub enum ApplicationErrorKind {
     InvalidRequest,
+    /// A well-formed value requires functionality not yet supported.
+    UnsupportedValue,
     RequestRejected,
     UnauthorizedOrRevoked,
     PolicyUnsettled,
@@ -181,6 +183,7 @@ impl fmt::Display for ApplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let disposition = match self.kind {
             ApplicationErrorKind::InvalidRequest => "invalid application request",
+            ApplicationErrorKind::UnsupportedValue => "unsupported application request value",
             ApplicationErrorKind::RequestRejected => "request rejected by selected data policy",
             ApplicationErrorKind::UnauthorizedOrRevoked => {
                 "application identity or selected data is not currently authorized"

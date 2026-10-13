@@ -476,6 +476,9 @@ pub struct BlobDelivery {
     pub topic: Topic,
     pub scope: Scope,
     pub priority: Priority,
+    /// Original source-authenticated TTL in milliseconds; `None` is durable.
+    /// This is never a remaining lifetime or deletion timestamp.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -629,6 +632,51 @@ pub struct BlobPublishRequest {
     pub schema_id: Vec<u8>,
 }
 
+/// Additive lifetime options for one Blob publication.
+///
+/// Durable publication is the default. Finite values are reserved for
+/// end-to-end finite Blob support; publication currently rejects them as
+/// unsupported before consuming the source or mutating state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobPublishOptions {
+    ttl_ms: Option<u64>,
+}
+
+impl BlobPublishOptions {
+    /// Selects durable, non-expiring publication.
+    pub const fn durable() -> Self {
+        Self { ttl_ms: None }
+    }
+
+    /// Selects a positive original lifetime in milliseconds.
+    pub const fn finite_ttl_ms(ttl_ms: u64) -> Result<Self, ApplicationError> {
+        if ttl_ms == 0 {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob publish",
+            ));
+        }
+        Ok(Self {
+            ttl_ms: Some(ttl_ms),
+        })
+    }
+
+    /// Returns the exact original lifetime, never a remaining lifetime.
+    pub const fn ttl_ms(self) -> Option<u64> {
+        self.ttl_ms
+    }
+
+    fn require_supported(self) -> Result<(), ApplicationError> {
+        if self.ttl_ms.is_some() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnsupportedValue,
+                "blob publish",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Successful durable Blob publication without manifest or provider details.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPublishResult {
@@ -636,6 +684,9 @@ pub struct BlobPublishResult {
     pub publisher: NodeId,
     pub publisher_counter: u64,
     pub priority: Priority,
+    /// Original source-authenticated TTL in milliseconds; `None` is durable.
+    /// This is never a remaining lifetime or deletion timestamp.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -680,6 +731,9 @@ pub struct BlobReadPage {
     pub publisher: NodeId,
     pub publisher_counter: u64,
     pub priority: Priority,
+    /// Original source-authenticated TTL in milliseconds; `None` is durable.
+    /// This is never a remaining lifetime or deletion timestamp.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -720,6 +774,7 @@ impl fmt::Debug for BlobReadPage {
             .field("publisher", &self.publisher)
             .field("publisher_counter", &self.publisher_counter)
             .field("priority", &self.priority)
+            .field("ttl_ms", &self.ttl_ms)
             .field("total_len", &self.total_len)
             .field("media_type", &self.media_type)
             .field("schema_id", &self.schema_id)
@@ -745,6 +800,9 @@ pub struct BlobReadResult {
     pub publisher: NodeId,
     pub publisher_counter: u64,
     pub priority: Priority,
+    /// Original source-authenticated TTL in milliseconds; `None` is durable.
+    /// This is never a remaining lifetime or deletion timestamp.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -837,6 +895,22 @@ impl SelectedBlobHandle {
         request: BlobPublishRequest,
         source: fs::File,
     ) -> Result<BlobPublishResult, ApplicationError> {
+        self.publish_with_options(request, BlobPublishOptions::durable(), source)
+            .await
+    }
+
+    /// Publishes a regular file with an explicit lifetime choice.
+    ///
+    /// Finite TTL is currently unsupported and rejected before enqueueing or
+    /// source I/O. The owned file is dropped on rejection without being read.
+    /// Durable options retain all admission and cancellation semantics of [`Self::publish`].
+    pub async fn publish_with_options(
+        &self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: fs::File,
+    ) -> Result<BlobPublishResult, ApplicationError> {
+        options.require_supported()?;
         validate_live_publish_request(&request)?;
         let (response, received) = oneshot::channel();
         self.send(
@@ -1158,6 +1232,7 @@ struct VerifiedBlobDeliveryMetadata {
     topic: Topic,
     scope: Scope,
     priority: Priority,
+    ttl_ms: Option<u64>,
     total_len: u64,
     media_type: Option<String>,
     schema_id: Vec<u8>,
@@ -1175,6 +1250,7 @@ impl VerifiedBlobDeliveryMetadata {
             topic: self.topic,
             scope: self.scope,
             priority: self.priority,
+            ttl_ms: self.ttl_ms,
             total_len: self.total_len,
             media_type: self.media_type,
             schema_id: self.schema_id,
@@ -1542,6 +1618,20 @@ impl SelectedBlobNode {
         request: BlobPublishRequest,
         source: &mut R,
     ) -> Result<BlobPublishResult, ApplicationError> {
+        self.publish_with_options(request, BlobPublishOptions::durable(), source)
+    }
+
+    /// Publishes with an explicit lifetime choice.
+    ///
+    /// Finite TTL is currently unsupported and rejected before source I/O,
+    /// maintenance, or any store mutation. Durable options retain `publish` behavior.
+    pub fn publish_with_options<R: Read + Seek>(
+        &mut self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: &mut R,
+    ) -> Result<BlobPublishResult, ApplicationError> {
+        options.require_supported()?;
         let retry_request = request.clone();
         match self.publish_inner(request, source, None, None, None) {
             Err(BlobPublishAttemptError::Capacity { error, context }) => {
@@ -2374,6 +2464,7 @@ impl SelectedBlobNode {
                     topic: opened.blob.topic().clone(),
                     scope: opened.blob.scope().clone(),
                     priority: opened.blob.priority(),
+                    ttl_ms: opened.blob.ttl_ms(),
                     total_len: opened.blob.manifest().total_len(),
                     media_type: metadata.media_type().map(str::to_owned),
                     schema_id: metadata.schema_id().to_vec(),
@@ -2635,6 +2726,7 @@ impl SelectedBlobNode {
             publisher: selected.blob.publisher(),
             publisher_counter: selected.blob.dot().counter,
             priority: selected.blob.priority(),
+            ttl_ms: selected.blob.ttl_ms(),
             total_len: selected.blob.manifest().total_len(),
             media_type: metadata.media_type().map(str::to_owned),
             schema_id: metadata.schema_id().to_vec(),
@@ -2874,6 +2966,7 @@ impl SelectedBlobNode {
             publisher: selected.stored.blob.publisher(),
             publisher_counter: selected.stored.blob.dot().counter,
             priority: selected.stored.blob.priority(),
+            ttl_ms: selected.stored.blob.ttl_ms(),
             total_len,
             media_type: metadata.media_type().map(str::to_owned),
             schema_id: metadata.schema_id().to_vec(),
@@ -3562,6 +3655,7 @@ impl SelectedBlobNode {
             publisher: stored.header.stamp.dot.publisher,
             publisher_counter: stored.header.stamp.dot.counter,
             priority: stored.header.priority,
+            ttl_ms: stored.header.ttl_ms,
             total_len: prepared.total_len(),
             media_type: metadata.media_type().map(str::to_owned),
             schema_id: metadata.schema_id().to_vec(),
@@ -3657,6 +3751,7 @@ fn blob_publish_result(blob: &VerifiedStoredBlob, inserted: bool) -> BlobPublish
         publisher: blob.blob.publisher(),
         publisher_counter: blob.blob.dot().counter,
         priority: blob.blob.priority(),
+        ttl_ms: blob.blob.ttl_ms(),
         total_len: blob.blob.manifest().total_len(),
         media_type: metadata.media_type().map(str::to_owned),
         schema_id: metadata.schema_id().to_vec(),
@@ -3849,6 +3944,198 @@ mod tests {
 
     use super::*;
     use crate::application::SelectedEventNode;
+
+    #[test]
+    fn blob_publish_options_preserve_exact_positive_ttl() {
+        const DURABLE: BlobPublishOptions = BlobPublishOptions::durable();
+        const FINITE: Result<BlobPublishOptions, ApplicationError> =
+            BlobPublishOptions::finite_ttl_ms(u64::MAX);
+        assert_eq!(BlobPublishOptions::default(), DURABLE);
+        assert_eq!(DURABLE.ttl_ms(), None);
+        assert_eq!(FINITE.unwrap().ttl_ms(), Some(u64::MAX));
+        assert_eq!(
+            BlobPublishOptions::finite_ttl_ms(1).unwrap().ttl_ms(),
+            Some(1)
+        );
+        let error = BlobPublishOptions::finite_ttl_ms(0).unwrap_err();
+        assert_eq!(error.kind(), ApplicationErrorKind::InvalidRequest);
+        assert_eq!(error.operation(), "blob publish");
+    }
+
+    #[test]
+    fn blob_finite_publish_is_unsupported_before_source_or_store_effects() {
+        struct Untouched;
+        impl Read for Untouched {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("finite publish must not read");
+            }
+        }
+        impl Seek for Untouched {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                panic!("finite publish must not seek");
+            }
+        }
+        let root = TestRoot::new("finite-preflight");
+        let mut node = selected_node(&root);
+        let before = node.store.blob_stats().unwrap();
+        for ttl in [1, u64::MAX] {
+            let error = node
+                .publish_with_options(
+                    request(b"blob/finite"),
+                    BlobPublishOptions::finite_ttl_ms(ttl).unwrap(),
+                    &mut Untouched,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), ApplicationErrorKind::UnsupportedValue);
+            assert_eq!(error.operation(), "blob publish");
+            assert!(error.to_string().contains("unsupported"));
+            assert_eq!(node.store.blob_stats().unwrap(), before);
+        }
+        let published = node
+            .publish(request(b"blob/finite"), &mut Cursor::new([1]))
+            .unwrap();
+        assert!(published.inserted);
+        assert_eq!(published.publisher_counter, 1);
+        let replay = node
+            .publish_with_options(
+                request(b"blob/finite"),
+                BlobPublishOptions::default(),
+                &mut Cursor::new([1]),
+            )
+            .unwrap();
+        assert_eq!(
+            replay,
+            BlobPublishResult {
+                inserted: false,
+                ..published
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn live_blob_finite_publish_is_unsupported_before_enqueue_or_file_io() {
+        let root = TestRoot::new("finite-live-preflight");
+        let source_path = root.path().join("source.bin");
+        fs::write(&source_path, [1, 2]).unwrap();
+        let node = selected_node(&root);
+        let (commands, mut received) = mpsc::channel(1);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            Arc::new(AtomicBool::new(true)),
+            node.identity(),
+            node.mission_authority(),
+        );
+        for ttl in [1, u64::MAX] {
+            let source = fs::File::open(&source_path).unwrap();
+            let mut observer = source.try_clone().unwrap();
+            observer.seek(SeekFrom::Start(1)).unwrap();
+            let error = handle
+                .publish_with_options(
+                    request(b"blob/finite-live"),
+                    crate::application::BlobPublishOptions::finite_ttl_ms(ttl).unwrap(),
+                    source,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ApplicationErrorKind::UnsupportedValue);
+            assert_eq!(error.operation(), "blob publish");
+            assert_eq!(observer.stream_position().unwrap(), 1);
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_durable_options_echo_original_ttl_across_rust_surfaces() {
+        let root = TestRoot::new("durable-options-metadata");
+        let mut node = selected_node(&root);
+        let bytes = [1, 2, 3];
+        let publish_request = request(b"blob/durable-options");
+        let first = node
+            .publish_with_options(
+                publish_request.clone(),
+                BlobPublishOptions::durable(),
+                &mut Cursor::new(bytes),
+            )
+            .unwrap();
+        assert_eq!(first.ttl_ms, None);
+        let read_request = BlobReadRequest {
+            id: first.id,
+            topic: blob_topic(),
+            scope: blob_scope(),
+        };
+        let read = node
+            .read_into(read_request.clone(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(read.ttl_ms, None);
+        let source_path = root.path().join("source.bin");
+        fs::write(&source_path, bytes).unwrap();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(2);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            node.identity(),
+            node.mission_authority(),
+        );
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(SelectedApplicationCommand::Blob(command)) = received.blocking_recv() {
+                node.execute_live(command, &worker_admission).unwrap();
+            }
+        });
+        let old = handle
+            .publish(
+                publish_request.clone(),
+                fs::File::open(&source_path).unwrap(),
+            )
+            .await
+            .unwrap();
+        let new = handle
+            .publish_with_options(
+                publish_request,
+                BlobPublishOptions::default(),
+                fs::File::open(&source_path).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old, new);
+        assert_eq!(
+            new,
+            BlobPublishResult {
+                inserted: false,
+                ..first
+            }
+        );
+        let page = handle
+            .read_page(BlobReadPageRequest {
+                blob: read_request,
+                offset: 0,
+                max_bytes: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.ttl_ms, None);
+        assert_eq!(page.as_bytes(), bytes);
+        let subscription = handle
+            .subscribe(subscription_request(b"blob/ttl-selector"))
+            .await
+            .unwrap();
+        let delivery = handle
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(delivery.deliveries.len(), 1);
+        assert_eq!(delivery.deliveries[0].ttl_ms, None);
+        drop(handle);
+        worker.await.unwrap();
+    }
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 

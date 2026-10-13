@@ -98,6 +98,53 @@ hostile filesystem syscall can delay the joined worker and therefore delay
 shutdown or zeroization; no bounded shutdown-latency claim is made for such a
 file provider.
 
+## Explicit lifetime options (Rust API only)
+
+`BlobPublishRequest` and the existing `publish(request, source)` methods remain
+unchanged and durable. Both Rust facades additionally accept
+`publish_with_options(request, options, source)`:
+
+```rust
+use aster_node::application::BlobPublishOptions;
+
+// Live handle: owns a regular file, just like publish.
+let published = blobs
+    .publish_with_options(request, BlobPublishOptions::durable(), source)
+    .await?;
+assert_eq!(published.ttl_ms, None);
+
+// Stopped facade: borrows a Read + Seek source.
+let published = stopped.publish_with_options(
+    other_request,
+    BlobPublishOptions::default(),
+    &mut seekable_source,
+)?;
+assert_eq!(published.ttl_ms, None);
+```
+
+`Default` and `durable()` select `None`. `finite_ttl_ms(0)` returns
+`ApplicationErrorKind::InvalidRequest`; positive values through `u64::MAX`
+construct options successfully, and `ttl_ms()` returns that exact value.
+**Finite publication is not activated:** either facade rejects those options
+with `ApplicationErrorKind::UnsupportedValue` before source I/O, command enqueue,
+maintenance, or store mutation. The live call owns and drops its file on
+rejection but does not read or seek it. Never retry a finite request as durable
+unless the application explicitly chooses to change its lifetime requirement.
+
+`BlobPublishResult`, `BlobReadPage`, `BlobReadResult`, and `BlobDelivery` expose
+`ttl_ms: Option<u64>` from authenticated publication metadata. This is the
+original signed TTL, never remaining time or a deletion timestamp; currently
+successful publications and reads report `None`. Adding these public fields
+requires downstream exhaustive struct literals/patterns to be updated. There is
+no public Rust retirement-delivery type in this increment.
+
+This increment changes neither storage/wire lifetime semantics nor protobuf,
+RPC handlers, generated clients, or CLI. The future Blob RPC integration must
+preserve TTL presence and exact value and retain the pre-mutation unsupported
+(or capability) gate until end-to-end finite storage and negotiated wire support
+is active; its contract is specified in the
+[Blob lifecycle design](../superpowers/specs/2026-10-07-blob-lifecycle-design.md#application-and-status-behavior).
+
 ## Subscribe to immutable publication metadata
 
 A Blob subscription selects one topic and scope, optionally including
@@ -171,7 +218,7 @@ returned from that verified set.
 Before returning a delivery, the node rechecks current mission policy, exact
 source envelope and identity metadata, route/content authority, revocation and
 epoch, and the completed encrypted-depot content. The notification exposes only
-the publication ID, Blob ID, publisher/counter, topic/scope, priority, byte
+the publication ID, Blob ID, publisher/counter, topic/scope, priority, original TTL, byte
 length, media/schema identity metadata, acceptance marker, attempt, and opaque
 acknowledgement token. It never returns a manifest, source envelope, sealed
 bytes, key, nonce, chunk, carrier state, or depot path.
