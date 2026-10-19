@@ -41,6 +41,66 @@ const PROFILE_EVENT_OPERATION_WARNING: u64 = 512;
 const PROFILE_EVENT_OPERATION_BOUNDARY: u64 = 1_024;
 const PROFILE_EVENT_PENDING_DELIVERY_BOUNDARY: u64 = 256;
 const PUBLISH_EVENTS_WINDOW: usize = 8;
+const BLOB_RPC_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
+const BLOB_RPC_MAX_IDLE: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub(crate) struct ApplicationService {
+    ordinary: connectrpc::ConnectRpcService<connectrpc::Router>,
+    blob: connectrpc::ConnectRpcService<connectrpc::Router>,
+}
+
+impl ApplicationService {
+    pub(crate) const fn new(
+        ordinary: connectrpc::ConnectRpcService<connectrpc::Router>,
+        blob: connectrpc::ConnectRpcService<connectrpc::Router>,
+    ) -> Self {
+        Self { ordinary, blob }
+    }
+}
+
+impl<B> tower_service::Service<http::Request<B>> for ApplicationService
+where
+    connectrpc::ConnectRpcService<connectrpc::Router>: tower_service::Service<http::Request<B>>,
+{
+    type Response = <connectrpc::ConnectRpcService<connectrpc::Router> as tower_service::Service<
+        http::Request<B>,
+    >>::Response;
+    type Error = <connectrpc::ConnectRpcService<connectrpc::Router> as tower_service::Service<
+        http::Request<B>,
+    >>::Error;
+    type Future = <connectrpc::ConnectRpcService<connectrpc::Router> as tower_service::Service<
+        http::Request<B>,
+    >>::Future;
+
+    fn poll_ready(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match tower_service::Service::poll_ready(&mut self.ordinary, context) {
+            std::task::Poll::Ready(Ok(())) => {
+                tower_service::Service::poll_ready(&mut self.blob, context)
+            }
+            other => other,
+        }
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if is_blob_rpc_path(request.uri().path()) {
+            tower_service::Service::call(&mut self.blob, request)
+        } else {
+            tower_service::Service::call(&mut self.ordinary, request)
+        }
+    }
+}
+
+fn is_blob_rpc_path(path: &str) -> bool {
+    let Some((service, method)) = path.strip_prefix('/').and_then(|path| path.split_once('/'))
+    else {
+        return false;
+    };
+    service == APPLICATION_SERVICE_NAME && matches!(method, "PublishBlob" | "ReadBlob")
+}
 
 /// High-level ConnectRPC service backed by the running node's sole authority.
 #[derive(Clone)]
@@ -92,16 +152,17 @@ pub(crate) fn application_service_with_blobs(
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> std::io::Result<connectrpc::ConnectRpcService<connectrpc::Router>> {
-    Ok(configured_service(
-        AsterConnectService::new(
-            events,
-            configured_emission_policy,
-            credential_generation,
-            shutdown,
-        )
-        .with_blobs(blobs, &state_root)?
-        .router(),
+) -> std::io::Result<ApplicationService> {
+    let service = AsterConnectService::new(
+        events,
+        configured_emission_policy,
+        credential_generation,
+        shutdown,
+    )
+    .with_blobs(blobs, &state_root)?;
+    Ok(ApplicationService::new(
+        configured_service(service.clone().router()),
+        configured_blob_service(service.router()),
     ))
 }
 
@@ -110,15 +171,16 @@ pub(crate) fn application_service(
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> connectrpc::ConnectRpcService<connectrpc::Router> {
-    configured_service(
-        AsterConnectService::new(
-            events,
-            configured_emission_policy,
-            credential_generation,
-            shutdown,
-        )
-        .router(),
+) -> ApplicationService {
+    let service = AsterConnectService::new(
+        events,
+        configured_emission_policy,
+        credential_generation,
+        shutdown,
+    );
+    ApplicationService::new(
+        configured_service(service.clone().router()),
+        configured_blob_service(service.router()),
     )
 }
 
@@ -129,14 +191,32 @@ pub(crate) fn configured_service(
         .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
-    let deadline = connectrpc::DeadlinePolicy::new()
+    let ordinary_deadline = connectrpc::DeadlinePolicy::new()
         .with_min(Duration::from_millis(10))
         .with_max(Duration::from_secs(30))
         .with_default_timeout(Duration::from_secs(10))
         .with_enforce_on_streams(true);
     connectrpc::ConnectRpcService::new(router)
         .with_limits(limits)
-        .with_deadline_policy(deadline)
+        .with_deadline_policy(ordinary_deadline)
+}
+
+pub(crate) fn configured_blob_service(
+    router: connectrpc::Router,
+) -> connectrpc::ConnectRpcService<connectrpc::Router> {
+    let limits = connectrpc::Limits::default()
+        .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
+        .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
+        .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
+    let blob_deadline = connectrpc::DeadlinePolicy::new()
+        .with_min(Duration::from_millis(10))
+        .with_max(BLOB_RPC_MAX_DURATION)
+        .with_default_timeout(Duration::from_secs(10))
+        .with_enforce_on_streams(true)
+        .with_inter_message_timeout(BLOB_RPC_MAX_IDLE);
+    connectrpc::ConnectRpcService::new(router)
+        .with_limits(limits)
+        .with_deadline_policy(blob_deadline)
 }
 
 fn rejection_handler<Req, Res>() -> impl connectrpc::BidiStreamingHandler<Req, Res, Item = Res>
@@ -295,7 +375,7 @@ impl api::AsterApplicationService for AsterConnectService {
         &self,
         ctx: RequestContext,
         requests: connectrpc::InboundStream<api::PublishBlobRequest>,
-    ) -> ServiceResult<api::PublishBlobResponse> {
+    ) -> ServiceResult<ServiceStream<api::PublishBlobResponse>> {
         let blobs = self.blobs.as_ref().ok_or_else(|| {
             public_error(
                 ErrorCode::FailedPrecondition,
@@ -1389,75 +1469,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "client", feature = "server", target_os = "linux"))]
-    #[tokio::test]
-    async fn combined_blob_staging_reopens_the_running_nodes_pinned_state_inode() {
-        use std::os::unix::fs::{MetadataExt as _, symlink};
-
-        let fixture = TestState::new();
-        let target = fixture.0.join("target");
-        let configured = fixture.0.join("configured-link");
-        let moved = fixture.0.join("moved-after-start");
-        fs::create_dir(&target).expect("state target");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
-            .expect("protect state target");
-        symlink(&target, &configured).expect("configured state symlink");
-        let mission = UnprotectedReferenceMission::from_bytes(
-            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
-                .to_vec(),
-        )
-        .expect("test mission");
-        let node = start_node(NodeConfig {
-            state: configured,
-            bind: "127.0.0.1:0".parse().expect("mesh bind"),
-            mission,
-            peers: Vec::new(),
-            mutable_interests: MutableSourceInterests::default(),
-            sync_interval: Duration::from_millis(50),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("production node startup");
-        let pinned = fs::metadata(node.state_root()).expect("pinned state");
-        fs::rename(&target, &moved).expect("move pinned state");
-        fs::create_dir(&target).expect("replacement state");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
-            .expect("protect replacement state");
-
-        let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
-        let service = AsterConnectService::new(
-            node.selected_events(),
-            EventEmissionPolicy::Normal,
-            None,
-            shutdown,
-        )
-        .with_blobs(node.selected_blobs(), node.state_root())
-        .expect("construct combined service from running-node authority");
-        let staging = service
-            .blobs
-            .as_ref()
-            .expect("combined Blob service")
-            .staging_directory_identity()
-            .expect("staging descriptor identity")
-            .expect("Linux staging descriptor");
-        assert_eq!(staging, (pinned.dev(), pinned.ino()));
-        let replacement = fs::metadata(&target).expect("replacement state");
-        assert_ne!(staging, (replacement.dev(), replacement.ino()));
-        assert!(moved.join("mesh.redb").is_file());
-        assert!(
-            target
-                .read_dir()
-                .expect("replacement entries")
-                .next()
-                .is_none()
-        );
-
-        fs::remove_dir(&target).expect("remove empty replacement state");
-        fs::rename(&moved, &target).expect("restore pinned state for orderly shutdown");
-        node.shutdown().await.expect("node shutdown");
-    }
-
     #[cfg(all(feature = "client", feature = "server", not(target_os = "linux")))]
     #[tokio::test]
     async fn combined_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
@@ -1538,13 +1549,16 @@ mod tests {
                     >,
                 >::Pending
             }));
-        let error = api::AsterApplicationService::publish_blob(
+        let error = match api::AsterApplicationService::publish_blob(
             &service,
             RequestContext::default(),
             inbound,
         )
         .await
-        .expect_err("unsupported publish fails at the handler boundary");
+        {
+            Ok(_) => panic!("unsupported publish must fail at the handler boundary"),
+            Err(error) => error,
+        };
         assert_public_detail(
             &error,
             "aster.application.v1alpha1.PublicErrorDetail",

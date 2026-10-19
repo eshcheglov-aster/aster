@@ -11,6 +11,7 @@ use crate::NodeError;
 use crate::event_pages::{
     ChangePageV7, ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventTurnPlanV1, TransferProfileOfferV1,
 };
+use crate::stream_transfer::{STREAM_TAGS, StreamFrame};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 pub(crate) const MECHANICS_FRAME_PREFIX_BYTES: usize = MAGIC.len() + 1;
@@ -92,6 +93,13 @@ const EVENT_TURN_PLAN_V1: u8 = 0xd2;
 const CHANGE_TURN_HEADER_V1: u8 = 0xd3;
 const CHANGE_PAGE_V7: u8 = 0xd4;
 const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
+const BLOB_PUBLICATION_OPEN_V1: u8 = 0xdd;
+const BLOB_PUBLICATION_COMMIT_V1: u8 = 0xde;
+const BLOB_PUBLICATION_ABSENT_V1: u8 = 0xdf;
+const BLOB_PUBLICATION_RESUME_V1: u8 = 0xe0;
+const BLOB_STREAM_PLAN_V1: u8 = 0xe1;
+const BLOB_STREAM_PLAN_REPLY_V1: u8 = 0xe2;
+const MAX_SIGNED_BLOB_PUBLICATION_BYTES: usize = 1_048_576;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
 pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
@@ -112,6 +120,50 @@ pub(crate) const MAX_BLOB_INTEREST_BYTES: usize = 2 + MAX_EVENT_INTEREST_SELECTO
 pub(crate) enum EventDirection {
     ToSessionInitiator,
     ToSessionResponder,
+}
+
+/// Receiver-authored durable resume point selected before opening a profile-5
+/// transport attempt. An absent selection is the bounded no-work response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobStreamPlanSelectionV1 {
+    pub(crate) source_id: BlobTransferId,
+    pub(crate) next_carrier_index: u64,
+    pub(crate) durable_offset: u64,
+    pub(crate) checkpoint_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobStreamPlanV1 {
+    pub(crate) direction: EventDirection,
+    pub(crate) selection: Option<BlobStreamPlanSelectionV1>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationOpenV1 {
+    pub(crate) signed_open: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationCommitV1 {
+    pub(crate) signed_commitment: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationAbsentV1 {
+    pub(crate) direction: EventDirection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationResumeV1 {
+    pub(crate) direction: EventDirection,
+    pub(crate) stream_id: [u8; 32],
+    pub(crate) open_digest: [u8; 32],
+    pub(crate) durable_plaintext_offset: u64,
+    pub(crate) durable_wire_offset: u64,
+    pub(crate) next_segment_index: u64,
+    pub(crate) plaintext_commitment: [u8; 32],
+    pub(crate) ciphertext_commitment: [u8; 32],
+    pub(crate) checkpoint_generation: u64,
 }
 
 /// Bounded operator emission state disclosed only as a protected v3 response.
@@ -884,6 +936,14 @@ pub(crate) enum Frame {
     ChangeTurnHeader(ChangeTurnHeaderV1),
     ChangePage(ChangePageV7),
     ChangeTurnFinished(ChangeTurnFinishedV1),
+    BlobStreamPlan(BlobStreamPlanV1),
+    BlobStreamPlanReply(BlobStreamPlanV1),
+    BlobPublicationOpen(BlobPublicationOpenV1),
+    BlobPublicationCommit(BlobPublicationCommitV1),
+    BlobPublicationAbsent(BlobPublicationAbsentV1),
+    BlobPublicationResume(BlobPublicationResumeV1),
+    #[allow(dead_code)] // Activated by the profile-5 runtime driver.
+    Stream(StreamFrame),
 }
 
 impl Frame {
@@ -1516,6 +1576,48 @@ impl Frame {
                         .map_err(|error| NodeError::Protocol(error.to_string()))?,
                 );
             }
+            Self::BlobStreamPlan(plan) | Self::BlobStreamPlanReply(plan) => {
+                output.push(if matches!(self, Self::BlobStreamPlan(_)) {
+                    BLOB_STREAM_PLAN_V1
+                } else {
+                    BLOB_STREAM_PLAN_REPLY_V1
+                });
+                encode_blob_stream_plan(&mut output, plan)?;
+            }
+            Self::BlobPublicationOpen(open) => {
+                output.push(BLOB_PUBLICATION_OPEN_V1);
+                encode_blob_publication(&mut output, &open.signed_open)?;
+            }
+            Self::BlobPublicationCommit(commitment) => {
+                output.push(BLOB_PUBLICATION_COMMIT_V1);
+                encode_blob_publication(&mut output, &commitment.signed_commitment)?;
+            }
+            Self::BlobPublicationAbsent(absent) => {
+                output.push(BLOB_PUBLICATION_ABSENT_V1);
+                output.extend_from_slice(&9_u16.to_be_bytes());
+                output.extend_from_slice(&5_u16.to_be_bytes());
+                output.push(absent.direction.encode());
+            }
+            Self::BlobPublicationResume(resume) => {
+                validate_blob_publication_resume(resume)?;
+                output.push(BLOB_PUBLICATION_RESUME_V1);
+                output.extend_from_slice(&9_u16.to_be_bytes());
+                output.extend_from_slice(&5_u16.to_be_bytes());
+                output.push(resume.direction.encode());
+                output.extend_from_slice(&resume.stream_id);
+                output.extend_from_slice(&resume.open_digest);
+                output.extend_from_slice(&resume.durable_plaintext_offset.to_be_bytes());
+                output.extend_from_slice(&resume.durable_wire_offset.to_be_bytes());
+                output.extend_from_slice(&resume.next_segment_index.to_be_bytes());
+                output.extend_from_slice(&resume.plaintext_commitment);
+                output.extend_from_slice(&resume.ciphertext_commitment);
+                output.extend_from_slice(&resume.checkpoint_generation.to_be_bytes());
+            }
+            Self::Stream(_) => {
+                return Err(NodeError::Protocol(
+                    "stream frame requires an authenticated semantic/profile context".into(),
+                ));
+            }
         }
         Ok(output)
     }
@@ -1530,11 +1632,44 @@ impl Frame {
                 "semantic v1-v6 session cannot emit a v7-only mechanics frame".into(),
             ));
         }
+        if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V9 && self.is_v9_only() {
+            return Err(NodeError::Protocol(
+                "semantic v1-v8 session cannot emit a v9-only mechanics frame".into(),
+            ));
+        }
         if semantic_version >= crate::event_pages::SEMANTIC_PROTOCOL_V8 {
             self.encode_with_v8_blob_fields(true)
         } else {
             self.encode()
         }
+    }
+
+    #[allow(dead_code)] // Activated by the profile-5 runtime driver.
+    pub(crate) fn encode_for_semantic_profile(
+        &self,
+        semantic_version: u16,
+        profile_id: u16,
+    ) -> Result<Vec<u8>, NodeError> {
+        match self {
+            Self::Stream(frame) => frame
+                .encode_for_context(semantic_version, profile_id)
+                .map_err(|error| NodeError::Protocol(error.to_string())),
+            _ => self.encode_for_semantic_version(semantic_version),
+        }
+    }
+
+    #[allow(dead_code)] // Activated by the profile-5 runtime driver.
+    pub(crate) fn decode_for_semantic_profile(
+        input: &[u8],
+        semantic_version: u16,
+        profile_id: u16,
+    ) -> Result<Self, NodeError> {
+        if input.len() >= 5 && STREAM_TAGS.contains(&input[4]) {
+            return StreamFrame::decode_for_context(semantic_version, profile_id, input)
+                .map(Self::Stream)
+                .map_err(|error| NodeError::Protocol(error.to_string()));
+        }
+        Self::decode_for_semantic_version(input, semantic_version)
     }
 
     pub(crate) fn decode_for_semantic_version(
@@ -1550,6 +1685,11 @@ impl Frame {
         if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V7 && is_v7_only_tag(input[4]) {
             return Err(NodeError::Protocol(
                 "semantic v1-v6 session rejected a v7-only mechanics frame".into(),
+            ));
+        }
+        if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V9 && is_v9_only_tag(input[4]) {
+            return Err(NodeError::Protocol(
+                "semantic v1-v8 session rejected a v9-only mechanics frame".into(),
             ));
         }
         if semantic_version >= crate::event_pages::SEMANTIC_PROTOCOL_V8 {
@@ -1638,6 +1778,18 @@ impl Frame {
                 | Self::ChangeTurnHeader(_)
                 | Self::ChangePage(_)
                 | Self::ChangeTurnFinished(_)
+        )
+    }
+
+    const fn is_v9_only(&self) -> bool {
+        matches!(
+            self,
+            Self::BlobStreamPlan(_)
+                | Self::BlobStreamPlanReply(_)
+                | Self::BlobPublicationOpen(_)
+                | Self::BlobPublicationCommit(_)
+                | Self::BlobPublicationAbsent(_)
+                | Self::BlobPublicationResume(_)
         )
     }
 
@@ -2220,6 +2372,66 @@ impl Frame {
             CHANGE_TURN_FINISHED_V1 => Ok(Self::ChangeTurnFinished(
                 ChangeTurnFinishedV1::decode(body).map_err(event_pages_protocol_error)?,
             )),
+            BLOB_STREAM_PLAN_V1 => Ok(Self::BlobStreamPlan(decode_blob_stream_plan(body)?)),
+            BLOB_STREAM_PLAN_REPLY_V1 => {
+                Ok(Self::BlobStreamPlanReply(decode_blob_stream_plan(body)?))
+            }
+            BLOB_PUBLICATION_OPEN_V1 | BLOB_PUBLICATION_COMMIT_V1 => {
+                let signed = decode_blob_publication(body)?;
+                if tag == BLOB_PUBLICATION_OPEN_V1 {
+                    Ok(Self::BlobPublicationOpen(BlobPublicationOpenV1 {
+                        signed_open: signed,
+                    }))
+                } else {
+                    Ok(Self::BlobPublicationCommit(BlobPublicationCommitV1 {
+                        signed_commitment: signed,
+                    }))
+                }
+            }
+            BLOB_PUBLICATION_ABSENT_V1 => {
+                if body.len() != 5
+                    || u16::from_be_bytes(body[..2].try_into().expect("fixed slice")) != 9
+                    || u16::from_be_bytes(body[2..4].try_into().expect("fixed slice")) != 5
+                {
+                    return Err(NodeError::Protocol(
+                        "absent Blob publication context differs".into(),
+                    ));
+                }
+                Ok(Self::BlobPublicationAbsent(BlobPublicationAbsentV1 {
+                    direction: EventDirection::decode(body[4])?,
+                }))
+            }
+            BLOB_PUBLICATION_RESUME_V1 => {
+                if body.len() != 165
+                    || u16::from_be_bytes(body[..2].try_into().expect("fixed slice")) != 9
+                    || u16::from_be_bytes(body[2..4].try_into().expect("fixed slice")) != 5
+                {
+                    return Err(NodeError::Protocol(
+                        "Blob publication resume context differs".into(),
+                    ));
+                }
+                let resume = BlobPublicationResumeV1 {
+                    direction: EventDirection::decode(body[4])?,
+                    stream_id: body[5..37].try_into().expect("fixed slice"),
+                    open_digest: body[37..69].try_into().expect("fixed slice"),
+                    durable_plaintext_offset: u64::from_be_bytes(
+                        body[69..77].try_into().expect("fixed slice"),
+                    ),
+                    durable_wire_offset: u64::from_be_bytes(
+                        body[77..85].try_into().expect("fixed slice"),
+                    ),
+                    next_segment_index: u64::from_be_bytes(
+                        body[85..93].try_into().expect("fixed slice"),
+                    ),
+                    plaintext_commitment: body[93..125].try_into().expect("fixed slice"),
+                    ciphertext_commitment: body[125..157].try_into().expect("fixed slice"),
+                    checkpoint_generation: u64::from_be_bytes(
+                        body[157..165].try_into().expect("fixed slice"),
+                    ),
+                };
+                validate_blob_publication_resume(&resume)?;
+                Ok(Self::BlobPublicationResume(resume))
+            }
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
@@ -2252,8 +2464,141 @@ const fn is_v7_only_tag(tag: u8) -> bool {
     )
 }
 
+const fn is_v9_only_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        BLOB_STREAM_PLAN_V1
+            | BLOB_STREAM_PLAN_REPLY_V1
+            | BLOB_PUBLICATION_OPEN_V1
+            | BLOB_PUBLICATION_COMMIT_V1
+            | BLOB_PUBLICATION_ABSENT_V1
+            | BLOB_PUBLICATION_RESUME_V1
+    )
+}
+
+fn validate_blob_stream_plan_selection(
+    selection: BlobStreamPlanSelectionV1,
+) -> Result<(), NodeError> {
+    if selection.checkpoint_generation == 0 {
+        return Err(NodeError::Protocol(
+            "Blob stream plan checkpoint generation is zero".into(),
+        ));
+    }
+    if (selection.next_carrier_index == 0) != (selection.durable_offset == 0) {
+        return Err(NodeError::Protocol(
+            "Blob stream plan checkpoint origin differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_blob_stream_plan(output: &mut Vec<u8>, plan: &BlobStreamPlanV1) -> Result<(), NodeError> {
+    output.push(plan.direction.encode());
+    match plan.selection {
+        None => output.push(0),
+        Some(selection) => {
+            validate_blob_stream_plan_selection(selection)?;
+            output.push(1);
+            output.extend_from_slice(selection.source_id.as_bytes());
+            output.extend_from_slice(&selection.next_carrier_index.to_be_bytes());
+            output.extend_from_slice(&selection.durable_offset.to_be_bytes());
+            output.extend_from_slice(&selection.checkpoint_generation.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn decode_blob_stream_plan(body: &[u8]) -> Result<BlobStreamPlanV1, NodeError> {
+    let (direction, body) = decode_direction(body)?;
+    let Some((&present, body)) = body.split_first() else {
+        return Err(NodeError::Protocol(
+            "Blob stream plan selection flag is missing".into(),
+        ));
+    };
+    let selection = match present {
+        0 if body.is_empty() => None,
+        1 if body.len() == 56 => {
+            let selection = BlobStreamPlanSelectionV1 {
+                source_id: BlobTransferId::new(body[..32].try_into().expect("fixed slice")),
+                next_carrier_index: u64::from_be_bytes(
+                    body[32..40].try_into().expect("fixed slice"),
+                ),
+                durable_offset: u64::from_be_bytes(body[40..48].try_into().expect("fixed slice")),
+                checkpoint_generation: u64::from_be_bytes(
+                    body[48..56].try_into().expect("fixed slice"),
+                ),
+            };
+            validate_blob_stream_plan_selection(selection)?;
+            Some(selection)
+        }
+        _ => {
+            return Err(NodeError::Protocol(
+                "Blob stream plan selection encoding differs".into(),
+            ));
+        }
+    };
+    Ok(BlobStreamPlanV1 {
+        direction,
+        selection,
+    })
+}
+
+fn validate_blob_publication_resume(resume: &BlobPublicationResumeV1) -> Result<(), NodeError> {
+    let initial = resume.checkpoint_generation == 0;
+    if resume.stream_id == [0; 32]
+        || resume.open_digest == [0; 32]
+        || resume.plaintext_commitment == [0; 32]
+        || resume.ciphertext_commitment == [0; 32]
+        || (initial
+            && (resume.plaintext_commitment != [1; 32] || resume.ciphertext_commitment != [1; 32]))
+        || initial
+            != (resume.durable_plaintext_offset == 0
+                && resume.durable_wire_offset == 0
+                && resume.next_segment_index == 0)
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication resume authority is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_blob_publication(output: &mut Vec<u8>, signed: &[u8]) -> Result<(), NodeError> {
+    if signed.is_empty() || signed.len() > MAX_SIGNED_BLOB_PUBLICATION_BYTES {
+        return Err(NodeError::Protocol(
+            "signed Blob publication length out of bounds".into(),
+        ));
+    }
+    output.extend_from_slice(&9_u16.to_be_bytes());
+    output.extend_from_slice(&5_u16.to_be_bytes());
+    output.extend_from_slice(&(signed.len() as u32).to_be_bytes());
+    output.extend_from_slice(signed);
+    Ok(())
+}
+
+fn decode_blob_publication(body: &[u8]) -> Result<Vec<u8>, NodeError> {
+    if body.len() < 8
+        || u16::from_be_bytes(body[..2].try_into().expect("fixed slice")) != 9
+        || u16::from_be_bytes(body[2..4].try_into().expect("fixed slice")) != 5
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication context differs".into(),
+        ));
+    }
+    let len = usize::try_from(u32::from_be_bytes(
+        body[4..8].try_into().expect("fixed slice"),
+    ))
+    .map_err(|_| NodeError::Protocol("Blob publication length overflow".into()))?;
+    if len == 0 || len > MAX_SIGNED_BLOB_PUBLICATION_BYTES || body.len() != 8 + len {
+        return Err(NodeError::Protocol(
+            "signed Blob publication length differs".into(),
+        ));
+    }
+    Ok(body[8..].to_vec())
+}
+
 fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
-    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V8).contains(&semantic_version) {
+    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V9).contains(&semantic_version) {
         return Err(NodeError::Protocol(format!(
             "unsupported semantic protocol version {semantic_version}"
         )));
@@ -3662,6 +4007,175 @@ mod tests {
     }
 
     #[test]
+    fn blob_stream_plans_have_exact_bounded_v9_encodings() {
+        // Catch tag reuse, field reordering, loss of origin/resume authority,
+        // and accidental acceptance on a pre-v9 contact.
+        for (direction, direction_byte) in [
+            (EventDirection::ToSessionInitiator, 1),
+            (EventDirection::ToSessionResponder, 2),
+        ] {
+            for selection in [
+                None,
+                Some(BlobStreamPlanSelectionV1 {
+                    source_id: BlobTransferId::new([0x31; 32]),
+                    next_carrier_index: 0,
+                    durable_offset: 0,
+                    checkpoint_generation: 1,
+                }),
+                Some(BlobStreamPlanSelectionV1 {
+                    source_id: BlobTransferId::new([0x31; 32]),
+                    next_carrier_index: u64::MAX,
+                    durable_offset: u64::MAX,
+                    checkpoint_generation: u64::MAX,
+                }),
+            ] {
+                let plan = BlobStreamPlanV1 {
+                    direction,
+                    selection,
+                };
+                for (frame, tag) in [
+                    (Frame::BlobStreamPlan(plan), 0xe1),
+                    (Frame::BlobStreamPlanReply(plan), 0xe2),
+                ] {
+                    let mut expected = vec![b'A', b'S', b'M', 1, tag, direction_byte];
+                    match selection {
+                        None => expected.push(0),
+                        Some(selection) => {
+                            expected.push(1);
+                            expected.extend_from_slice(&[0x31; 32]);
+                            if selection.next_carrier_index == 0 {
+                                expected.extend_from_slice(&[0; 23]);
+                                expected.push(1);
+                            } else {
+                                expected.extend_from_slice(&[0xff; 24]);
+                            }
+                        }
+                    }
+                    let encoded = frame
+                        .encode_for_semantic_version(9)
+                        .expect("encode retained Blob stream plan");
+                    assert_eq!(encoded, expected);
+                    assert_eq!(encoded.len(), if selection.is_some() { 63 } else { 7 });
+                    assert_eq!(Frame::decode(&encoded).expect("generic plan decode"), frame);
+                    assert_eq!(
+                        Frame::decode_for_semantic_version(&encoded, 9)
+                            .expect("decode retained Blob stream plan"),
+                        frame
+                    );
+                    for version in 1..=8 {
+                        assert!(frame.encode_for_semantic_version(version).is_err());
+                        assert!(Frame::decode_for_semantic_version(&encoded, version).is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blob_stream_plans_reject_noncanonical_lengths_flags_and_checkpoints() {
+        // Decode fixed literal records so the encoder cannot mask validation gaps.
+        for tag in [0xe1, 0xe2] {
+            let mut valid = vec![b'A', b'S', b'M', 1, tag, 1, 1];
+            valid.extend_from_slice(&[0x42; 32]);
+            valid.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 2]);
+            valid.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 3]);
+            valid.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 4]);
+            assert!(Frame::decode_for_semantic_version(&valid, 9).is_ok());
+            for length in 0..valid.len() {
+                assert!(Frame::decode_for_semantic_version(&valid[..length], 9).is_err());
+            }
+            let mut trailing = valid.clone();
+            trailing.push(0);
+            assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());
+            for (position, value) in [(5, 0), (5, 3), (6, 2)] {
+                let mut invalid = valid.clone();
+                invalid[position] = value;
+                assert!(Frame::decode_for_semantic_version(&invalid, 9).is_err());
+            }
+            for range in [39..47, 47..55, 55..63] {
+                let mut invalid = valid.clone();
+                invalid[range].fill(0);
+                assert!(Frame::decode_for_semantic_version(&invalid, 9).is_err());
+            }
+            let mut absent = vec![b'A', b'S', b'M', 1, tag, 1, 0];
+            absent.push(0);
+            assert!(Frame::decode_for_semantic_version(&absent, 9).is_err());
+            for publication_tag in [0xdd, 0xde, 0xdf, 0xe0] {
+                let mut wrong_tag = valid.clone();
+                wrong_tag[4] = publication_tag;
+                assert!(Frame::decode_for_semantic_version(&wrong_tag, 9).is_err());
+            }
+        }
+        for (next_carrier_index, durable_offset, checkpoint_generation) in
+            [(0, 0, 0), (0, 1, 1), (1, 0, 1)]
+        {
+            let plan = BlobStreamPlanV1 {
+                direction: EventDirection::ToSessionResponder,
+                selection: Some(BlobStreamPlanSelectionV1 {
+                    source_id: BlobTransferId::new([0x42; 32]),
+                    next_carrier_index,
+                    durable_offset,
+                    checkpoint_generation,
+                }),
+            };
+            for frame in [
+                Frame::BlobStreamPlan(plan),
+                Frame::BlobStreamPlanReply(plan),
+            ] {
+                assert!(frame.encode_for_semantic_version(9).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn blob_publication_absent_is_direction_bound_and_v9_only() {
+        let frame = Frame::BlobPublicationAbsent(BlobPublicationAbsentV1 {
+            direction: EventDirection::ToSessionResponder,
+        });
+        let encoded = frame
+            .encode_for_semantic_version(9)
+            .expect("encode absent Blob publication");
+        assert_eq!(encoded[4], BLOB_PUBLICATION_ABSENT_V1);
+        assert_eq!(
+            Frame::decode_for_semantic_version(&encoded, 9)
+                .expect("decode absent Blob publication"),
+            frame
+        );
+        assert!(frame.encode_for_semantic_version(8).is_err());
+        assert!(Frame::decode_for_semantic_version(&encoded, 8).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());
+    }
+
+    #[test]
+    fn blob_publication_resume_binds_receiver_durable_authority() {
+        let frame = Frame::BlobPublicationResume(BlobPublicationResumeV1 {
+            direction: EventDirection::ToSessionResponder,
+            stream_id: [0x11; 32],
+            open_digest: [0x22; 32],
+            durable_plaintext_offset: 1_048_576,
+            durable_wire_offset: 1_048_754,
+            next_segment_index: 1,
+            plaintext_commitment: [0x33; 32],
+            ciphertext_commitment: [0x44; 32],
+            checkpoint_generation: 1,
+        });
+        let encoded = frame
+            .encode_for_semantic_version(9)
+            .expect("encode Blob resume authority");
+        assert_eq!(encoded[4], BLOB_PUBLICATION_RESUME_V1);
+        assert_eq!(
+            Frame::decode_for_semantic_version(&encoded, 9).expect("decode Blob resume authority"),
+            frame
+        );
+        assert!(frame.encode_for_semantic_version(8).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());
+    }
+
+    #[test]
     fn blob_source_class_and_chunk_object_id_are_exactly_typed() {
         let source = BlobTransferId::new([0x5b; 32]);
         let frame = Frame::MutableFetch {
@@ -4833,7 +5347,7 @@ mod tests {
             direction: EventDirection::ToSessionInitiator,
         };
         let raw = frame.encode().unwrap();
-        for semantic_version in 1..=8 {
+        for semantic_version in 1..=9 {
             assert_eq!(
                 frame.encode_for_semantic_version(semantic_version).unwrap(),
                 raw
@@ -4843,6 +5357,6 @@ mod tests {
                 frame
             );
         }
-        assert!(Frame::decode_for_semantic_version(&raw, 9).is_err());
+        assert!(Frame::decode_for_semantic_version(&raw, 10).is_err());
     }
 }

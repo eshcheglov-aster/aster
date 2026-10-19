@@ -2,6 +2,8 @@ name: "Build: .deb arm64"
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,6 +18,7 @@ defaults:
 
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 97
     name: "Build: .deb arm64"
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60

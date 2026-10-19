@@ -247,8 +247,8 @@ same store. Rust applications may instead call
 `RunningNode::selected_state()`, `RunningNode::selected_records()`, and
 `RunningNode::selected_blobs()` for cloneable live handles backed by that
 actor's bounded application lane. Live Blob publish accepts an already-open
-regular nonempty file at cursor zero, with a 64-MiB/1,024 canonical 64-KiB
-chunk ceiling; a live page read returns at most 64 KiB in zeroize-on-drop
+regular nonempty file at cursor zero, bounded by configured depot bytes and
+selected-profile 64-KiB chunk capacity; a live page read returns at most 1 MiB in zeroize-on-drop
 plaintext after fresh source, policy/lineage, and exact authenticated depot
 completion checks. The CLI does not expose these handles as language bindings,
 and its built-in roles neither publish nor read Blob. Record network ingest

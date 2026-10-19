@@ -80,8 +80,9 @@ Default: 8181.
 .BI \-\-timeout " SECONDS"
 Set the client timeout for each RPC to an integer from 1 to 86400 seconds.
 Default: 10 seconds. Each query page gets its own deadline.
-The agent may enforce a shorter deadline; the current aster-agent caps each
-RPC at 30 seconds, even when the client requests more.
+The agent may enforce a shorter deadline. Ordinary RPCs cap at 30 seconds;
+PublishBlob and ReadBlob streams may request up to 1800 seconds and remain
+bounded by connection lifetime and stream progress checks.
 This does not limit time spent reading a publication payload from stdin.
 .TP
 .B \-\-help

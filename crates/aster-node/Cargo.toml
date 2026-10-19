@@ -24,6 +24,7 @@ aster-mesh = { package = "aster-core", path = "../aster-core", default-features 
 aster-negentropy = { path = "../aster-negentropy" }
 aster-profile = { path = "../aster-profile" }
 aster-redb-store = { path = "../aster-redb-store" }
+bytes.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
 tokio.workspace = true

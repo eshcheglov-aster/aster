@@ -70,8 +70,9 @@ service AsterApplicationService {
   rpc DeleteEventSubscription(DeleteEventSubscriptionRequest) returns (DeleteEventSubscriptionResponse);
   // QueryEventGaps reports authenticated gaps in one exact publisher stream.
   rpc QueryEventGaps(QueryEventGapsRequest) returns (QueryEventGapsResponse);
-  // PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
-  rpc PublishBlob(stream PublishBlobRequest) returns (PublishBlobResponse);
+  // PublishBlob negotiates a durable resume offset, then accepts offset-bearing
+  // plaintext chunks while reporting Store-authoritative durable checkpoints.
+  rpc PublishBlob(stream PublishBlobRequest) returns (stream PublishBlobResponse);
   // ReadBlob streams freshly authenticated bounded plaintext pages.
   rpc ReadBlob(ReadBlobRequest) returns (stream ReadBlobResponse);
 }
@@ -91,11 +92,30 @@ message PublishBlobMetadata {
 message PublishBlobRequest {
   oneof frame {
     PublishBlobMetadata metadata = 1;
-    bytes chunk = 2;
+    PublishBlobData data = 2;
+    PublishBlobFinish finish = 3;
   }
 }
 
-message PublishBlobResponse {
+message PublishBlobData {
+  uint64 offset = 1;
+  bytes bytes = 2;
+}
+
+message PublishBlobFinish {}
+
+message PublishBlobAccepted {
+  uint64 accepted_offset = 1;
+  uint64 durable_offset = 2;
+  uint32 canonical_frame_bytes = 3;
+}
+
+message PublishBlobCheckpoint {
+  uint64 accepted_offset = 1;
+  uint64 durable_offset = 2;
+}
+
+message PublishBlobReceipt {
   bytes id = 1;
   bytes publisher = 2;
   uint64 publisher_counter = 3;
@@ -106,6 +126,14 @@ message PublishBlobResponse {
   bytes schema_id = 8;
   uint64 acceptance_marker = 9;
   bool inserted = 10;
+}
+
+message PublishBlobResponse {
+  oneof frame {
+    PublishBlobAccepted accepted = 1;
+    PublishBlobCheckpoint checkpoint = 2;
+    PublishBlobReceipt complete = 3;
+  }
 }
 
 message ReadBlobRequest {

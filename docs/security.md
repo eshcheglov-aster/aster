@@ -281,7 +281,7 @@ are recorded separately in the
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`, and profile 1
+  `1`, the default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`, and profile 1
   has one registered complete suite.
 - Semantic-v7 profile, plan, header, page, and terminal records bind semantic
   version, the canonical transfer-profile digest, lane, selected profile, and
@@ -295,11 +295,11 @@ are recorded separately in the
   only a send attempt, and later authenticated reconciliation determines the
   remaining difference.
 - Both classical and PQ signatures verify; failure is indistinguishable on wire.
-- A compact semantic-version-2/3/v4/v5/v6/v7/v8 batch item is never authenticated by its P-256
+- A compact semantic-version-2/3/v4/v5/v6/v7/v8/v9 batch item is never authenticated by its P-256
   suffix alone: the exact proof credential, authority hybrid signature, source
   hybrid root signature, ciphertext commitment, Merkle path, and item signature
   must all verify. Missing proof means bounded pending state, never delivery.
-- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3 through v8 sessions, use a distinct
+- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3 through v9 sessions, use a distinct
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.
@@ -700,10 +700,11 @@ agreement and never repairs a partial or contradictory lifecycle image.
 The application boundary uses the same authority rather than a second Blob
 store. `RunningNode::selected_blobs()` returns a cloneable handle whose publish
 operation accepts ownership only of a nonempty regular file positioned at byte
-zero and caps it at 64 MiB/1,024 fixed 64-KiB chunks. The source length is
+zero and caps it by configured depot bytes and selected-profile 64-KiB chunk
+capacity. The source length is
 checked across both bounded passes so a concurrent change cannot silently
 change the authenticated intent. A read returns one freshly authenticated
-`1..=64 KiB` plaintext page in a zeroize-on-drop allocation and rechecks policy,
+`1..=1 MiB` plaintext window in a zeroize-on-drop allocation and rechecks policy,
 source selection, current lineage, and the exact depot completion capability
 around decryption. The shared application lane is capped at 32 commands and a
 single joined Blob worker accepts at most one queued Blob command; saturation

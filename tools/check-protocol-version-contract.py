@@ -11,7 +11,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSIONS = tuple(range(1, 9))
+VERSIONS = tuple(range(1, 10))
 DEFAULT_OFFER = tuple(reversed(VERSIONS))
 PROTOCOL_ROWS = {
     1: ("—", "stable Event and Blob-chunk transfer"),
@@ -28,6 +28,10 @@ PROTOCOL_ROWS = {
         "v7 byte-for-byte except the lane AAD domain and Blob custody fields",
         "authenticated finite Blob custody over `BlobRangesStreamV1`",
     ),
+    9: (
+        "v8 stable object and ordinary-lane bytes",
+        "`BlobStreamV1` profile identity and reserved stream-record tags; runtime activation is separately gated",
+    ),
 }
 CDDL_ALIASES = {
     1: "1 / 2",
@@ -38,6 +42,7 @@ CDDL_ALIASES = {
     6: "semantic-v5-object-kind",
     7: "semantic-v6-object-kind",
     8: "semantic-v7-object-kind",
+    9: "semantic-v8-object-kind",
 }
 PROTOCOL_DEFAULT_OFFER_PATTERNS = (
     r"default semantic offer is\s*`\[([^\]]+)\]`",
@@ -80,7 +85,7 @@ def parse_implementation(core: str) -> None:
         missing = tuple(sorted(set(expected_versions) - set(actual_versions)))
         extra = tuple(sorted(set(actual_versions) - set(expected_versions)))
         fail(
-            "implementation versions must be exactly 1 through 8 with matching values; "
+            "implementation versions must be exactly 1 through 9 with matching values; "
             f"missing {missing}, extra {extra}, mismatched {tuple(mismatched)}"
         )
 
@@ -130,7 +135,7 @@ def parse_protocol(protocol: str) -> None:
         missing = tuple(sorted(set(VERSIONS) - set(actual_versions)))
         extra = tuple(sorted(set(actual_versions) - set(VERSIONS)))
         fail(
-            "protocol registry must contain exactly semantic versions 1 through 8; "
+            "protocol registry must contain exactly semantic versions 1 through 9; "
             f"missing {missing}, extra {extra}"
         )
     if rows[6][0] != PROTOCOL_ROWS[6][0]:
@@ -147,6 +152,11 @@ def parse_protocol(protocol: str) -> None:
         fail(
             "protocol v8 inheritance must preserve v7 bytes except the lane AAD domain and Blob custody fields; "
             f"found {rows[8][0]!r}"
+        )
+    if rows[9][0] != PROTOCOL_ROWS[9][0]:
+        fail(
+            "protocol v9 inheritance must preserve v8 stable object and ordinary-lane bytes; "
+            f"found {rows[9][0]!r}"
         )
     if rows != PROTOCOL_ROWS:
         fail(f"protocol registry semantics drifted; found {rows!r}")
@@ -192,7 +202,7 @@ def parse_cddl(cddl: str) -> None:
         missing = tuple(sorted(set(VERSIONS) - set(actual_versions)))
         extra = tuple(sorted(set(actual_versions) - set(VERSIONS)))
         fail(
-            "CDDL object-kind aliases must cover exactly semantic versions 1 through 8; "
+            "CDDL object-kind aliases must cover exactly semantic versions 1 through 9; "
             f"missing {missing}, extra {extra}"
         )
     if aliases[6] != CDDL_ALIASES[6]:
@@ -209,6 +219,11 @@ def parse_cddl(cddl: str) -> None:
         fail(
             "CDDL v8 inheritance must reuse the semantic-v7 object-kind registry; "
             f"found {aliases[8]!r}"
+        )
+    if aliases[9] != CDDL_ALIASES[9]:
+        fail(
+            "CDDL v9 inheritance must reuse the semantic-v8 object-kind registry; "
+            f"found {aliases[9]!r}"
         )
     if aliases != CDDL_ALIASES:
         fail(f"CDDL object-kind registry drifted; found {aliases!r}")
@@ -234,7 +249,7 @@ def main() -> int:
     except (ContractViolation, OSError) as error:
         print(f"protocol version contract check failed: {error}", file=sys.stderr)
         return 1
-    print("protocol version contract check passed: semantic versions 1 through 8 align")
+    print("protocol version contract check passed: semantic versions 1 through 9 align")
     return 0
 
 

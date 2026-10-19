@@ -84,8 +84,10 @@ listeners; `--host` does not change that server restriction. There is no TLS.
 Each RPC has a configurable timeout (10 seconds by default), a 4-MiB response
 limit and a 4-MiB decoded-element budget.
 Use `--timeout 30` or `--timeout=30` before or after the command to change the
-client deadline. The agent may enforce a shorter deadline: the current
-`aster-agent` caps each RPC at 30 seconds, even when the client requests more.
+client deadline. The agent may enforce a shorter deadline. Ordinary RPCs cap
+at 30 seconds; progressing `PublishBlob` and `ReadBlob` streams may request up
+to 1,800 seconds and are still bounded by the connection lifetime and stream
+progress checks.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
 
@@ -101,11 +103,15 @@ asterctl --token-file ./client.token blob-read \
     --output ./downloaded-map.bin
 ```
 
+The agent returns freshly authorized read windows of at most 1 MiB; `asterctl`
+streams each window directly into its private no-replace output staging file.
+
 `blob-publish` requires a nonempty regular source file. The path remains local
 and is never sent to the agent. The client sends metadata first, then streams
-canonical chunks of at most 64 KiB without buffering the whole Blob or treating
+canonical 64-KiB data frames (with only the terminal data frame shorter) without buffering the whole Blob or treating
 the current backend size policy as a public maximum. The current agent may
-reject a source above its configured backend limit. Keep the opened source
+reject a source above its configured backend limit. Finite-TTL uploads also
+retain the 64-MiB implementation cap. Keep the opened source
 file's contents and length unchanged until the command exits. Detectable size
 changes fail the command with an unknown publication outcome; in-place
 same-length mutation is outside the command contract and can produce mixed
@@ -113,18 +119,33 @@ source bytes. `--schema-id` is Base64;
 `--ttl-ms` accepts positive unsigned 64-bit milliseconds, including
 `18446744073709551615`. Omitting it selects durable publication.
 
+Before reading payload bytes, `asterctl` waits for the agent's accepted offset
+and seeks the already-open regular file to that position. Durable uploads use
+the exact Store-confirmed resume offset. Finite-TTL uploads always start at zero
+and use private agent staging followed by the retained custody publication path.
+Staging progress advances accepted bytes while the durable offset stays zero;
+a disconnected finite upload retries the whole file with the same operation key
+and options. Every request data frame carries its absolute offset; concurrent
+response processing rejects a regressing durable checkpoint or one beyond bytes
+successfully sent. An explicit finish closes the payload grammar, and success
+is reported only after the terminal durable publication receipt.
+
 `blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
-it writes to an anonymous temporary inode in the pinned destination directory,
-then publishes that exact open inode with an atomic no-replace descriptor link
-after synchronization. No named partial path exists. Closing the descriptor
-discards an incomplete read, and an existing or concurrently created
-destination is never overwritten. The command fails before contacting the
-agent on non-Linux platforms and when the destination filesystem cannot create
-the required anonymous temporary. If descriptor-link publication is
-unsupported, finalization fails without publishing an output path. Every
-streamed page must have contiguous offsets, stable authenticated metadata and
-TTL, and an exact complete length. Blob bytes go only to the destination;
-stdout contains metadata and never Blob plaintext.
+it requires a destination directory owned by the current user and not writable
+by group or other users. It writes to a randomly named mode-0600 sibling,
+synchronizes the complete verified stream, then atomically renames that exact
+inode with no-replace semantics and synchronizes the directory. The requested
+destination remains absent until publication, and an existing or concurrently
+created destination is never overwritten. Failure cleanup removes the sibling
+on a best-effort basis; filesystem errors or an abrupt process or host failure
+can leave that hidden owner-only file for operator cleanup. A post-publication
+directory-sync error says that the output exists and must be verified before
+retrying. The command fails before contacting the agent on non-Linux platforms
+and fails closed when the destination filesystem cannot provide named staging,
+atomic no-replace rename, or directory synchronization. Every streamed page
+must have contiguous offsets, stable authenticated metadata and TTL, and an
+exact complete length. Blob bytes go only to the output filesystem; stdout
+contains metadata and never Blob plaintext.
 
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.

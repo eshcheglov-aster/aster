@@ -40,6 +40,7 @@ semantic-v5-object-kind = semantic-v4-object-kind
 semantic-v6-object-kind = semantic-v5-object-kind
 semantic-v7-object-kind = semantic-v6-object-kind
 semantic-v8-object-kind = semantic-v7-object-kind
+semantic-v9-object-kind = semantic-v8-object-kind
 object-id = bytes .size 33
 hash-256 = bytes .size 32
 priority = 0..3
@@ -146,3 +147,12 @@ sync-message = interest / summary / probe / radix-node / offer / want / data / r
 ; order are specified in protocol.md section 9.4 and locked by the executable
 ; conformance/vectors/event-pages-v7.tsv corpus. They allocate no ObjectKind and
 ; do not change any sync-message encoding above.
+;
+; Semantic-v9 retained-source Blob stream plans are also fixed binary
+; mechanics, not CBOR: ASM\x01 || tag (0xe1 plan, 0xe2 reply) || direction u8
+; || presence u8 || optional(source_id[32] || next_carrier_index u64
+; || durable_offset u64 || checkpoint_generation u64). Integers are big-endian;
+; bodies are exactly 2 or 58 bytes. Direction is 1 or 2, presence is 0 or 1,
+; generation is nonzero, and index/offset are either both zero or both nonzero.
+; The protected phase, publication-tag separation, and validation rules are
+; specified in protocol.md section 9.4.

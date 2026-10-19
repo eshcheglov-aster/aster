@@ -11,20 +11,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
 
 use aster_mesh::{
     BlobChunkRecord, BlobManifest, BlobMetadata as CoreBlobMetadata, BlobPhysicalLineage,
-    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
+    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, VerifiedBlobTransferObject,
 };
 use redb::{ReadableTable, ReadableTableMetadata};
 
 use super::*;
 
 const DEPOT_DIRECTORY: &str = "blob-depot-v1";
+const BLOB_PACK_DIRECTORY: &str = "stream-packs-v1";
 const DEPOT_OWNER_FILE: &str = ".aster-store-owner-v1";
 const DEPOT_OWNER_TEMP_PREFIX: &str = ".aster-store-owner-tmp-";
 const DEPOT_PENDING_PREFIX: &str = ".aster-blob-depot-pending-v1-";
@@ -677,6 +678,87 @@ pub struct BlobDepot<'a> {
     read_authorized_variant: Option<BlobVariantId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PreparedBlobStreamCarrier {
+    pub index: u64,
+    pub record: BlobChunkRecord,
+    pub committed_file_bytes: u64,
+    pub already_committed: bool,
+}
+
+pub(super) fn commit_prepared_stream_markers_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    prepared: &[PreparedBlobStreamCarrier],
+) -> Result<(), StoreError> {
+    let mut added_bytes = 0_u64;
+    let mut added_chunks = 0_u64;
+    for carrier in prepared {
+        let key = chunk_key(variant, carrier.index);
+        let mut state = write
+            .open_table(BLOB_CHUNKS)?
+            .get(key.as_slice())?
+            .map(|row| decode_chunk_state(row.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "prepared stream carrier lost its durable state",
+                ))
+            })?;
+        if state.committed == Some(carrier.record) {
+            if state.committed_file_bytes != carrier.committed_file_bytes {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "duplicate stream carrier file accounting differs",
+                )));
+            }
+            continue;
+        }
+        if carrier.already_committed
+            || state.committed.is_some()
+            || state.expected != Some(carrier.record)
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "prepared stream carrier conflicts with its marker",
+            )));
+        }
+        state.committed = Some(carrier.record);
+        state.committed_file_bytes = carrier.committed_file_bytes;
+        let encoded = encode_chunk_state(state);
+        write
+            .open_table(BLOB_CHUNKS)?
+            .insert(key.as_slice(), encoded.as_slice())?;
+        added_bytes = added_bytes
+            .checked_add(carrier.committed_file_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        added_chunks = added_chunks
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    }
+    if added_chunks != 0 {
+        let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
+        let bytes = metadata
+            .get(DEPOT_COMMITTED_FILE_BYTES)?
+            .map_or(0, |row| row.value());
+        let chunks = metadata
+            .get(DEPOT_COMMITTED_CHUNK_COUNT)?
+            .map_or(0, |row| row.value());
+        metadata.insert(
+            DEPOT_COMMITTED_FILE_BYTES,
+            bytes
+                .checked_add(added_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )?;
+        metadata.insert(
+            DEPOT_COMMITTED_CHUNK_COUNT,
+            chunks
+                .checked_add(added_chunks)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        )?;
+    }
+    super::pressure::reconcile_variant_write(write, variant)?;
+    Ok(())
+}
+
 /// Capability-gated, mutation-incapable adapter for one finalized Blob variant.
 ///
 /// This deliberately implements the generic core store seam so authenticated
@@ -823,6 +905,187 @@ impl CoreBlobStore for AuthenticatedBlobReadDepot<'_> {
 }
 
 impl<'a> BlobDepot<'a> {
+    /// Makes every file in one bounded stream batch durable without publishing
+    /// any new committed marker. The caller must atomically install the
+    /// returned markers with the cumulative stream checkpoint.
+    pub(super) fn prepare_verified_stream_batch(
+        &mut self,
+        carriers: &[VerifiedBlobTransferObject],
+    ) -> Result<Vec<PreparedBlobStreamCarrier>, StoreError> {
+        let active = self.active.ok_or_else(|| {
+            blob_error(BlobStoreError::DepotIntegrity(
+                "Blob stream batch has no active import",
+            ))
+        })?;
+        for carrier in carriers {
+            self.ensure_chunk_record(active, carrier.index(), carrier.record())?;
+            if usize::try_from(carrier.record().ciphertext_len()).ok()
+                != Some(carrier.ciphertext().len())
+                || <[u8; 32]>::from(Sha256::digest(carrier.ciphertext()))
+                    != *carrier.record().ciphertext_sha256()
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "verified stream carrier bytes differ from their record",
+                )));
+            }
+        }
+        self.stage_stream_expected_records(active, carriers)?;
+
+        let variant = self
+            .root
+            .open_child_directory(&hex32(active.variant_id.as_bytes()), true)?;
+        let mut prepared = Vec::with_capacity(carriers.len());
+        for carrier in carriers {
+            let index = carrier.index();
+            let record = carrier.record();
+            let state = self.load_chunk(active, index)?.ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "stream carrier lost its expected durable record",
+                ))
+            })?;
+            let file_name = chunk_file_name(index);
+            if state.committed == Some(record) {
+                verify_chunk_file(
+                    &variant,
+                    &file_name,
+                    active,
+                    index,
+                    record,
+                    state.committed_file_bytes,
+                )?;
+                prepared.push(PreparedBlobStreamCarrier {
+                    index,
+                    record,
+                    committed_file_bytes: state.committed_file_bytes,
+                    already_committed: true,
+                });
+                continue;
+            }
+            if state.committed.is_some() || state.expected != Some(record) {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "stream carrier conflicts with durable chunk state",
+                )));
+            }
+            variant.unlink_file_if_exists_no_sync(&file_name)?;
+            let encoded = encode_chunk_file(active, index, record, carrier.ciphertext())?;
+            let committed_file_bytes = u64::try_from(encoded.len())
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+            variant.write_atomic_without_directory_sync(&file_name, &encoded)?;
+            prepared.push(PreparedBlobStreamCarrier {
+                index,
+                record,
+                committed_file_bytes,
+                already_committed: false,
+            });
+        }
+        // One directory barrier publishes every rename in the batch before
+        // any database marker or checkpoint can become authoritative.
+        variant.sync()?;
+        maybe_inject_fault(&variant.path, DepotFaultPoint::DirectorySynced)?;
+        Ok(prepared)
+    }
+
+    fn stage_stream_expected_records(
+        &self,
+        active: ActiveImport,
+        carriers: &[VerifiedBlobTransferObject],
+    ) -> Result<(), StoreError> {
+        let write = self.store.database.begin_write()?;
+        enforce_live_write(&write)?;
+        super::deletion::require_variant_available_write(&write, active.variant_id)?;
+        super::pressure::require_variant_write(&write, active.variant_id)?;
+        let import = load_import_write(&write, active.variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::DepotIntegrity("Blob import disappeared")))?;
+        if import.blob_id != active.blob_id
+            || import.content_group != active.content_group
+            || import.epoch != active.epoch
+            || import.total_len != active.total_len
+            || import.chunk_count != active.chunk_count
+            || import.physical_lineage != active.physical_lineage
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "active Blob stream import changed",
+            )));
+        }
+        let admission = depot_admission_usage_write(&write)?;
+        let mut added_rows = 0_u64;
+        let mut added_reserved = 0_u64;
+        for carrier in carriers {
+            let key = chunk_key(active.variant_id, carrier.index());
+            let existing = write
+                .open_table(BLOB_CHUNKS)?
+                .get(key.as_slice())?
+                .map(|row| decode_chunk_state(row.value()))
+                .transpose()?;
+            let mut state = existing.unwrap_or_default();
+            let record = carrier.record();
+            if state
+                .plaintext_digest
+                .is_some_and(|digest| digest != *record.plaintext_sha256())
+                || state.expected.is_some_and(|expected| expected != record)
+                || state.committed.is_some_and(|committed| committed != record)
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "stream carrier differs from durable expected metadata",
+                )));
+            }
+            if existing.is_none() {
+                added_rows = added_rows
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            }
+            if state.expected.is_none() {
+                added_reserved = added_reserved
+                    .checked_add(chunk_file_len(record)?)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+            state.plaintext_digest = Some(*record.plaintext_sha256());
+            state.expected = Some(record);
+            let encoded = encode_chunk_state(state);
+            write
+                .open_table(BLOB_CHUNKS)?
+                .insert(key.as_slice(), encoded.as_slice())?;
+        }
+        if admission
+            .chunks
+            .checked_add(added_rows)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+            > self.store.blob_depot_limits.max_chunks
+        {
+            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
+                current: admission.chunks,
+                limit: self.store.blob_depot_limits.max_chunks,
+            }));
+        }
+        if admission
+            .reserved_bytes
+            .checked_add(added_reserved)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            > self.store.blob_depot_limits.max_bytes
+        {
+            return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
+                current: admission.reserved_bytes,
+                incoming: added_reserved,
+                limit: self.store.blob_depot_limits.max_bytes,
+            }));
+        }
+        if added_reserved != 0 {
+            let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
+            let reserved = metadata
+                .get(DEPOT_RESERVED_FILE_BYTES)?
+                .map_or(0, |row| row.value());
+            metadata.insert(
+                DEPOT_RESERVED_FILE_BYTES,
+                reserved
+                    .checked_add(added_reserved)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            )?;
+        }
+        super::pressure::reconcile_variant_write(&write, active.variant_id)?;
+        write.commit()?;
+        Ok(())
+    }
+
     pub(super) fn acquire_local_import_attempt(
         &mut self,
         staging: BlobTransferId,
@@ -898,6 +1161,13 @@ impl<'a> BlobDepot<'a> {
         variant: BlobVariantId,
     ) -> Result<(), StoreError> {
         self.ensure_variant_lease(variant, super::lease::BlobLeaseKind::InternalChunkWork)
+    }
+
+    pub(super) fn acquire_carrier_extent_lease(
+        &mut self,
+        variant: BlobVariantId,
+    ) -> Result<(), StoreError> {
+        self.ensure_variant_lease(variant, super::lease::BlobLeaseKind::CarrierExtent)
     }
 
     pub(super) fn open(store: &'a Store) -> Result<Self, StoreError> {
@@ -1414,11 +1684,14 @@ impl<'a> BlobDepot<'a> {
         // so acquiring another worker lease here would turn a stopped whole-
         // Blob read into unbounded worker work. The write-transaction check
         // below remains the durable DeletePending fence for both cases.
-        if self._lease.is_some() {
-            self.ensure_variant_lease(
-                incoming.variant_id,
-                super::lease::BlobLeaseKind::LocalImport,
-            )?;
+        if let Some(lease) = &self._lease {
+            let held = lease.kind().map_err(super::lease::store_error)?;
+            let required = if held == super::lease::BlobLeaseKind::CarrierExtent {
+                held
+            } else {
+                super::lease::BlobLeaseKind::LocalImport
+            };
+            self.ensure_variant_lease(incoming.variant_id, required)?;
         }
         #[cfg(test)]
         self.store
@@ -1509,6 +1782,82 @@ impl<'a> BlobDepot<'a> {
         self.active = Some(active_from_import(&incoming));
         Ok(())
     }
+}
+
+/// Opens the owner-bound directory used by append-only stream packs.  The
+/// returned capability is descriptor-backed; callers never reconstruct its
+/// path or reopen it by pathname.
+pub(super) fn open_blob_pack_root(
+    store: &Store,
+    create: bool,
+) -> Result<OwnedDirectory, StoreError> {
+    let depot = BlobDepot::open_network_mutation(store, create)?;
+    depot.root.open_child_directory(BLOB_PACK_DIRECTORY, create)
+}
+
+/// Discards only the bounded, private artifact set for a stream reservation
+/// whose caller has locked and rechecked the absence of any redb checkpoint or
+/// publication. Preflight every entry before unlinking anything; a temporary
+/// atomic-write file is never authority to remove an unknown artifact.
+pub(super) fn discard_uncheckpointed_blob_pack(
+    root: &OwnedDirectory,
+    open_digest: [u8; 32],
+    max_pack_len: u64,
+    checkpoint_len: u64,
+) -> Result<(), StoreError> {
+    const MAX_ATOMIC_TEMPS: usize = 64;
+    const MAX_COMPLETION_LEN: u64 = 1024;
+    let name = hex32(&open_digest);
+    let directory = match root.open_child_directory(&name, false) {
+        Ok(directory) => directory,
+        Err(StoreError::Blob(BlobStoreError::Io(error)))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let entries = directory.entry_names_bounded(4 + MAX_ATOMIC_TEMPS)?;
+    let mut temporary_count = 0;
+    for entry in &entries {
+        // These are the fixed files of the v1 stream-pack layout. Atomic
+        // temporaries can contain an incomplete journal or completion write.
+        let max_len = match entry.as_str() {
+            "segments.pack" => max_pack_len,
+            "checkpoint.0" | "checkpoint.1" => checkpoint_len,
+            "completion" => MAX_COMPLETION_LEN,
+            _ if canonical_atomic_temp_name(entry) => {
+                temporary_count += 1;
+                if temporary_count > MAX_ATOMIC_TEMPS {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack has too many atomic-write temporaries",
+                    )));
+                }
+                checkpoint_len.max(MAX_COMPLETION_LEN)
+            }
+            _ => {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob pack contains an unexpected artifact",
+                )));
+            }
+        };
+        directory.require_private_artifact(entry, max_len)?;
+    }
+    for entry in entries {
+        directory.remove_if_exists(&entry, false)?;
+    }
+    root.remove_if_exists(&name, true)
+}
+
+fn canonical_atomic_temp_name(name: &str) -> bool {
+    let Some((pid, sequence)) = name
+        .strip_prefix(TEMP_PREFIX)
+        .and_then(|v| v.split_once('-'))
+    else {
+        return false;
+    };
+    matches!(pid.parse::<u32>(), Ok(value) if value != 0 && value.to_string() == pid)
+        && matches!(sequence.parse::<u64>(), Ok(value) if value != 0 && value.to_string() == sequence)
 }
 
 impl CoreBlobStore for BlobDepot<'_> {
@@ -2446,7 +2795,13 @@ pub(crate) fn prepare_depot_owner_token_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    if legacy.iter().any(|table| !existing.contains(*table)) || !matches!(network_present, 0 | 4) {
+    let legacy_network_schema = network[..4].iter().all(|table| existing.contains(*table))
+        && !existing.contains(network[4]);
+    if legacy.iter().any(|table| !existing.contains(*table))
+        || !(network_present == 0
+            || network_present == network.len()
+            || (network_present == 4 && legacy_network_schema))
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
@@ -3879,6 +4234,12 @@ fn reclaim_unmarked_artifacts(
         if name == "." || name == ".." || name == DEPOT_OWNER_FILE {
             continue;
         }
+        if name == BLOB_PACK_DIRECTORY {
+            // Append-only packs are a separate owner-bound namespace. Their
+            // exact files are governed by Blob stream reservation/publication
+            // authority and must never be interpreted as legacy variants.
+            continue;
+        }
         let Some(raw) = decode_hex32(&name) else {
             // Only known temporary files are reclaimable at the root. Unknown
             // artifacts fail closed rather than broadening cleanup authority.
@@ -3986,6 +4347,7 @@ fn audit_unmarked_artifacts_read(
     }
     for name in root.entry_names()? {
         if name == DEPOT_OWNER_FILE
+            || name == BLOB_PACK_DIRECTORY
             || name.starts_with(TEMP_PREFIX)
             || name.starts_with(DEPOT_OWNER_TEMP_PREFIX)
         {
@@ -4217,11 +4579,22 @@ pub(super) fn stage_verified_plan_write(
     write: &redb::WriteTransaction,
     limits: BlobDepotLimits,
     plan: &VerifiedBlobTransferPlan,
+    stream_v1: bool,
 ) -> Result<(), StoreError> {
     let manifest = plan.manifest();
     let incoming = ImportRecord::from_manifest(manifest, Some(plan.physical_lineage()))?;
-    if incoming.total_len > MAX_NETWORK_BLOB_BYTES
-        || incoming.chunk_count > MAX_NETWORK_BLOB_CHUNKS
+    let max_bytes = if stream_v1 {
+        limits.max_bytes()
+    } else {
+        MAX_NETWORK_BLOB_BYTES
+    };
+    let max_chunks = if stream_v1 {
+        limits.max_chunks().min(MAX_SELECTED_BLOB_CHUNKS)
+    } else {
+        MAX_NETWORK_BLOB_CHUNKS
+    };
+    if incoming.total_len > max_bytes
+        || incoming.chunk_count > max_chunks
         || usize::try_from(incoming.chunk_count).ok() != Some(plan.chunk_records().len())
     {
         return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
@@ -5258,7 +5631,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-struct OwnedDirectory {
+pub(super) struct OwnedDirectory {
     path: PathBuf,
     created_by_open: bool,
     #[cfg(unix)]
@@ -5424,6 +5797,15 @@ fn read_manifest_deletion_file(
 }
 
 impl OwnedDirectory {
+    pub(super) fn read_private_file_if_present(
+        &self,
+        name: &str,
+        max_len: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read_private_regular_file_if_present(name, max_len)
+            .map_err(|error| error.error)
+    }
+
     fn open_root_if_present(store_path: &Path) -> Result<Option<Self>, StoreError> {
         Self::open_root_internal(store_path)
     }
@@ -6346,7 +6728,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn open_child_directory(&self, name: &str, create: bool) -> Result<Self, StoreError> {
+    pub(super) fn open_child_directory(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, StoreError> {
         let mut created = false;
         let descriptor = match rustix::fs::openat(
             &self.file,
@@ -6399,7 +6785,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn open_child_directory(&self, name: &str, create: bool) -> Result<Self, StoreError> {
+    pub(super) fn open_child_directory(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, StoreError> {
         let path = self.path.join(name);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.is_dir() => {
@@ -6420,7 +6810,19 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_without_directory_sync(final_name, bytes)?;
+        self.sync()?;
+        maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_atomic_without_directory_sync(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
         let temp_name = format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6451,15 +6853,23 @@ impl OwnedDirectory {
             return Err(blob_error(BlobStoreError::Io(error.into())));
         }
         maybe_inject_fault(&self.path, DepotFaultPoint::Renamed)?;
-        self.file
-            .sync_all()
-            .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_without_directory_sync(final_name, bytes)?;
+        self.sync()?;
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }
 
     #[cfg(not(unix))]
-    fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    fn write_atomic_without_directory_sync(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
         let temp = self.path.join(format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6475,8 +6885,6 @@ impl OwnedDirectory {
         maybe_inject_fault(&self.path, DepotFaultPoint::TempSynced)?;
         std::fs::rename(&temp, &final_path)?;
         maybe_inject_fault(&self.path, DepotFaultPoint::Renamed)?;
-        File::open(&self.path)?.sync_all()?;
-        maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }
 
@@ -6693,11 +7101,15 @@ impl OwnedDirectory {
         Ok(std::fs::read_dir(&self.path)?.next().is_none())
     }
 
-    #[cfg(unix)]
     fn entry_names(&self) -> Result<Vec<String>, StoreError> {
+        self.entry_names_bounded(usize::MAX)
+    }
+
+    #[cfg(unix)]
+    fn entry_names_bounded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
         let directory = rustix::fs::Dir::read_from(&self.file)
             .map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
-        directory
+        let entries = directory
             .map(|entry| {
                 let entry = entry.map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
                 entry.file_name().to_str().map(str::to_owned).map_err(|_| {
@@ -6707,12 +7119,20 @@ impl OwnedDirectory {
                 })
             })
             .filter(|entry| !matches!(entry, Ok(name) if name == "." || name == ".."))
-            .collect()
+            .take(limit.saturating_add(1))
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries.len() > limit {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob directory exceeds the allowed artifact count",
+            )));
+        }
+        Ok(entries)
     }
 
     #[cfg(not(unix))]
-    fn entry_names(&self) -> Result<Vec<String>, StoreError> {
-        std::fs::read_dir(&self.path)?
+    fn entry_names_bounded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let entries = std::fs::read_dir(&self.path)?
+            .take(limit.saturating_add(1))
             .map(|entry| {
                 entry
                     .map_err(|error| blob_error(BlobStoreError::Io(error)))?
@@ -6724,11 +7144,47 @@ impl OwnedDirectory {
                         ))
                     })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries.len() > limit {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob directory exceeds the allowed artifact count",
+            )));
+        }
+        Ok(entries)
     }
 
     #[cfg(unix)]
-    fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
+    fn require_private_artifact(&self, name: &str, max_len: u64) -> Result<(), StoreError> {
+        let metadata = rustix::fs::statat(&self.file, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
+        if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+            != rustix::fs::FileType::RegularFile
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+            || metadata.st_mode & 0o777 != 0o600
+            || metadata.st_nlink != 1
+            || u64::try_from(metadata.st_size).map_or(true, |len| len > max_len)
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob pack artifact type, ownership, mode, link count, or length mismatches",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn require_private_artifact(&self, name: &str, max_len: u64) -> Result<(), StoreError> {
+        let metadata = std::fs::symlink_metadata(self.path.join(name))
+            .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+        if !metadata.is_file() || metadata.len() > max_len {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob pack artifact type or length mismatches",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let flags = if directory {
             rustix::fs::AtFlags::REMOVEDIR
         } else {
@@ -6781,7 +7237,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
+    pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let result = if directory {
             std::fs::remove_dir(self.path.join(name))
         } else {
@@ -6834,6 +7290,94 @@ fn read_exact_chunk_file_parts(
     {
         return Err(blob_error(BlobStoreError::DepotIntegrity(
             "marked Blob chunk is oversized",
+        )));
+    }
+    Ok(())
+}
+
+impl OwnedDirectory {
+    pub(super) fn open_private_rw_file(
+        &self,
+        name: &str,
+        create_new: bool,
+    ) -> Result<File, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let mut flags = rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC;
+            if create_new {
+                flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
+            }
+            let descriptor = rustix::fs::openat(
+                &self.file,
+                name,
+                flags,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(|error| {
+                if error == rustix::io::Errno::LOOP
+                    || error == rustix::io::Errno::ISDIR
+                    || error == rustix::io::Errno::NOTDIR
+                {
+                    blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    ))
+                } else {
+                    blob_error(BlobStoreError::Io(error.into()))
+                }
+            })?;
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(create_new);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob pack file is not regular",
+                )));
+            }
+            Ok(file)
+        }
+    }
+
+    pub(super) fn open_private_read_file(&self, name: &str) -> Result<File, StoreError> {
+        let mut file = self.open_private_rw_file(name, false)?;
+        file.rewind()
+            .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+        Ok(file)
+    }
+}
+
+fn require_relative_leaf_name(name: &str) -> Result<(), StoreError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob pack filename is not a relative leaf",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_pack_file(file: &File) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob pack type, ownership, mode, or link count mismatches",
         )));
     }
     Ok(())

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
+pub(crate) const SEMANTIC_PROTOCOL_V9: u16 = 9;
 pub(crate) const MAX_CHANGE_PAGE_PROTECTED_BYTES: usize = aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES;
 const MECHANICS_FRAME_OVERHEAD_BYTES: usize = crate::frame::MECHANICS_FRAME_PREFIX_BYTES;
 pub(crate) const MAX_CHANGE_PAGE_CODEC_BYTES: usize = MAX_CHANGE_PAGE_PROTECTED_BYTES
@@ -1510,6 +1511,73 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_profile_v9_is_blob_stream_only_and_preserves_v7_v8_bytes() {
+        let v7 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
+            .expect("v7 transfer-profile offer");
+        let v8 =
+            TransferProfileOfferV1::for_semantic_version(8).expect("v8 transfer-profile offer");
+        let v9 =
+            TransferProfileOfferV1::for_semantic_version(9).expect("v9 transfer-profile offer");
+
+        assert_eq!(
+            v7.encode().expect("v7 offer"),
+            v8.encode().expect("v8 offer")
+        );
+        assert_eq!(
+            v9.encode().expect("v9 offer"),
+            vec![
+                1, 5, // codec version and lane count
+                0, 5, 1, 0, 1, // EventBridge: LegacyV6
+                0, 4, 1, 0, 5, // Blob: BlobStreamV1
+                0, 3, 1, 0, 1, // Record: LegacyV6
+                0, 2, 1, 0, 1, // State: LegacyV6
+                0, 1, 2, 0, 2, 0, 1, // Event: EventPagesV1, LegacyV6
+            ]
+        );
+        assert_eq!(
+            v9.known_lanes()
+                .into_iter()
+                .find(|(lane, _)| *lane == LaneId::Blob),
+            Some((LaneId::Blob, vec![TransferProfileId::BlobStreamV1]))
+        );
+        assert_eq!(
+            TransferProfileId::decode(5),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        let negotiated = negotiate_transfer_profiles_for_semantic_version(9, &v9, &v9)
+            .expect("matching v9 offers");
+        assert_eq!(
+            negotiated.profile(LaneId::Blob),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            transfer_profile_digest(&v9, &v9, &negotiated),
+            [
+                0xac, 0xe5, 0xad, 0x78, 0xfa, 0x87, 0x20, 0x39, 0x40, 0x22, 0x1a, 0xbc, 0x2a, 0x90,
+                0x61, 0x44, 0xbf, 0xb0, 0xca, 0xd7, 0x4f, 0xca, 0xfc, 0x50, 0x89, 0xb5, 0x75, 0x97,
+                0x1d, 0x63, 0x59, 0x6f,
+            ]
+        );
+        assert!(negotiate_transfer_profiles_for_semantic_version(8, &v9, &v9).is_err());
+
+        let stream_on_event = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::BlobStreamV1]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Event,
+                vec![
+                    TransferProfileId::BlobStreamV1,
+                    TransferProfileId::EventPagesV1,
+                    TransferProfileId::LegacyV6,
+                ],
+            ),
+        ]);
+        assert!(stream_on_event.encode().is_err());
+    }
 
     #[test]
     fn blob_stream_profile_is_version_neutral_and_fails_closed() {

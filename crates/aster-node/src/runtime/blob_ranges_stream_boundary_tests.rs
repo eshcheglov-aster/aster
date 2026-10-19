@@ -177,9 +177,9 @@ async fn stream_prefix_conflict_contact(
         }
     });
     let policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
-    let result = sync_once_with_forwarding(
-        &client,
-        OutboundContact {
+    let result = with_test_semantic_version(
+        SEMANTIC_PROTOCOL_V8,
+        sync_once_with_forwarding(&client, OutboundContact {
             store: client_store,
             mission: client_mission,
             peer: MissionExpectedPeer {
@@ -200,7 +200,7 @@ async fn stream_prefix_conflict_contact(
             event_bridge: None,
             mutable_interests: interests,
             controlled_relay: None,
-        },
+        }),
     )
     .await;
     client.close().await;

@@ -31,7 +31,7 @@ OPTIONS:
   -h, --host IP          Loopback agent IP address (default: 127.0.0.1)
   -p, --port PORT        Aster node RPC port (default: 8181)
       --timeout SECONDS Client RPC timeout, 1–86400 seconds (default: 10)
-                        Agent-side deadlines may be shorter (currently at most 30s)
+                        Ordinary agent RPCs cap at 30s; Blob streams cap at 1800s
   -j, --json             Print output in JSON (when possible)
   -t, --token TOKEN      Aster node API token as plain text
       --token-file PATH  Read the agent API token from a file

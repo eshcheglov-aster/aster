@@ -123,8 +123,9 @@ type AsterApplicationServiceClient interface {
 	DeleteEventSubscription(context.Context, *connect.Request[DeleteEventSubscriptionRequest]) (*connect.Response[DeleteEventSubscriptionResponse], error)
 	// QueryEventGaps reports authenticated gaps in one exact publisher stream.
 	QueryEventGaps(context.Context, *connect.Request[QueryEventGapsRequest]) (*connect.Response[QueryEventGapsResponse], error)
-	// PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
-	PublishBlob(context.Context) *connect.ClientStreamForClient[PublishBlobRequest, PublishBlobResponse]
+	// PublishBlob negotiates a durable resume offset, then accepts offset-bearing
+	// plaintext chunks while reporting Store-authoritative durable checkpoints.
+	PublishBlob(context.Context) *connect.BidiStreamForClient[PublishBlobRequest, PublishBlobResponse]
 	// ReadBlob streams freshly authenticated bounded plaintext pages.
 	ReadBlob(context.Context, *connect.Request[ReadBlobRequest]) (*connect.ServerStreamForClient[ReadBlobResponse], error)
 }
@@ -363,8 +364,8 @@ func (c *asterApplicationServiceClient) QueryEventGaps(ctx context.Context, req 
 }
 
 // PublishBlob calls aster.application.v1alpha1.AsterApplicationService.PublishBlob.
-func (c *asterApplicationServiceClient) PublishBlob(ctx context.Context) *connect.ClientStreamForClient[PublishBlobRequest, PublishBlobResponse] {
-	return c.publishBlob.CallClientStream(ctx)
+func (c *asterApplicationServiceClient) PublishBlob(ctx context.Context) *connect.BidiStreamForClient[PublishBlobRequest, PublishBlobResponse] {
+	return c.publishBlob.CallBidiStream(ctx)
 }
 
 // ReadBlob calls aster.application.v1alpha1.AsterApplicationService.ReadBlob.
@@ -407,8 +408,9 @@ type AsterApplicationServiceHandler interface {
 	DeleteEventSubscription(context.Context, *connect.Request[DeleteEventSubscriptionRequest]) (*connect.Response[DeleteEventSubscriptionResponse], error)
 	// QueryEventGaps reports authenticated gaps in one exact publisher stream.
 	QueryEventGaps(context.Context, *connect.Request[QueryEventGapsRequest]) (*connect.Response[QueryEventGapsResponse], error)
-	// PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
-	PublishBlob(context.Context, *connect.ClientStream[PublishBlobRequest]) (*connect.Response[PublishBlobResponse], error)
+	// PublishBlob negotiates a durable resume offset, then accepts offset-bearing
+	// plaintext chunks while reporting Store-authoritative durable checkpoints.
+	PublishBlob(context.Context, *connect.BidiStream[PublishBlobRequest, PublishBlobResponse]) error
 	// ReadBlob streams freshly authenticated bounded plaintext pages.
 	ReadBlob(context.Context, *connect.Request[ReadBlobRequest], *connect.ServerStream[ReadBlobResponse]) error
 }
@@ -516,7 +518,7 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		connect.WithSchema(asterApplicationServiceMethods.ByName("QueryEventGaps")),
 		connect.WithHandlerOptions(opts...),
 	)
-	asterApplicationServicePublishBlobHandler := connect.NewClientStreamHandler(
+	asterApplicationServicePublishBlobHandler := connect.NewBidiStreamHandler(
 		AsterApplicationServicePublishBlobProcedure,
 		svc.PublishBlob,
 		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishBlob")),
@@ -639,8 +641,8 @@ func (UnimplementedAsterApplicationServiceHandler) QueryEventGaps(context.Contex
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.QueryEventGaps is not implemented"))
 }
 
-func (UnimplementedAsterApplicationServiceHandler) PublishBlob(context.Context, *connect.ClientStream[PublishBlobRequest]) (*connect.Response[PublishBlobResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishBlob is not implemented"))
+func (UnimplementedAsterApplicationServiceHandler) PublishBlob(context.Context, *connect.BidiStream[PublishBlobRequest, PublishBlobResponse]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishBlob is not implemented"))
 }
 
 func (UnimplementedAsterApplicationServiceHandler) ReadBlob(context.Context, *connect.Request[ReadBlobRequest], *connect.ServerStream[ReadBlobResponse]) error {

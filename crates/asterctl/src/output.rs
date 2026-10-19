@@ -76,7 +76,7 @@ pub fn publish(
 }
 
 pub fn publish_blob(
-    response: &api::PublishBlobResponse,
+    response: &api::PublishBlobReceipt,
     operation_key: &str,
     json: bool,
 ) -> Result<String, serde_json::Error> {
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn blob_metadata_output_uses_exact_ttl_and_never_contains_plaintext() {
-        let response = api::PublishBlobResponse {
+        let response = api::PublishBlobReceipt {
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: u64::MAX,

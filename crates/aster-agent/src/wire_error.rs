@@ -5,6 +5,7 @@
 //! buffering them. Only terminal metadata and unary error JSON are rewritten.
 
 use bytes::Bytes;
+use connectrpc::ConnectRpcBody;
 use http::{HeaderMap, Response};
 use hyper::body::Frame;
 
@@ -16,9 +17,27 @@ pub(crate) struct WireErrors {
 }
 
 impl WireErrors {
-    pub(crate) fn for_response<B>(response: &mut Response<B>) -> Self {
+    pub(crate) fn for_response(response: &mut Response<ConnectRpcBody>) -> Self {
         sanitize_grpc_headers(response.headers_mut());
         let protocol = connectrpc::Protocol::detect(response.headers());
+        if protocol
+            .as_ref()
+            .is_some_and(|p| p.protocol == connectrpc::Protocol::Grpc)
+            && matches!(
+                response.body(),
+                ConnectRpcBody::GrpcUnary(_) | ConnectRpcBody::Streaming(_)
+            )
+        {
+            // ConnectRPC 0.9.1 emits authoritative terminal trailers for both
+            // native gRPC body variants, but duplicates early errors' status
+            // and message in initial headers without their typed details.
+            // Its streaming client stops at those headers and loses details.
+            // Keep terminal metadata together in the trailer. Full/unknown
+            // bodies may have only headers, so retain their status unchanged.
+            response.headers_mut().remove("grpc-status");
+            response.headers_mut().remove("grpc-message");
+            response.headers_mut().remove("grpc-status-details-bin");
+        }
         Self {
             unary_error: !response.status().is_success(),
             terminal_flag: protocol.and_then(|p| match (p.protocol, p.is_streaming) {
@@ -147,4 +166,101 @@ fn sanitize_grpc_web(bytes: &[u8]) -> Bytes {
         output.push_str("\r\n");
     }
     output.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use connectrpc::{ErrorCode, Router, ServiceStream};
+    use http::Request;
+    use http_body_util::{BodyExt as _, Full};
+    use tower::ServiceExt as _;
+
+    use crate::{
+        api,
+        error::{PublicOperation, public_error},
+    };
+
+    #[tokio::test]
+    async fn early_grpc_router_errors_keep_typed_details_in_terminal_trailers() {
+        let router = Router::new()
+            .route(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "GetStatus",
+                connectrpc::handler_fn(|_ctx, _request: api::GetStatusRequest| async {
+                    Err::<connectrpc::Response<api::GetStatusResponse>, _>(public_error(
+                        ErrorCode::InvalidArgument,
+                        api::PublicErrorReason::MalformedInput,
+                        PublicOperation::Unspecified,
+                        false,
+                        None,
+                    ))
+                }),
+            )
+            .route_server_stream(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "ReadBlob",
+                connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async {
+                    Err::<connectrpc::Response<ServiceStream<api::ReadBlobResponse>>, _>(
+                        public_error(
+                            ErrorCode::NotFound,
+                            api::PublicErrorReason::MissingDurableObject,
+                            PublicOperation::ReadBlob,
+                            false,
+                            None,
+                        ),
+                    )
+                }),
+            );
+        let service = crate::event_service::configured_service(router);
+        for (method, status, message) in [
+            ("GetStatus", "3", "request is malformed"),
+            ("ReadBlob", "5", "durable object is unavailable"),
+        ] {
+            let mut response = service
+                .clone()
+                .oneshot(
+                    Request::post(format!(
+                        "/aster.application.v1alpha1.AsterApplicationService/{method}"
+                    ))
+                    .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+                    .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["grpc-status"], status);
+            assert!(!response.headers().contains_key("grpc-status-details-bin"));
+            let mut errors = WireErrors::for_response(&mut response);
+            assert!(!response.headers().contains_key("grpc-status"));
+            assert!(!response.headers().contains_key("grpc-message"));
+            let collected = response.into_body().collect().await.unwrap();
+            let trailers = collected.trailers().expect("authoritative status trailer");
+            let frame = errors.frame(Frame::trailers(trailers.clone()));
+            let sanitized = frame.trailers_ref().unwrap();
+            assert_eq!(sanitized["grpc-status"], status);
+            assert_eq!(sanitized["grpc-message"], message);
+            assert!(sanitized.contains_key("grpc-status-details-bin"));
+            assert_eq!(sanitized, trailers);
+            assert!(collected.to_bytes().is_empty());
+        }
+    }
+
+    #[test]
+    fn header_only_grpc_errors_retain_their_only_status_source() {
+        let mut response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+            .header("grpc-status", "3")
+            .header("grpc-message", "request is malformed")
+            .header("grpc-status-details-bin", "public-detail")
+            .body(ConnectRpcBody::Full(Full::new(Bytes::new())))
+            .unwrap();
+        WireErrors::for_response(&mut response);
+        assert_eq!(response.headers()["grpc-status"], "3");
+        assert_eq!(response.headers()["grpc-message"], "request is malformed");
+        assert_eq!(
+            response.headers()["grpc-status-details-bin"],
+            "public-detail"
+        );
+    }
 }

@@ -19,8 +19,10 @@
 //! zeroize-on-drop plaintext pages. The corresponding stopped facades retain
 //! exclusive maintenance/application access and streaming Blob I/O. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes. Blob transfer is selected only for semantic v7/v8 profile 4: v7 is
-//! durable-only and v8 adds authenticated finite custody. Semantic v5/v6 Blob
+//! lanes. Blob transfer uses semantic v7/v8 profile 4: v7 is durable-only and
+//! v8 adds authenticated finite custody. Semantic v9 allocates profile 5 for
+//! the distinct bounded stream driver; durable Blob streaming is active while
+//! finite custody-v2 composition remains fail-closed. Semantic v5/v6 Blob
 //! intent fails instead of falling back to a historical carrier path.
 //! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
@@ -40,6 +42,10 @@ mod frame;
 mod identity;
 pub mod mission;
 mod runtime;
+#[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
+mod stream_transfer;
+#[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
+mod stream_transport;
 
 pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};
 pub use control_admin::{
@@ -55,7 +61,7 @@ pub use mission::{
     respond_classical_over_iroh,
 };
 pub use runtime::{
-    ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
+    BlobStreamTransport, ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
     NodeError, NodeOperatorOutputPolicy, NodeReceipt, PeerReceipt, RunningNode,
@@ -313,6 +319,13 @@ pub fn fuzz_decode_mechanics_frame_for_semantic_version(
         frame
     );
     true
+}
+
+/// Exercises semantic-v9/profile-5 stream decoding and pure transitions.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_stream_transfer_decode(input: &[u8]) {
+    stream_transfer::fuzz_decode(input);
 }
 
 #[cfg(test)]

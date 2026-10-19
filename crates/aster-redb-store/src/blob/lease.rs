@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::BlobStoreError;
 use super::{BlobTransferId, BlobVariantId};
@@ -96,6 +96,7 @@ pub(crate) enum BlobLeaseKind {
     LocalImport,
     ApplicationPageRead,
     CarrierRange,
+    CarrierExtent,
     InternalChunkWork,
 }
 
@@ -105,7 +106,8 @@ impl BlobLeaseKind {
             Self::LocalImport => 0,
             Self::ApplicationPageRead => 1,
             Self::CarrierRange => 2,
-            Self::InternalChunkWork => 3,
+            Self::CarrierExtent => 3,
+            Self::InternalChunkWork => 4,
         }
     }
 
@@ -158,7 +160,7 @@ struct BlobLeaseKey {
 #[derive(Clone, Copy, Debug)]
 struct LeaseEntry {
     active: usize,
-    active_by_kind: [usize; 4],
+    active_by_kind: [usize; 5],
     delete_pending: bool,
     generation: BlobLeaseGeneration,
     watches: usize,
@@ -224,7 +226,7 @@ impl BlobLifecycleLeaseRegistry {
             BlobLeaseKind::ApplicationPageRead => {
                 (state.application_pages, self.inner.limits.application_pages)
             }
-            BlobLeaseKind::CarrierRange => {
+            BlobLeaseKind::CarrierRange | BlobLeaseKind::CarrierExtent => {
                 (state.network_sessions, self.inner.limits.network_sessions)
             }
             BlobLeaseKind::LocalImport | BlobLeaseKind::InternalChunkWork => {
@@ -237,7 +239,7 @@ impl BlobLifecycleLeaseRegistry {
         let generation = allocate_generation(&mut state)?;
         let entry = state.entries.entry(key).or_insert(LeaseEntry {
             active: 0,
-            active_by_kind: [0; 4],
+            active_by_kind: [0; 5],
             delete_pending: false,
             generation,
             watches: 0,
@@ -252,7 +254,9 @@ impl BlobLifecycleLeaseRegistry {
             .ok_or(BlobLeaseAcquireError::Capacity)?;
         match kind {
             BlobLeaseKind::ApplicationPageRead => state.application_pages += 1,
-            BlobLeaseKind::CarrierRange => state.network_sessions += 1,
+            BlobLeaseKind::CarrierRange | BlobLeaseKind::CarrierExtent => {
+                state.network_sessions += 1;
+            }
             BlobLeaseKind::LocalImport | BlobLeaseKind::InternalChunkWork => {
                 state.blob_workers += 1;
             }
@@ -295,7 +299,7 @@ impl BlobLifecycleLeaseRegistry {
         };
         let entry = state.entries.entry(key).or_insert(LeaseEntry {
             active: 0,
-            active_by_kind: [0; 4],
+            active_by_kind: [0; 5],
             delete_pending: false,
             generation,
             watches: 0,
@@ -485,7 +489,7 @@ impl BlobDeleteAdmissionGuard {
         let pending = state.entries.get(&self.key).is_some_and(|entry| {
             entry.delete_pending
                 && entry.active == 0
-                && entry.active_by_kind == [0; 4]
+                && entry.active_by_kind == [0; 5]
                 && entry.watches == 1
                 && entry.generation == self.generation
         }) && state.watches == 1;
@@ -512,7 +516,7 @@ impl Drop for BlobDeleteAdmissionGuard {
         let pending = state.entries.get(&self.key).is_some_and(|entry| {
             entry.delete_pending
                 && entry.active == 0
-                && entry.active_by_kind == [0; 4]
+                && entry.active_by_kind == [0; 5]
                 && entry.watches == 1
                 && entry.generation == self.generation
         }) && state.watches == 1;
@@ -643,7 +647,7 @@ impl BlobLeaseGuard {
         }
         let next = state.entries.entry(next_key).or_insert(LeaseEntry {
             active: 0,
-            active_by_kind: [0; 4],
+            active_by_kind: [0; 5],
             delete_pending: false,
             generation: next_generation,
             watches: 0,
@@ -689,7 +693,9 @@ impl BlobLeaseGuard {
         };
         match self.kind {
             BlobLeaseKind::ApplicationPageRead => state.application_pages -= 1,
-            BlobLeaseKind::CarrierRange => state.network_sessions -= 1,
+            BlobLeaseKind::CarrierRange | BlobLeaseKind::CarrierExtent => {
+                state.network_sessions -= 1;
+            }
             BlobLeaseKind::LocalImport | BlobLeaseKind::InternalChunkWork => {
                 state.blob_workers -= 1;
             }
@@ -704,6 +710,81 @@ impl BlobLeaseGuard {
 impl Drop for BlobLeaseGuard {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+type BlobStreamWriters = Mutex<HashSet<aster_mesh::BlobPublicationStreamId>>;
+type BlobStreamWriterOwners = Mutex<HashMap<[u8; 32], Weak<BlobStreamWriters>>>;
+
+static BLOB_STREAM_WRITER_OWNERS: OnceLock<BlobStreamWriterOwners> = OnceLock::new();
+
+/// One exclusive writer per stream, shared by Store handles for the same
+/// owner-bound database. Weak owner entries do not retain closed stores; a
+/// session that outlives its Store keeps exclusion across a same-file reopen.
+pub(crate) struct BlobStreamWriterLeaseRegistry {
+    writers: Arc<BlobStreamWriters>,
+}
+
+impl BlobStreamWriterLeaseRegistry {
+    pub(crate) fn for_owner(owner_binding: [u8; 32]) -> Result<Self, StoreError> {
+        let mut owners = BLOB_STREAM_WRITER_OWNERS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| store_error(BlobLeaseAcquireError::Poisoned))?;
+        owners.retain(|_, writers| writers.strong_count() != 0);
+        let writers = match owners.get(&owner_binding).and_then(Weak::upgrade) {
+            Some(writers) => writers,
+            None => {
+                let writers = Arc::new(Mutex::new(HashSet::new()));
+                owners.insert(owner_binding, Arc::downgrade(&writers));
+                writers
+            }
+        };
+        Ok(Self { writers })
+    }
+
+    pub(crate) fn acquire(
+        &self,
+        stream_id: aster_mesh::BlobPublicationStreamId,
+    ) -> Result<BlobStreamWriterLease, StoreError> {
+        let mut writers = self
+            .writers
+            .lock()
+            .map_err(|_| store_error(BlobLeaseAcquireError::Poisoned))?;
+        if !writers.insert(stream_id) {
+            return Err(store_error(BlobLeaseAcquireError::Capacity));
+        }
+        Ok(BlobStreamWriterLease {
+            writers: Arc::clone(&self.writers),
+            stream_id,
+        })
+    }
+}
+
+pub(crate) struct BlobStreamWriterLease {
+    writers: Arc<BlobStreamWriters>,
+    stream_id: aster_mesh::BlobPublicationStreamId,
+}
+
+impl BlobStreamWriterLease {
+    pub(crate) fn require_registry(
+        &self,
+        registry: &BlobStreamWriterLeaseRegistry,
+    ) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(&self.writers, &registry.writers) {
+            return Err(StoreError::Blob(BlobStoreError::ReservationChanged));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BlobStreamWriterLease {
+    fn drop(&mut self) {
+        let mut writers = self
+            .writers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        writers.remove(&self.stream_id);
     }
 }
 
@@ -905,6 +986,25 @@ mod tests {
         drop((page, carrier, worker));
         assert_eq!(registry.total_active(), 0);
         assert_eq!(registry.stored_entries(), 0);
+    }
+
+    #[test]
+    fn blob_stream_lifecycle_extent_shares_the_network_session_limit() {
+        let registry = BlobLifecycleLeaseRegistry::new(
+            BlobLeaseLimits::new(2, 1, 2).expect("one network session"),
+        );
+        let extent = registry
+            .acquire(owner(), variant(0x31), BlobLeaseKind::CarrierExtent)
+            .expect("profile-5 extent lease");
+        assert!(matches!(
+            registry.acquire(owner(), staging(0x32), BlobLeaseKind::CarrierRange),
+            Err(BlobLeaseAcquireError::Capacity)
+        ));
+        drop(extent);
+        let range = registry
+            .acquire(owner(), staging(0x32), BlobLeaseKind::CarrierRange)
+            .expect("profile-4 range after extent release");
+        drop(range);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::{api, operation_key, validation};
 use std::{
     fs::{File, OpenOptions},
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
@@ -207,6 +207,12 @@ pub(crate) struct FrameStream {
     receiver: tokio::sync::mpsc::Receiver<api::PublishBlobRequest>,
 }
 
+impl FrameStream {
+    pub(crate) async fn next(&mut self) -> Option<api::PublishBlobRequest> {
+        self.receiver.recv().await
+    }
+}
+
 impl connectrpc::client::Stream for FrameStream {
     type Item = api::PublishBlobRequest;
 
@@ -216,34 +222,32 @@ impl connectrpc::client::Stream for FrameStream {
 }
 
 pub(crate) fn stream_file(
-    metadata: api::PublishBlobMetadata,
     file: File,
+    total_len: u64,
+    start_offset: u64,
 ) -> (
     FrameStream,
     tokio::task::JoinHandle<Result<(), &'static str>>,
 ) {
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let reader = tokio::task::spawn_blocking(move || produce_frames(metadata, file, sender));
+    let reader =
+        tokio::task::spawn_blocking(move || produce_frames(file, total_len, start_offset, sender));
     (FrameStream { receiver }, reader)
 }
 
 fn produce_frames(
-    metadata: api::PublishBlobMetadata,
     mut file: File,
+    total_len: u64,
+    start_offset: u64,
     sender: tokio::sync::mpsc::Sender<api::PublishBlobRequest>,
 ) -> Result<(), &'static str> {
-    let mut remaining = metadata.total_len;
-    if sender
-        .blocking_send(api::PublishBlobRequest {
-            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
-                metadata,
-            ))),
-            ..Default::default()
-        })
-        .is_err()
-    {
-        return Ok(());
+    if start_offset > total_len {
+        return Err("agent returned an invalid Blob resume offset");
     }
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|_| "cannot seek source file to the Blob resume offset")?;
+    let mut offset = start_offset;
+    let mut remaining = total_len - start_offset;
     while remaining > 0 {
         let length = remaining.min(CHUNK_BYTES as u64) as usize;
         let mut chunk = vec![0_u8; length];
@@ -254,13 +258,22 @@ fn produce_frames(
             .ok_or("source file length changed while reading")?;
         if sender
             .blocking_send(api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(chunk)),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset,
+                        bytes: chunk,
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             })
             .is_err()
         {
             return Ok(());
         }
+        offset = offset
+            .checked_add(length as u64)
+            .ok_or("source file length overflow")?;
     }
     let mut extra = [0_u8; 1];
     match file.read(&mut extra) {
@@ -272,7 +285,7 @@ fn produce_frames(
 
 pub(crate) fn receipt_matches(
     request: &api::PublishBlobMetadata,
-    response: &api::PublishBlobResponse,
+    response: &api::PublishBlobReceipt,
 ) -> bool {
     response.id.len() == 32
         && response.publisher.len() == 32
@@ -283,6 +296,22 @@ pub(crate) fn receipt_matches(
         && response.media_type == request.media_type
         && response.schema_id == request.schema_id
         && response.acceptance_marker != 0
+}
+
+pub(crate) fn checkpoint_is_valid(
+    checkpoint: &api::PublishBlobCheckpoint,
+    previous_accepted: u64,
+    previous_durable: u64,
+    sent_offset: u64,
+    total_len: u64,
+) -> bool {
+    checkpoint.accepted_offset >= previous_accepted
+        && checkpoint.accepted_offset <= sent_offset
+        && checkpoint.accepted_offset <= total_len
+        && checkpoint.durable_offset >= previous_durable
+        && checkpoint.durable_offset <= checkpoint.accepted_offset
+        && (checkpoint.accepted_offset > previous_accepted
+            || checkpoint.durable_offset > previous_durable)
 }
 
 #[cfg(test)]
@@ -306,7 +335,7 @@ mod tests {
     #[test]
     fn blob_publish_receipt_compares_ttl_presence_unconditionally() {
         let request = metadata(7);
-        let response = api::PublishBlobResponse {
+        let response = api::PublishBlobReceipt {
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,
@@ -321,14 +350,14 @@ mod tests {
         assert!(receipt_matches(&request, &response));
         assert!(!receipt_matches(
             &request,
-            &api::PublishBlobResponse {
+            &api::PublishBlobReceipt {
                 publisher_counter: 0,
                 ..response.clone()
             }
         ));
         assert!(!receipt_matches(
             &request,
-            &api::PublishBlobResponse {
+            &api::PublishBlobReceipt {
                 acceptance_marker: 0,
                 ..response.clone()
             }
@@ -342,7 +371,7 @@ mod tests {
         ));
         assert!(!receipt_matches(
             &request,
-            &api::PublishBlobResponse {
+            &api::PublishBlobReceipt {
                 ttl_ms: None,
                 ..response
             }
@@ -352,7 +381,7 @@ mod tests {
     #[test]
     fn blob_publish_receipt_accepts_checked_lengths_above_legacy_boundary() {
         let request = metadata((64 * 1024 * 1024_u64) + 1);
-        let response = api::PublishBlobResponse {
+        let response = api::PublishBlobReceipt {
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,
@@ -367,8 +396,103 @@ mod tests {
         assert!(receipt_matches(&request, &response));
     }
 
+    #[test]
+    fn blob_publish_rejects_checkpoint_ahead_of_successfully_sent_bytes() {
+        let checkpoint = api::PublishBlobCheckpoint {
+            accepted_offset: CHUNK_BYTES as u64,
+            durable_offset: CHUNK_BYTES as u64,
+            ..Default::default()
+        };
+        assert!(!checkpoint_is_valid(
+            &checkpoint,
+            0,
+            0,
+            0,
+            CHUNK_BYTES as u64,
+        ));
+        assert!(checkpoint_is_valid(
+            &checkpoint,
+            0,
+            0,
+            CHUNK_BYTES as u64,
+            CHUNK_BYTES as u64,
+        ));
+    }
+
+    #[test]
+    fn blob_publish_accepts_staging_progress_without_claiming_durable_resume() {
+        let staged = api::PublishBlobCheckpoint {
+            accepted_offset: CHUNK_BYTES as u64,
+            durable_offset: 0,
+            ..Default::default()
+        };
+        assert!(checkpoint_is_valid(
+            &staged,
+            0,
+            0,
+            CHUNK_BYTES as u64,
+            CHUNK_BYTES as u64
+        ));
+        assert!(
+            !checkpoint_is_valid(
+                &staged,
+                CHUNK_BYTES as u64,
+                0,
+                CHUNK_BYTES as u64,
+                CHUNK_BYTES as u64
+            ),
+            "an unchanged checkpoint cannot fake progress"
+        );
+        assert!(
+            !checkpoint_is_valid(
+                &staged,
+                CHUNK_BYTES as u64 + 1,
+                0,
+                CHUNK_BYTES as u64 + 1,
+                CHUNK_BYTES as u64 + 1
+            ),
+            "accepted bytes must not regress"
+        );
+        assert!(
+            !checkpoint_is_valid(&staged, 0, 1, CHUNK_BYTES as u64, CHUNK_BYTES as u64),
+            "durable bytes must not regress even when accepted bytes advance"
+        );
+        assert!(
+            !checkpoint_is_valid(&staged, 0, 0, CHUNK_BYTES as u64 - 1, CHUNK_BYTES as u64),
+            "staging cannot acknowledge unsent bytes"
+        );
+        assert!(
+            !checkpoint_is_valid(&staged, 0, 0, CHUNK_BYTES as u64, CHUNK_BYTES as u64 - 1),
+            "staging cannot exceed declared length"
+        );
+        let committed = api::PublishBlobCheckpoint {
+            accepted_offset: CHUNK_BYTES as u64,
+            durable_offset: CHUNK_BYTES as u64,
+            ..Default::default()
+        };
+        assert!(
+            checkpoint_is_valid(
+                &committed,
+                CHUNK_BYTES as u64,
+                0,
+                CHUNK_BYTES as u64,
+                CHUNK_BYTES as u64
+            ),
+            "durable progress may catch up without receiving more bytes"
+        );
+        let invalid = api::PublishBlobCheckpoint {
+            accepted_offset: 1,
+            durable_offset: 2,
+            ..Default::default()
+        };
+        assert!(
+            !checkpoint_is_valid(&invalid, 0, 0, 2, 2),
+            "durable progress cannot exceed accepted bytes"
+        );
+    }
+
     #[tokio::test]
-    async fn blob_publish_streams_metadata_then_canonical_bounded_chunks() {
+    async fn blob_publish_streams_offset_bearing_canonical_bounded_chunks() {
         use connectrpc::client::Stream as _;
         use std::{fs, future::poll_fn};
 
@@ -377,27 +501,49 @@ mod tests {
         let bytes = vec![0x5a; CHUNK_BYTES + 1];
         fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
-        let (mut frames, reader) = stream_file(metadata(bytes.len() as u64), file);
+        let (mut frames, reader) = stream_file(file, bytes.len() as u64, 0);
         let mut observed = Vec::new();
         while let Some(frame) = poll_fn(|context| Pin::new(&mut frames).poll_next(context)).await {
             observed.push(frame);
         }
         reader.await.unwrap().unwrap();
         fs::remove_file(path).unwrap();
-        assert!(matches!(
-            observed[0].frame,
-            Some(api::publish_blob_request::Frame::Metadata(_))
-        ));
-        let chunks: Vec<_> = observed[1..]
+        let chunks: Vec<_> = observed
             .iter()
             .map(|frame| match frame.frame.as_ref().unwrap() {
-                api::publish_blob_request::Frame::Chunk(chunk) => chunk.len(),
+                api::publish_blob_request::Frame::Data(chunk) => (chunk.offset, chunk.bytes.len()),
                 api::publish_blob_request::Frame::Metadata(_) => {
-                    panic!("metadata after first frame")
+                    panic!("metadata belongs to the negotiation phase")
+                }
+                api::publish_blob_request::Frame::Finish(_) => {
+                    panic!("finish belongs to the caller-owned RPC phase")
                 }
             })
             .collect();
-        assert_eq!(chunks, [CHUNK_BYTES, 1]);
+        assert_eq!(chunks, [(0, CHUNK_BYTES), (CHUNK_BYTES as u64, 1)]);
+    }
+
+    #[tokio::test]
+    async fn blob_publish_seeks_to_the_store_authoritative_resume_offset() {
+        use connectrpc::client::Stream as _;
+        use std::{fs, future::poll_fn};
+
+        let path =
+            std::env::temp_dir().join(format!("asterctl-blob-resume-{}", std::process::id()));
+        let bytes = vec![0x5a; CHUNK_BYTES + 3];
+        fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        let (mut frames, reader) = stream_file(file, bytes.len() as u64, CHUNK_BYTES as u64);
+        let frame = poll_fn(|context| Pin::new(&mut frames).poll_next(context))
+            .await
+            .unwrap();
+        reader.await.unwrap().unwrap();
+        fs::remove_file(path).unwrap();
+        let api::publish_blob_request::Frame::Data(chunk) = frame.frame.unwrap() else {
+            panic!("expected resumed chunk")
+        };
+        assert_eq!(chunk.offset, CHUNK_BYTES as u64);
+        assert_eq!(chunk.bytes, vec![0x5a; 3]);
     }
 
     #[tokio::test]
@@ -414,7 +560,7 @@ mod tests {
         let original_len = file.metadata().unwrap().len();
         fs::write(&path, b"short").unwrap();
 
-        let (mut frames, reader) = stream_file(metadata(original_len), file);
+        let (mut frames, reader) = stream_file(file, original_len, 0);
         while poll_fn(|context| Pin::new(&mut frames).poll_next(context))
             .await
             .is_some()

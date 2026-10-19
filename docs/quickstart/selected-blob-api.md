@@ -8,7 +8,7 @@ application may publish a durable or finite-TTL owned regular file while the
 node has no peers, read one freshly authenticated plaintext page at a time,
 and consume tagged at-least-once content or retirement notifications for exact
 source-authenticated Blob publications.
-Each live page is at most 64 KiB and zeroizes its owned plaintext allocation on
+Each live page is at most 1 MiB and zeroizes its owned plaintext allocation on
 drop; each delivery is metadata only and carries no Blob plaintext.
 
 The live surface deliberately keeps application delivery separate from network
@@ -24,8 +24,12 @@ content-capable peers. V7 admits durable work only; v8 also admits finite work
 with exact authenticated custody provenance. Both endpoints must support
 `BlobRangesStreamV1`; old Blob transfer has no fallback. Incompatible profile
 offers and v5/v6 carrier attempts fail before carrier IO. `EventPagesV1` is
-Event-only. The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable
-wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
+Event-only. The default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`;
+semantic v9 uses Blob profile 5 `BlobStreamV1` for durable completed packs and
+retained-source transfers. Finite retained sources use authenticated custody-v2;
+finite completed packs are withheld from this network path until receiver-local
+custody authority is available. Stable wire/ABI, source,
+manifest, and `ASTRBT01` formats remain version 1.
 
 ## Use the live actor API
 
@@ -81,10 +85,11 @@ loop {
 }
 ```
 
-The live publisher accepts a nonempty regular file of at most 64 MiB, with its
-cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
+The live publisher accepts a nonempty regular file within the configured depot
+byte and selected-profile chunk limits, with its cursor at exactly zero, and
+fixes the selected chunk size at 64 KiB. The file is
 moved into a bounded, joined worker rather than cloned into the actor command.
-The 64-MiB ceiling is the current selected-backend policy, not a public RPC or
+The resulting ceiling is backend capacity policy, not a public RPC or
 wire-format guarantee.
 The returned publication is operation-key idempotent and echoes its original
 signed TTL (`None` means durable), never a remaining lifetime or deletion
@@ -113,8 +118,9 @@ file provider.
 On Linux, the local `aster-agent` exposes native gRPC `PublishBlob` and
 `ReadBlob` streams backed by the same running node authority. Its plaintext
 listener is loopback-only. On non-Linux hosts, `ReadBlob` remains available to
-a capable native-gRPC client, while secure agent upload staging and
-`asterctl blob-read` finalization are unsupported. Supply exactly one
+a capable native-gRPC client, while finite-TTL agent upload staging and
+`asterctl blob-read` finalization are unsupported. Durable uploads use the
+stream path without whole-file agent staging. Supply exactly one
 bearer-token source to `asterctl`; a protected token file avoids placing the
 token in the command line:
 
@@ -159,19 +165,40 @@ exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
 original authenticated lifetime, never a countdown or deletion time. Blob
 plaintext is written only to the requested output and is never printed.
 
-The RPC and CLI use checked `u64` lengths and bounded 64-KiB frames/pages; they
-do not promise a fixed total-size ceiling. The current selected backend rejects
-objects above 64 MiB. The shared agent deadline policy currently defaults to
-10 seconds and caps a stream at 30 seconds, even if `asterctl --timeout` asks
-for longer. These values describe this implementation, not durable RPC
-semantics, supported large-file behavior, or performance qualification.
+The publish RPC and CLI use checked `u64` lengths and canonical 64-KiB data
+frames, with only the terminal data frame shorter; read pages remain bounded. They
+do not define a fixed protocol total-size ceiling. Configured profile-5 depot
+bounds determine durable large-object admission. Finite-TTL RPC uploads retain
+the existing 64-MiB implementation cap and must also fit the configured depot
+bound. Ordinary RPCs retain a 10-second default and
+30-second maximum. Progressing `PublishBlob` and `ReadBlob` streams may request
+up to 1,800 seconds and remain bounded by connection lifetime and progress
+checks. These values describe this implementation, not durable RPC semantics
+or performance qualification.
 
-`blob-read` currently requires Linux and a destination filesystem supporting
-`O_TMPFILE` plus descriptor-relative publication of the open inode. It creates
-a mode-0600 anonymous inode in the pinned destination directory, synchronizes
-the complete verified stream, then links that exact inode atomically without
-replacing an existing or concurrently created path. Unsupported platforms and
-filesystems fail closed, and an incomplete stream leaves no named partial.
+Blob publication is a bidirectional protocol. The client sends metadata first,
+waits for the accepted offset, seeks its open regular file, and then sends
+canonical `(offset, bytes)` frames followed by finish. Durable uploads return
+Store-authoritative offsets and monotonic durable checkpoints; retries with the
+same operation key replay only the non-durable tail. Finite-TTL uploads return
+offset zero and retain private, preallocated, unlinked file staging with bounded
+in-memory frames. Progress responses advance accepted bytes while keeping the
+durable offset at zero. Finish publishes that file through the retained-source
+custody path. A disconnected finite upload retries the whole file with the same operation
+key and options; completed retries remain idempotent. Both paths return the
+publication receipt only after durable publication.
+
+`blob-read` currently requires Linux, a destination directory owned by the
+current user and not writable by group or other users, and a filesystem that
+supports named staging, atomic no-replace rename, and directory synchronization.
+It creates one randomly named mode-0600 sibling, synchronizes the complete
+verified stream, then renames that exact inode atomically without replacing an
+existing or concurrently created path and synchronizes the directory. The
+requested destination remains absent until publication. Cleanup removes the
+sibling on a best-effort basis; filesystem errors or an abrupt process or host
+failure can leave that hidden owner-only file for operator cleanup. A reported
+post-publication directory-sync failure means the destination exists and must
+be verified before retrying. Unsupported platforms and filesystems fail closed.
 
 The caller's source file and completed output file remain outside node
 zeroization custody. Node zeroization does not erase them, and callers must
@@ -467,8 +494,10 @@ filters Event only.
 The live handle does not change those contact rules and reports no Blob peer or
 convergence status. On a host with a supported custody clock, the Rust
 `publish_with_options` surface activates local finite Blob publication and
-expiry. Finite transfer between peers remains restricted to semantic v8 with
-profile 4; v7 transfers durable Blob work only. Bounded strictly-lower-priority
+expiry. Finite retained sources transfer under semantic-v8 profile 4 or
+semantic-v9 profile 5 with custody-v2; v7 transfers durable Blob work only.
+Finite completed-pack publications are not offered or admitted on the network
+because publisher clock samples alone do not establish receiver-local custody. Bounded strictly-lower-priority
 pressure recovery remains internal.
 Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
 Blob TTL fields in the FFI surface are not implemented. The selected Linux

@@ -49,6 +49,10 @@ mod blob;
 mod blob;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod blob_custody;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_custody_v2;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_stream;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -144,10 +148,11 @@ pub use blob::ReferenceBlobReader;
 pub use blob::{
     BlobCarrierId, BlobChunkRecord, BlobError, BlobId, BlobManifest, BlobMetadata,
     BlobPhysicalLineage, BlobRangeReadStats, BlobReadStats, BlobReader, BlobRouteCommitment,
-    BlobStore, BlobStoreConfig, BlobWriteProgress, BuiltBlobTransferObject, FinishedBlob,
-    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
-    MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob,
-    ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
+    BlobStore, BlobStoreConfig, BlobStreamLayout, BlobWriteProgress, BuiltBlobTransferObject,
+    FinishedBlob, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
+    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES,
+    MIN_BLOB_CHUNK_SIZE, OwnedBlobStreamExtent, PreparedBlob, ReferenceBlobService,
+    SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion, VerifiedBlobStreamExtent,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
@@ -155,6 +160,19 @@ pub use blob_custody::{
     AuthenticatedBlobCustodyContactV1, AuthenticatedBlobCustodySendContextV1,
     BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
     BlobCustodyTransferId, OpenedBlobSourceFrameV1, VerifiedBlobCustodyClaimV1,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_custody_v2::{
+    ApplicationRecordContext, AuthenticatedBlobCustodyContactV2,
+    AuthenticatedBlobCustodySendContextV2, BLOB_CUSTODY_CLAIM_V2_BYTES, BlobCustodyClaimV2,
+    VerifiedBlobCustodyClaimV2,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_stream::{
+    AuthenticatedBlobStreamSegmentCheckpoint, BLOB_STREAM_SEGMENT_BYTES, BlobPublicationStreamId,
+    BlobStreamAccumulator, BlobStreamAccumulatorCheckpoint, BlobStreamAccumulatorDomain,
+    BlobStreamDecryptor, BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen,
+    EncryptedBlobStreamSegment, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{
@@ -264,10 +282,10 @@ pub const REPLICATION_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = REPLICATION_WIRE_VERSION;
 
 /// Semantic replication version offered first by a default initiator.
-pub const DEFAULT_SEMANTIC_VERSION: u16 = 8;
+pub const DEFAULT_SEMANTIC_VERSION: u16 = 9;
 
 /// Highest semantic replication version implemented by this build.
-pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 8;
+pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 9;
 
 #[cfg(feature = "sqlite-store")]
 const _: () = assert!(batch::DATA_CLASS_EVENT == model::DataClass::Event as u8);
@@ -282,9 +300,9 @@ mod version_surface_tests {
         #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
         assert_eq!(
             crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[8, 7, 6, 5, 4, 3, 2, 1]
+            &[9, 8, 7, 6, 5, 4, 3, 2, 1]
         );
-        assert_eq!(DEFAULT_SEMANTIC_VERSION, 8);
+        assert_eq!(DEFAULT_SEMANTIC_VERSION, 9);
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         #[cfg(feature = "sqlite-store")]
         assert_eq!(batch::DATA_CLASS_EVENT, DataClass::Event as u8);

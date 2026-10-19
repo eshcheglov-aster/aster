@@ -18,5 +18,8 @@ redb.workspace = true
 rustix.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+zeroize.workspace = true
+
 [lints]
 workspace = true

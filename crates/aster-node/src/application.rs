@@ -60,6 +60,7 @@ use crate::{
 };
 
 mod blob;
+mod blob_stream;
 #[cfg(test)]
 #[path = "application/operation_capacity_test.rs"]
 mod operation_capacity_test;
@@ -72,11 +73,16 @@ pub use blob::{
     BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest,
     BlobPublicationId, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
     BlobReadPageRequest, BlobReadRequest, BlobReadResult, BlobRetirementDelivery,
-    BlobRetirementReason, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
+    BlobRetirementReason, BlobStreamTerminalCategory, BlobStreamTransferPhase,
+    BlobStreamTransferStatus, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
     BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
     MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
     MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
     SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
+};
+pub use blob_stream::{
+    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, BlobReadStreamMetadata,
+    SelectedBlobPublishStream, SelectedBlobReadStream,
 };
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{

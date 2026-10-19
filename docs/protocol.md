@@ -82,7 +82,7 @@ The protocol has two deterministic encodings. Replication messages use the RFC
 [`wire.cddl`](wire.cddl) defines those maps. Security objects—credentials, source envelopes,
 handshake flights, custody wrappers, controls, and Blob manifests—use the fixed,
 length-prefixed binary structures in [envelope.md](envelope.md); the
-semantic-v2/v3/v4/v5/v6/v7/v8 batch additions use the fixed structures in §6.1. Those readers reject
+semantic-v2/v3/v4/v5/v6/v7/v8/v9 batch additions use the fixed structures in §6.1. Those readers reject
 truncation, trailing bytes, nonzero reserved fields, unknown critical kinds, and
 lengths above their field-specific bound before allocation. A security object is
 never reinterpreted as a CBOR object or vice versa.
@@ -94,9 +94,9 @@ words, signature messages, KDF salts, labels, and contexts are normative in
 Security digests and semantic identifiers are 32-byte SHA-256 results. The
 replication namespace uses a fixed 33-byte `ObjectID = kind u8 || digest[32]`.
 Semantic version 1 permits kind `1` source envelopes and kind `2` Blob chunk
-carriers. Semantic versions 2 through 8 additionally permit kind `3`
+carriers. Semantic versions 2 through 9 additionally permit kind `3`
 source-batch proofs, kind `4` bridge authorizations, and kind `5` bridge-route
-wrappers. Semantic versions 3 through 8 additionally enable session-bound
+wrappers. Semantic versions 3 through 9 additionally enable session-bound
 custody records for the selected Event/RouteEvent path without allocating a new
 stable transfer-object kind. Semantic version 4 adds selected protected
 State/Record mechanics frames, inherited by later versions; semantic version 5
@@ -187,7 +187,7 @@ TTL, publisher/counter/context, Event sequence, tombstone state, declared
 content length, authenticated Blob route commitment, content group/epoch/nonce,
 ciphertext length, and the authentication fields selected by the envelope
 format. Format 2 carries the unchanged singleton authentication-manifest
-identifier and hybrid source signature. Semantic-v2/v3/v4/v5/v6/v7/v8 format 3 carries the exact
+identifier and hybrid source signature. Semantic-v2/v3/v4/v5/v6/v7/v8/v9 format 3 carries the exact
 batch reference, Merkle path, and item ECDSA suffix in §6.1. A consumer MUST
 reject if a repeated semantic field differs from decrypted ItemCore.
 
@@ -218,15 +218,15 @@ delivery. Missing or stripped signatures fail.
 The fixed envelope includes a singleton authentication-manifest identifier and
 both publisher signatures bind the complete canonical semantic header, including
 the conditional Blob route commitment. Its bytes and meaning remain unchanged:
-semantic-v2/v3/v4/v5/v6/v7/v8 peers MAY still use format 2 for a singleton or urgent fallback, but
+semantic-v2/v3/v4/v5/v6/v7/v8/v9 peers MAY still use format 2 for a singleton or urgent fallback, but
 no implementation may reinterpret a format-2 byte as compact batch
 authentication.
 
-### 6.1 Semantic-v2/v3/v4/v5/v6/v7/v8 content-committing PQ batch profile
+### 6.1 Semantic-v2/v3/v4/v5/v6/v7/v8/v9 content-committing PQ batch profile
 
 This profile amortizes the authority credential and ML-DSA source signature
 without removing post-quantum authentication. It is available only after the
-authenticated session selects semantic version 2 through 8. A batch has
+authenticated session selects semantic version 2 through 9. A batch has
 `2..64` items from one publisher with one data class, topic, scope, content-key
 epoch, and credential. Causal counters are nonzero and contiguous in item-index
 order.
@@ -327,7 +327,7 @@ noncanonical; structure and the computed root decide validity.
 
 #### 6.1.3 BatchProof object and compact item suffix
 
-The batch proof is a stable semantic-v2/v3/v4/v5/v6/v7/v8 transfer object with `ObjectKind = 3`.
+The batch proof is a stable semantic-v2/v3/v4/v5/v6/v7/v8/v9 transfer object with `ObjectKind = 3`.
 Its protected route plaintext is exactly:
 
 ```text
@@ -514,16 +514,17 @@ A Blob manifest contains total length, media/schema metadata, chunk size, ordere
 SHA-256 chunk digests, and a full-content digest. Default chunk size is 16 KiB,
 configurable from 4–64 KiB. Chunks use independently derived keys/nonces and are
 verified and committed while streaming. A complete blob digest is verified before
-delivery. The canonical manifest is at most 1 MiB and is independently
+delivery. The canonical manifest is at most 4 MiB and is independently
 implementable from [envelope.md](envelope.md). The current durable Blob service
 can resume local chunk production and reading without whole-Blob RAM growth.
 
 The selected node's application profile fixes canonical chunks at 64 KiB. A
 stopped `SelectedBlobNode` retains synchronous streaming, while
 `RunningNode::selected_blobs()` returns a cloneable live handle. Live publish
-takes ownership of a nonempty regular file positioned at byte zero and admits
-at most 64 MiB/1,024 chunks; live read returns one freshly authenticated,
-zeroize-on-drop page of `1..=64 KiB`. These application chunk/page bounds are
+takes ownership of a nonempty regular file positioned at byte zero and derives
+its admission ceiling from the configured depot byte and selected-profile chunk
+limits; live read returns one freshly authenticated, zeroize-on-drop window of
+`1..=1 MiB`. These application chunk/window bounds are
 separate from the historical semantic-v5 carrier range bound of 16 KiB in §9.2.
 Neither surface treats a redb projection as authorization: it freshly verifies
 the selected source and current policy/lineage and requires the exact
@@ -565,7 +566,10 @@ route root or chunk count.
 
 Empty manifests are canonical local objects, but envelope format 2 requires a
 nonzero route chunk count, so a zero-byte Blob is not publishable in this network
-profile. A manifest has at most 14,543 chunks and 1 MiB of bytes.
+profile. A manifest has at most 58,234 chunks and 4 MiB of bytes. Profile 4
+retains its separate 64-MiB/1,024-chunk network admission ceiling; profile 5
+uses checked configured depot byte/chunk limits and supports at least a 2-GiB
+shape when those limits reserve its complete physical representation.
 The composite per-contact inventory is capped at 100,000 ObjectIDs with source
 envelopes inserted before Blob carriers. A source-envelope selection that alone
 exceeds the cap is rejected rather than silently truncated. Content-authorized nodes retain both a
@@ -588,7 +592,7 @@ bounded retention cannot prevent that indefinitely.
 For each policy-filtered snapshot selected by the embedding node, the implemented
 inventory is an exact sparse nibble-radix Merkle tree keyed by the full 33-byte
 typed ObjectID. It therefore has 66 nibble levels. A leaf commits to that full
-typed identifier, keeping source envelopes, Blob chunk carriers, and semantic-v2/v3/v4/v5/v6/v7/v8
+typed identifier, keeping source envelopes, Blob chunk carriers, and semantic-v2/v3/v4/v5/v6/v7/v8/v9
 batch proofs disjoint even if their 32-byte digests collide. Internal hashes
 commit to depth, ordered child summaries, and counts. ItemID, singleton/batch
 identifiers, proof dependencies, and semantic fields are authenticated inside
@@ -676,13 +680,13 @@ protocol receipt state.
 ### 9.1 Selected semantic-v4 State and Record reconciliation
 
 The selected mechanics profile adds State and Record when the authenticated
-mission session selects semantic version `4`, `5`, `6`, `7`, or `8`. Semantic
+mission session selects semantic version `4`, `5`, `6`, `7`, `8`, or `9`. Semantic
 versions `1`, `2`, and `3` retain their Event compatibility behavior and MUST
 NOT send, accept, reserve, or count mutable frames. The current default semantic
-offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
+offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
 framing, source envelopes, and suite remain version `1`. Semantic v5 inherits
 these State/Record mechanics unchanged and adds the separate Blob mechanics in
-§9.2; semantic v6, v7, and v8 inherit both ordinary lanes unchanged.
+§9.2; semantic v6, v7, v8, and v9 inherit both ordinary lanes unchanged.
 
 State and Record are independent classes (`State = 1`, `Record = 2`). Each has
 two receiver-directed lanes, so every contact has four independent reconciliation
@@ -761,9 +765,9 @@ Finish/Finished records are not an available runtime fallback.
 Semantic version `5` inherits the exact Event behavior of versions `1` through
 `4` and the semantic-v4 State/Record mechanics above. It additionally allocates
 one selected Blob source class (`MutableClass = 3`) and one Blob carrier lane.
-Semantic versions `6`, `7`, and `8` inherit that complete v5 ordinary-lane
+Semantic versions `6`, `7`, `8`, and `9` inherit that complete v5 ordinary-lane
 behavior unchanged. The current default descending offer is
-`[8, 7, 6, 5, 4, 3, 2, 1]`.
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
 Stable replication-wire and ABI version `1`, handshake framing,
 `ASTRENV2`/`ASTRENV3` source formats, `ASTRBT01` carriers, typed ObjectIDs, and
 the registered cryptographic suite do not change. A semantic-v1, v2, v3, or v4
@@ -1004,20 +1008,25 @@ content-authorized target delivery may open the committed payload, and the
 selected runtime emits only its length and SHA-256 digest.
 
 
-### 9.4 Selected semantic-v7/v8 transfer profiles and receipt-free Event pages
+### 9.4 Selected semantic-v7/v8/v9 transfer profiles and receipt-free Event pages
 
 Semantic version `7` inherits every semantic-v6 source object and mechanics lane
 without changing v1-v6 bytes. Semantic version `8` inherits every v7 source
 object, ordinary lane, and profile-exchange byte without revising v5-v7 durable
-Blob mechanics. Immediately after the four-flight handshake, the
+Blob mechanics. Semantic version `9` preserves all v1-v8 stable object and
+ordinary-lane bytes but gives Blob streaming a new profile identity; it does not
+reinterpret profile 4. Immediately after the four-flight handshake, the
 initiator sends and the responder returns one protected canonical
 `TransferProfileOfferV1`. Known lane IDs are `1` Event, `2` State, `3` Record,
 `4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
-`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), and `4` `BlobRangesStreamV1`. Lanes and profiles are strictly
+`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), `4`
+`BlobRangesStreamV1`, and `5` `BlobStreamV1`. Lanes and profiles are strictly
 descending and unique. Event, State, Record, and EventBridge MUST offer
-`LegacyV6`. Blob offers MUST contain `LegacyV6` or `BlobRangesStreamV1`;
-the selected runtime offers only `BlobRangesStreamV1`. Only Event may offer
-`EventPagesV1`, and only Blob may offer `BlobRangesStreamV1`. Unknown
+`LegacyV6`. Blob offers MUST contain `LegacyV6`, `BlobRangesStreamV1`, or
+`BlobStreamV1`;
+semantic v7/v8 offers only `BlobRangesStreamV1`, while semantic v9 offers only
+`BlobStreamV1`. Only Event may offer `EventPagesV1`, and only Blob may offer
+`BlobRangesStreamV1` or `BlobStreamV1`. Unknown
 IDs with bit `0x8000` set are critical and fail the contact; other unknown IDs
 remain canonical digest input but are not selected.
 
@@ -1034,7 +1043,162 @@ Blob transfer. No other data class changes its profile or grammar. Semantic v7
 uses profile 4 with durable-only policy; semantic v8 uses the same stream with
 authenticated finite-TTL custody. See [receipt-free Blob ranges](blob-ranges-stream.md)
 for the versioned profile contract. A missing required profile, empty
-intersection, digest mismatch, or profile substitution fails closed.
+intersection, digest mismatch, semantic/profile substitution, or profile-5
+selection before v9 fails closed. A v9/v8 or v9/v7 peer pair first negotiates
+the lower semantic version and then uses that version's exact profile-4 offer;
+an active profile-5 attempt is never downgraded into profile 4.
+
+Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
+`StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
+`StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
+profile 5. Semantic v9 also reserves ordinary mission-protected mechanics tags
+`0xdd` `BlobPublicationOpenV1`, `0xde` `BlobPublicationCommitV1`, `0xdf`
+`BlobPublicationAbsentV1`, `0xe0` `BlobPublicationResumeV1`, `0xe1`
+`BlobStreamPlanV1`, and `0xe2` `BlobStreamPlanReplyV1`. Tags
+`0xd1..0xd5` and every semantic-v7/v8 byte retain their existing meanings.
+
+Each admitted Blob direction first exchanges a retained-source plan request and
+reply; any selected checkpoint is receiver-authored. Both plan tags use the fixed
+body `direction u8 || selection_present u8 || selection`. Direction is `1` toward
+the session initiator or `2` toward the session responder. Presence `0` requires
+an empty selection;
+presence `1` requires exactly `source_id[32] || next_carrier_index u64 ||
+durable_offset u64 || checkpoint_generation u64`. The body is therefore exactly
+2 or 58 bytes. Generation is nonzero, and carrier index is zero if and only if
+durable offset is zero. Unknown flags or directions, truncation, and trailing
+bytes fail closed. These records are mission-protected and valid only under
+semantic v9; they do not reuse publication tags `0xdd` or `0xde`.
+
+A selected retained source uses the existing source, custody, and carrier
+checkpoint authority for its bounded stream attempt, including finite custody
+and interrupted transfers. Semantic-v9 finite retained sources use custody-v2
+with receiver-local age authority. An absent selection proceeds to
+completed-publication discovery below. The plan does not grant content authority: the adapter must
+still verify current policy, source identity, and the exact durable checkpoint.
+One plan exchange plus the two publication exchanges fits the three-exchange
+reservation for each direction.
+
+The publisher first emits `BlobPublicationOpenV1` containing the provider-signed
+canonical `BlobStreamOpen`. Its body is `semantic_version u16 = 9 || profile_id
+u16 = 5 || signed_open_len u32 || signed_open[signed_open_len]`. The final
+mission record uses the same envelope with tag `0xde` and a provider-signed
+canonical `BlobStreamFinalCommitment`. Signed bodies are nonempty and at most
+1,048,576 bytes. Decoding grants no authority: only provider verification may
+mint `VerifiedBlobStreamOpen` or `VerifiedBlobStreamFinalCommitment` and thereby
+authorize provisional storage, encryption state, or promotion. The open binds
+the logical stream ID, publisher, mission, operation key, metadata, declared
+plaintext length, content epoch, policy revision, authorization digest, and
+publication salt. The final commitment binds that open, both accumulator roots,
+segment count, final custody, and resulting Blob identity.
+
+The selected completed-publication path admits durable publications only.
+Finite signed opens are skipped during source selection and rejected before
+receiver reservation: publisher initial/final clock samples do not establish a
+receiver-local custody anchor. Finite RPC publications use the retained-source
+path above.
+
+For completed-publication transfer, the requester sends the signed open and
+the responder returns the same open before accepting its signed final
+commitment. The responder then returns its durable authority as
+`BlobPublicationResumeV1`; a source without the requested publication returns
+the direction-bound `BlobPublicationAbsentV1`. Their bodies are:
+
+| Tag | Body after prefix and tag |
+| --- | --- |
+| `0xdf` BlobPublicationAbsentV1 | `semantic_version u16 = 9 || profile_id u16 = 5 || direction u8` |
+| `0xe0` BlobPublicationResumeV1 | `semantic_version u16 = 9 || profile_id u16 = 5 || direction u8 || stream_id[32] || open_digest[32] || durable_plaintext_offset u64 || durable_wire_offset u64 || next_segment_index u64 || plaintext_commitment[32] || ciphertext_commitment[32] || checkpoint_generation u64` |
+
+The resume record is receiver-authored. Stream and open identities and both
+commitments are nonzero. Generation zero is canonical only with zero offsets,
+zero next-segment index, and the profile-5 initial commitments; any durable
+progress requires a nonzero generation. The sender must match the subsequent
+`StreamAcceptV1` exactly to this authority before sending data.
+
+Each transport attempt reuses the signed logical open and chooses a fresh,
+nonzero attempt nonce. The receiver is authoritative for resume: it supplies
+the last durable plaintext and ciphertext offsets, next segment index, both
+accumulator commitments, checkpoint generation, and a new absolute receive
+limit. The sender MUST NOT infer progress from an earlier attempt.
+
+The profile-5 mechanics prefix is `"ASM\x01" || tag`. All integers are
+unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
+`transfer_id[32] || attempt_nonce[32] || sequence u64`. A zero attempt nonce,
+unknown class/direction/result value, truncation, trailing bytes, arithmetic
+overflow, or a record decoded outside semantic v9/profile 5 fails closed.
+
+The canonical attempt record bodies are:
+
+| Tag | Body after prefix and tag |
+| --- | --- |
+| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || stream_id[32] || open_digest[32] || attempt_nonce[32] || checkpoint_generation u64` |
+| `0xd7` StreamAcceptV1 | `attempt tuple || durable_plaintext_offset u64 || durable_ciphertext_offset u64 || next_segment_index u64 || plaintext_commitment[32] || ciphertext_commitment[32] || checkpoint_generation u64 || absolute_receive_limit u64 || max_extent_bytes u32 || checkpoint_batch_bytes u32` |
+| `0xd8` StreamDataV1 | `attempt tuple || offset u64 || extent_len u32 || extent[extent_len]` |
+| `0xd9` StreamCheckpointV1 | `attempt tuple || durable_plaintext_offset u64 || durable_ciphertext_offset u64 || next_segment_index u64 || plaintext_commitment[32] || ciphertext_commitment[32] || checkpoint_generation u64 || absolute_receive_limit u64` |
+| `0xda` StreamFinishV1 | `attempt tuple || final_plaintext_offset u64 || final_ciphertext_offset u64 || signed_commitment_len u32 || signed_commitment[signed_commitment_len]` |
+| `0xdb` StreamResultV1 | `attempt tuple || final_plaintext_offset u64 || final_ciphertext_offset u64 || result_code u8 || blob_id[32] || result_digest[32]` |
+| `0xdc` StreamResultAckV1 | `attempt tuple || result_digest[32]` |
+
+Each attempt-stream record has one outer kind byte. `0xa0 || protected` carries
+exactly one mission-AEAD-protected control record and must not carry
+`StreamDataV1`. `0xa1 || StreamDataV1` carries canonical data directly and may
+not carry a control record. Direct data remains bound to the authenticated QUIC
+peer and attempt tuple, contains already segment-AEAD-protected pack bytes, and
+is accepted durably only after segment verification; the publisher-signed open
+and final commitment bind the complete logical publication. This avoids a
+second whole-extent mission encryption/copy while retaining end-to-end content
+authentication. Unknown outer kinds fail closed.
+
+`class = 1` is Blob. Result codes are `1` Promoted, `2` AlreadyPresent, `3`
+DeferredCapacity, `4` RetiredExpired, `5` RejectedPolicy, and `6`
+IntegrityFailure. Extents are nonempty and at most 1,048,576 bytes;
+checkpoint batches are nonzero and at most 16 MiB. A reader MUST consume and
+validate the fixed 89-byte StreamData header, reserve the exact declared body
+against the global streaming budget, and only then read or allocate the body.
+Credit is a ciphertext-stream absolute offset and never decreases within an
+attempt. Every acceptance satisfies `absolute_receive_limit -
+durable_ciphertext_offset >= checkpoint_batch_bytes + max_extent_bytes`; with
+the initial 16-MiB batch and 1-MiB extent, the minimum window is 17 MiB. Credit
+may exceed declared ciphertext length; the sender clamps data to that length.
+This permits positive-credit pipelining while one batch becomes durable and one
+following extent is already in flight.
+
+Checkpoint plaintext offset, ciphertext offset, segment index, and generation
+are cumulative and never move backward. Advancing durable content advances the
+generation and carries the exact accumulator checkpoints persisted with that
+generation. A heartbeat may retain generation, offsets, roots, and credit
+unchanged; it may increase credit, but MUST NOT change one checkpoint field
+without advancing to a fully persisted generation. Accumulator commitments are
+the fixed-width canonical checkpoint commitments defined by the profile-5
+stream format, never serialized hash-library state.
+
+`StreamFinishV1` is valid only after all declared ciphertext bytes are durable
+and its signed final commitment verifies against the provisional open, exact
+plaintext/ciphertext lengths, both final roots, and segment count. Verification
+failure never promotes provisional bytes. Successful Store promotion is atomic
+with creation of the immutable descriptor; only then may the receiver emit
+Promoted or AlreadyPresent. Duplicate finish, result, and acknowledgement
+records replay the same Blob ID and result digest without repeating promotion.
+Errors before settlement leave receiver durable authority unchanged.
+
+The signed publication-pack grammar does not reinterpret retained-source
+carrier indexes or checkpoints. Retained-source continuation is selected
+explicitly by `BlobStreamPlanV1` and validated by its source adapter; it does not
+authorize resuming incompatible publication-pack development state. Semantic
+v7/v8 profile 4 remains byte-identical and independently resumable. A publication
+pack does not require an existing manifest or carrier before bytes begin: the
+signed provisional open is admission authority and the signed final commitment
+completes identity. Framing, attempt identity, credit, checkpoints, bounded
+buffers, retry, settlement, and transport selection are reusable substrate;
+Blob signing, identity, custody, and promotion are its class-specific adapter.
+
+For retained finite sources, `StreamOpen.open_digest` is
+`SHA-256("ASTER/blob-stream/retained-open-custody/v1\0" || BlobId[32] || 0x01 ||
+authenticated_custody_claim_digest[32])`. Durable retained sources keep the
+Blob ID unchanged. The receiver checks this binding before `StreamAccept`.
+A source newly admitted in the current direction takes precedence; otherwise
+resumed sources must be pending locally and common to the exact authenticated
+reconciliation inventory for that peer and direction. Without such a source,
+the direction proceeds to completed-pack publication negotiation.
 
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
@@ -1497,7 +1661,7 @@ is persisted with the authorization. The former format `1` and bare root-signed
 control shape are not accepted. Exact fields and signature input are in
 [envelope.md](envelope.md) §6.2.
 
-The semantic-version-2/3/v4/v5/v6/v7/v8 bridge path decrypts protected route metadata, evaluates
+The semantic-version-2/3/v4/v5/v6/v7/v8/v9 bridge path decrypts protected route metadata, evaluates
 an authority-issued exact directed-edge policy plus a local narrowing filter,
 and creates a destination routing wrapper around the byte-identical format-2
 source envelope. ObjectKind 4 authorization controls and ObjectKind 5 wrappers
@@ -1572,9 +1736,9 @@ The key schedule uses exact concatenation of the 32-byte P-256 ECDH result and
 direction/protection/confirmation labels. The stable handshake framing,
 credential/envelope encoding, cryptographic profile, and replication wire
 profile remain version `1`. Inside that framing, a default initiator offers
-semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
-the highest common value, so current peers select `8`, a v7-only peer selects
-`7`, a v6-only peer selects
+semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
+the highest common value, so current peers select `9`, a v8-only peer selects
+`8`, a v7-only peer selects `7`, a v6-only peer selects
 `6`, a v5-only peer selects `5`, a v4-only peer selects `4`, a v3-only peer
 selects `3`, a v2-only peer selects `2`, and a v1-only peer selects `1`. The
 selected semantic version is bound into the public transcript, key schedule,
@@ -1952,11 +2116,11 @@ version, cryptographic suite ID, and object/data-class registries are separate.
 A transport addition changes none of them. `PROTOCOL_VERSION` and the legacy C
 `aster_protocol_version()` report stable replication-wire/profile version `1`;
 the unambiguous replication-wire surfaces also report `1`, while the default and
-highest-supported semantic-version surfaces report `8`.
-The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`.
+highest-supported semantic-version surfaces report `9`.
+The default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
 
-The current handshake negotiates semantic versions `8`, `7`, `6`, `5`, `4`,
-`3`, `2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
+The current handshake negotiates semantic versions `9`, `8`, `7`, `6`, `5`,
+`4`, `3`, `2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
 duplicate-free canonical descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
 both selections to have been offered and to be locally supported.
@@ -1973,6 +2137,7 @@ The semantic-version inheritance registry is normative:
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
 | `7` | v6 byte-for-byte | per-lane profiles, receipt-free Event pages, and durable Blob range streams |
 | `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
+| `9` | v8 stable object and ordinary-lane bytes | `BlobStreamV1` profile identity and reserved stream-record tags; runtime activation is separately gated |
 
 An inherited version retains every earlier stable encoding and selected-lane
 rule unless the registry names an additional mechanic. In particular, semantic
@@ -1986,26 +2151,28 @@ the distinct v8 lane-record AAD domain described in §9.4.
 
 Semantic `1`
 permits transfer object kinds `1` (source envelope) and `2` (Blob chunk).
-Semantics `2` through `8` additionally permit the reserved kinds `3`
+Semantics `2` through `9` additionally permit the reserved kinds `3`
 (source-batch proof), `4` (bridge authorization), and `5` (bridge-route
-wrapper). Semantics `3` through `8` add the bounded session custody
+wrapper). Semantics `3` through `9` add the bounded session custody
 record in [envelope.md](envelope.md) §7.1; none allocates another stable object
-kind. Semantics `4` through `8` enable the §9.1 selected State/Record
-mechanics frames; semantics `5` through `8` recognize the historical §9.2 Blob
+kind. Semantics `4` through `9` enable the §9.1 selected State/Record
+mechanics frames; semantics `5` through `9` recognize the historical §9.2 Blob
 frame allocation, while selected carrier transfer requires the v7/v8 profile-4
 stream. Semantic `6` preserves all v5 ordinary-lane bytes and additionally
 enables the mutually opted-in §9.3 selected Event-bridge mechanics frames.
 Semantic `7` preserves all v6 mechanics and adds the §9.4 profile exchange and
 eligible receipt-free Event pages. Semantic `8` inherits those mechanics,
-changes the lane AAD domain, and adds authenticated finite Blob custody. A
+changes the lane AAD domain, and adds authenticated finite Blob custody.
+Semantic `9` preserves those stable bytes, selects Blob profile 5, and reserves
+the separately gated stream-record tags described in §9.4. A
 v1-v3 selected-node session filters all
 mutable frames, v4 filters all Blob frames, v1-v5 filter all v6 Event-bridge
 frames, and v1-v6 filter all v7 profile/page frames, completely.
 A v1 session filters
 those extended kinds before inventory-root construction and rejects them in
 messages, durable progress, and transfer events rather than silently processing
-v2/v3/v4/v5/v6/v7/v8 semantics. Semantic 1 also rejects envelope format 3 and compact batch
-authentication. Semantics 2 through 8 permit both the unchanged format-2
+v2/v3/v4/v5/v6/v7/v8/v9 semantics. Semantic 1 also rejects envelope format 3 and compact batch
+authentication. Semantics 2 through 9 permit both the unchanged format-2
 singleton and the §6.1 format-3 batch representation; negotiated semantics
 never rewrite stored stable bytes.
 
@@ -2092,11 +2259,13 @@ outbound, and replay limits:
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
 | selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
 | semantic-v8 Blob custody claim | exactly 208 bytes; source field at most 211 bytes and result/ack field at most 33 bytes | wrong presence, length, context, digest, duplicate, truncation, trailing bytes, or age overflow fail closed; a verified exact-context capability is required for finite admission and every lifecycle boundary |
+| semantic-v9 Blob custody claim | exactly 208 bytes plus fixed-size attempt/record AAD | v8/v9 domain substitution, zero nonce, wrong sequence/profile/lane/direction/digest, replay, or younger age fails closed before finite admission |
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |
-| live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB and 1,024 fixed 64-KiB chunks | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
-| live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
+| durable Blob RPC publication | one bounded bidirectional stream: metadata, Store-authoritative accepted offset plus canonical frame size, contiguous offset-bearing 64-KiB data frames with only the terminal data frame shorter, explicit finish, durable checkpoints, and terminal receipt | invalid shape or offset is rejected; overbound input returns `ResourceLimit`; canonical framing bounds per-frame work, only durable checkpoint offsets are resume authority, and the successful path has no whole-file staging or second plaintext pass |
+| finite Blob RPC publication | the smaller of 64 MiB plaintext and the configured depot bound; one private preallocated, unlinked Linux staging file and bounded canonical 64-KiB request frames | the initial accepted offset and every durable offset are zero; staging progress may advance the accepted offset, but disconnect requires whole-file retry with the same operation key/options; finish uses retained publication with custody-v2 network authority, and completed retries preserve operation-key idempotency |
+| live Blob plaintext window | `1..=1 MiB`, spanning at most 17 canonical chunks when unaligned | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
 | discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |
@@ -2151,11 +2320,12 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | class | 0 State, 1 Event, 2 Record, 3 Blob; every other value rejected in profile 1 |
 | priority | 0 Routine, 1 Priority, 2 Immediate, 3 Flash |
 | message | 1 Interest, 2 Summary, 3 Probe, 4 Node, 5 Offer, 6 Want, 7 Data, 8 Receipt |
-| transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2 through 8 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; later mechanics allocate no new object kind |
-| semantic-v7/v8 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
-| semantic-v7/v8 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 reserved `BlobCustodyV1` (not offered or selected), 4 `BlobRangesStreamV1` (Blob only; v7 durable-only, v8 authenticated custody); critical extension bit `0x8000` |
+| transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2 through 9 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; later mechanics allocate no new object kind |
+| semantic-v7/v8/v9 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
+| semantic-v7/v8/v9 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 reserved `BlobCustodyV1` (not offered or selected), 4 `BlobRangesStreamV1` (Blob only; v7 durable-only, v8 authenticated custody), 5 `BlobStreamV1` (Blob only; v9); critical extension bit `0x8000` |
 | semantic-v7/v8 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
-| source envelope format | 2 singleton hybrid authentication; semantics 2 through 8 add 3 content-committing batch authentication |
+| semantic-v9 Blob stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1 (profile-5 attempt context); `0xdd` BlobPublicationOpenV1, `0xde` BlobPublicationCommitV1, `0xdf` BlobPublicationAbsentV1, and `0xe0` BlobPublicationResumeV1 (mission-protected publication context); `0xe1` BlobStreamPlanV1 and `0xe2` BlobStreamPlanReplyV1 (mission-protected retained-source selection); attempt-stream outer kind `0xa0` is mission-protected control and `0xa1` is canonical direct data; all invalid before v9 |
+| source envelope format | 2 singleton hybrid authentication; semantics 2 through 9 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |
 | map field | unknown `0..63` critical; unknown `64..2^64-1` optional |
@@ -2175,7 +2345,7 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
 - Encryption does not hide traffic analysis.
 - PQ handshakes/signatures remain large; caching/batching reduces frequency only.
 - Format 2 carries a full credential and two large signatures per singleton
-  source envelope. The semantic-v2/v3/v4/v5/v6/v7/v8 provider and atomic explicit batch
+  source envelope. The semantic-v2/v3/v4/v5/v6/v7/v8/v9 provider and atomic explicit batch
   source/store/application path plus reference peer proof/compact runtime
   amortize transferred verification bytes, but the required 3 kbps end-to-end
   measurement and independent interoperability remain separate gates.

@@ -2457,6 +2457,11 @@ fn select_pressure_candidate_read_with_eligibility(
     Ok(charge.finish(candidate, proven))
 }
 
+/// Empty Blob roots do not make a pending migration or reanchor pass idle.
+pub(crate) fn maintenance_idle_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
+    Ok(expiry_indexes_active_read(read)? && pressure_ready_read(read)?)
+}
+
 fn pressure_ready_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
     let metadata = read.open_table(BLOB_PRESSURE_METADATA)?;
     let version = metadata

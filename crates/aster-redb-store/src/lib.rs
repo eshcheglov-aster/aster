@@ -341,8 +341,8 @@ pub const MAX_MUTABLE_NETWORK_ITEMS_PER_CLASS: u64 = 4_096;
 pub const MAX_MUTABLE_NETWORK_BYTES_PER_CLASS: u64 = 16 * 1024 * 1024;
 /// Maximum configured mission peers represented by durable mutable-transfer cursors.
 pub const MAX_MUTABLE_TRANSFER_CURSOR_PEERS: usize = 256;
-/// Maximum durable mutable-transfer cursor rows across all three classes and local modes.
-pub const MAX_MUTABLE_TRANSFER_CURSORS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS * 3 * 2;
+/// Maximum durable mutable-transfer cursor rows across all four classes and local modes.
+pub const MAX_MUTABLE_TRANSFER_CURSORS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS * 4 * 2;
 /// Implementation-local peer bound for durable receipt-free Event attempt cursors.
 ///
 /// This is a local allocation bound, not a wire limit or receiver rejection rule.
@@ -392,6 +392,8 @@ pub enum MutableTransferCursorClass {
     Record,
     /// Immutable selected Blob source transfers.
     Blob,
+    /// Completed pack-backed Blob publications, independent of manifest scheduling.
+    BlobStream,
 }
 
 impl MutableTransferCursorClass {
@@ -400,6 +402,7 @@ impl MutableTransferCursorClass {
             Self::State => 1,
             Self::Record => 2,
             Self::Blob => 3,
+            Self::BlobStream => 4,
         }
     }
 
@@ -408,6 +411,7 @@ impl MutableTransferCursorClass {
             1 => Ok(Self::State),
             2 => Ok(Self::Record),
             3 => Ok(Self::Blob),
+            4 => Ok(Self::BlobStream),
             _ => Err(StoreError::MutableTransferCursorInvariant(
                 "mutable-transfer cursor key has an invalid class tag",
             )),
@@ -5238,6 +5242,7 @@ pub struct Store {
     limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
     blob_lease_registry: blob::lease::BlobLifecycleLeaseRegistry,
+    blob_stream_writer_leases: blob::lease::BlobStreamWriterLeaseRegistry,
     operation_limits: EventOperationLimits,
     blob_lifecycle_limits: BlobLifecycleLimits,
     mission_authority: Option<NodeId>,
@@ -6148,6 +6153,9 @@ impl Store {
             limits,
             blob_depot_limits,
             blob_lease_registry: blob::lease::BlobLifecycleLeaseRegistry::new(blob_lease_limits),
+            blob_stream_writer_leases: blob::lease::BlobStreamWriterLeaseRegistry::for_owner(
+                blob_depot_owner_binding,
+            )?,
             operation_limits,
             blob_lifecycle_limits,
             mission_authority,
@@ -6518,6 +6526,7 @@ impl Store {
             limits: _,
             blob_depot_limits: _,
             blob_lease_registry: _,
+            blob_stream_writer_leases: _,
             operation_limits: _,
             blob_lifecycle_limits: _,
             mission_authority: _,
@@ -34558,6 +34567,7 @@ mod tests {
             MutableTransferCursorClass::State,
             MutableTransferCursorClass::Record,
             MutableTransferCursorClass::Blob,
+            MutableTransferCursorClass::BlobStream,
         ];
         let modes = [
             MutableTransferCursorMode::OfferToPeer,

@@ -192,6 +192,33 @@ pub(super) fn record(
     );
 }
 
+/// A Store-confirmed retained-stream checkpoint commits whole carriers. The
+/// pending-work API deliberately omits these carriers, so record the confirmed
+/// plan interval rather than querying its remaining work after the commit.
+pub(super) fn record_stream_checkpoint(
+    receiver: NodeId,
+    blob: &ContentVerifiedBlobEnvelope,
+    source: BlobTransferId,
+    plan: &aster_mesh::VerifiedBlobTransferPlan,
+    first_carrier: u64,
+    next_carrier: u64,
+) {
+    let key = (
+        receiver,
+        blob.publisher(),
+        blob.dot().counter,
+        *blob.blob_id().as_bytes(),
+    );
+    for index in first_carrier..next_carrier {
+        let id = plan.carrier_id(index).expect("committed stream carrier");
+        let object = BlobCarrierObjectId::new(id.wire_bytes()).expect("typed stream carrier");
+        let total = plan
+            .carrier_total_len(&id.wire_bytes())
+            .expect("stream carrier length");
+        record_key(key, source, object, total, total);
+    }
+}
+
 fn record_key(
     key: Key,
     source: BlobTransferId,

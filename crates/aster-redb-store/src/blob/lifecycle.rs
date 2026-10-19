@@ -1176,6 +1176,21 @@ pub(crate) fn initialize_ttl_expiry_cursors(
     Ok(())
 }
 
+/// A periodic idle hint must not freeze an unfinished expiry cycle or skip
+/// lifecycle migration. This reads only fixed-size metadata and cursor rows.
+pub(crate) fn maintenance_idle_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
+    if read
+        .open_table(BLOB_LIFECYCLE_METADATA)?
+        .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        != Some(BLOB_LIFECYCLE_SCHEMA_VERSION)
+    {
+        return Ok(false);
+    }
+    let state = load_ttl_expiry_state(&read.open_table(BLOB_TTL_EXPIRY_CURSORS)?)?;
+    Ok(state.live.is_none() && state.pending.is_none())
+}
+
 pub(crate) fn load_ttl_expiry_state_write(
     write: &redb::WriteTransaction,
 ) -> Result<TtlExpiryState, StoreError> {

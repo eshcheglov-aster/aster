@@ -10,6 +10,7 @@ const OFFER_CODEC_VERSION: u8 = 1;
 const CRITICAL_ID_MASK: u16 = 0x8000;
 const SEMANTIC_PROTOCOL_V7: u16 = 7;
 const SEMANTIC_PROTOCOL_V8: u16 = 8;
+const SEMANTIC_PROTOCOL_V9: u16 = 9;
 
 /// Fixed application transfer lanes covered by profile negotiation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -51,6 +52,7 @@ pub enum TransferProfileId {
     EventPagesV1 = 2,
     // 3 remains reserved for the approved BlobCustodyV1 design.
     BlobRangesStreamV1 = 4,
+    BlobStreamV1 = 5,
 }
 
 impl TransferProfileId {
@@ -60,6 +62,7 @@ impl TransferProfileId {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
             4 => Some(Self::BlobRangesStreamV1),
+            5 => Some(Self::BlobStreamV1),
             _ => None,
         }
     }
@@ -93,8 +96,9 @@ impl TransferProfileOfferV1 {
     pub fn for_semantic_version(semantic_version: u16) -> Result<Self, TransferProfileError> {
         match semantic_version {
             SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => Ok(Self::current()),
+            SEMANTIC_PROTOCOL_V9 => Ok(Self::stream_v9()),
             _ => Err(TransferProfileError::invalid(
-                "transfer-profile exchange requires semantic v7 or v8",
+                "transfer-profile exchange requires semantic v7, v8, or v9",
             )),
         }
     }
@@ -110,6 +114,37 @@ impl TransferProfileOfferV1 {
                 (
                     TransferLaneId::Blob as u16,
                     vec![TransferProfileId::BlobRangesStreamV1 as u16],
+                ),
+                (
+                    TransferLaneId::Record as u16,
+                    vec![TransferProfileId::LegacyV6 as u16],
+                ),
+                (
+                    TransferLaneId::State as u16,
+                    vec![TransferProfileId::LegacyV6 as u16],
+                ),
+                (
+                    TransferLaneId::Event as u16,
+                    vec![
+                        TransferProfileId::EventPagesV1 as u16,
+                        TransferProfileId::LegacyV6 as u16,
+                    ],
+                ),
+            ],
+        }
+    }
+
+    /// Semantic-v9 offer; Blob uses the credit-windowed checkpointed stream.
+    fn stream_v9() -> Self {
+        Self {
+            lanes: vec![
+                (
+                    TransferLaneId::EventBridge as u16,
+                    vec![TransferProfileId::LegacyV6 as u16],
+                ),
+                (
+                    TransferLaneId::Blob as u16,
+                    vec![TransferProfileId::BlobStreamV1 as u16],
                 ),
                 (
                     TransferLaneId::Record as u16,
@@ -217,7 +252,15 @@ impl TransferProfileOfferV1 {
             known_lanes.insert(lane);
             if !profiles.contains(&(TransferProfileId::LegacyV6 as u16))
                 && !(lane == TransferLaneId::Blob
-                    && profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16)))
+                    && profiles.iter().any(|profile| {
+                        matches!(
+                            TransferProfileId::decode(*profile),
+                            Some(
+                                TransferProfileId::BlobRangesStreamV1
+                                    | TransferProfileId::BlobStreamV1
+                            )
+                        )
+                    }))
             {
                 return Err(TransferProfileError::invalid(
                     "every fixed lane must offer LegacyV6",
@@ -235,6 +278,13 @@ impl TransferProfileOfferV1 {
             {
                 return Err(TransferProfileError::invalid(
                     "BlobRangesStreamV1 is valid only for the Blob lane",
+                ));
+            }
+            if lane != TransferLaneId::Blob
+                && profiles.contains(&(TransferProfileId::BlobStreamV1 as u16))
+            {
+                return Err(TransferProfileError::invalid(
+                    "BlobStreamV1 is valid only for the Blob lane",
                 ));
             }
         }
@@ -361,11 +411,21 @@ pub fn negotiate_transfer_profiles_for_semantic_version(
 ) -> Result<NegotiatedTransferProfiles, TransferProfileError> {
     if !matches!(
         semantic_version,
-        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 | SEMANTIC_PROTOCOL_V9
     ) {
         return Err(TransferProfileError::invalid(
-            "transfer-profile exchange requires semantic v7 or v8",
+            "transfer-profile exchange requires semantic v7, v8, or v9",
         ));
+    }
+    let expected = TransferProfileOfferV1::for_semantic_version(semantic_version)?;
+    for offer in [initiator, responder] {
+        let offered_blob = profiles_for(offer, TransferLaneId::Blob)?;
+        let expected_blob = profiles_for(&expected, TransferLaneId::Blob)?;
+        if offered_blob != expected_blob {
+            return Err(TransferProfileError::invalid(
+                "Blob transfer profile does not match semantic version",
+            ));
+        }
     }
     negotiate_transfer_profiles(initiator, responder)
 }

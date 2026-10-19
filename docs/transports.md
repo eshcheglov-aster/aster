@@ -56,8 +56,9 @@ freshly verified positive current versions and gives Record a separate durable
 whole-key active-head queue. Neither application selector mutates its separately
 configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
-file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
-live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Under
+file at cursor zero, bounded by configured depot bytes and selected-profile
+64-KiB chunk capacity, and a live read returns at most 1 MiB of plaintext per
+zeroize-on-drop window. Under
 semantic v7/v8 profile 4, the same selected runtime automatically reconciles
 Blob sources and transfers peer-neutral contiguous carrier ranges of at most
 16 KiB directly between content-capable peers. V7 is durable-only. V8 also
@@ -460,20 +461,54 @@ core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
 Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
-sources. The selected node does not yet expose the final multi-carrier adapter
-contract, so a new production adapter must not create a second persistence,
-reconciliation, authentication, or scheduling authority. Use the
+sources. The selected node now has an internal stream-adapter and deterministic
+selector seam, but `IrohQuicV1` is its only production stream adapter. Candidate
+support and locators must come from local configuration, provisioned peer data,
+or authenticated discovery before `StreamOpen`; peer-supplied ranking is never
+accepted. The selector filters policy and stream-contract eligibility, then
+orders health, configured priority, and stable adapter ID. Exactly one adapter
+carries a logical attempt. Iroh direct versus relay remains an Iroh-local path
+observation, not two selectable Aster transports.
+
+Fake adapters validate ranking, retry, cancellation, terminal outcomes, and
+checkpoint carry-forward, but they are not product transport support. This
+milestone may claim automatic selection of the sole eligible Iroh adapter and
+authenticated Iroh reopen. It must not claim best-available cross-transport
+selection or failover until a second independently usable production adapter
+and its physical scenario are reviewed. A new production adapter must not
+create a second persistence, reconciliation, authentication, or scheduling
+authority. Use the
 [binding pattern](bindings/pattern.md) for a language API.
 
 ## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]` in that
+implementation offers semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]` in that
 descending order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 8** is offered first. It inherits semantic-v7 profile
+- **Semantic version 9** is offered first. It preserves v1-v8 stable bytes and
+  selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
+  never a reinterpretation or in-attempt downgrade of profile 4. Its
+  `0xdd..0xde` receiver-authored pre-open plan, `0xd6..0xdc` attempt records,
+  v9 custody/record protection, concurrent Iroh data/control pair, durable
+  checkpoint recovery, internal one-adapter selector, and bounded completed-
+  contact metrics are implemented. The metrics use a stable transport ID and
+  numeric attempt, received/retransmitted byte, receive-limit, checkpoint,
+  checkpoint-latency, writer-commit, and failover-recovery fields. They never
+  contain raw paths or peer error text. Profile-5 metadata cursor advancement
+  is deferred until the authenticated stream result acknowledgement; a failed
+  attempt leaves that cursor unchanged, and an authenticated metadata-equal
+  reconnect reconstructs the exact deferred settlement from the selected
+  source and current cursor. Reopen of an already-staged finite
+  profile-5 source now consumes a fresh custody-v2 prelude, durably merges age,
+  binds its digest into `StreamOpen`, and withholds credit until authentication
+  succeeds. Initial finite profile-5 metadata is retained only for the current
+  contact; a custody-v2 prelude must authenticate before the receiver stages a
+  pending source, confirms the zero checkpoint, or emits stream credit.
+  Cross-transport failover remains fail-closed.
+- **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.
 - **Semantic version 7** remains a compatibility option. After the four-flight mission

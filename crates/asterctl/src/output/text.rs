@@ -159,7 +159,7 @@ pub(super) fn publish(s: &api::PublishEventResponse) -> String {
     text
 }
 
-pub(super) fn publish_blob(blob: &api::PublishBlobResponse) -> String {
+pub(super) fn publish_blob(blob: &api::PublishBlobReceipt) -> String {
     let mut text = String::from("BLOB:\n");
     field(&mut text, "ID", scalar(Bytes(&blob.id)));
     field(&mut text, "Publisher", scalar(Bytes(&blob.publisher)));

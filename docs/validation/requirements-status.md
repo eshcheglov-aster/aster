@@ -632,9 +632,9 @@ priority order:
    relays, physical or mixed implementations, scale, or release.
    Historical stopped `SelectedBlobNode` remains available. Current
    `RunningNode::selected_blobs()` returns a cloneable actor-owned handle that
-   admits a nonempty regular file under the selected 64-MiB/1,024-chunk bound,
+   admits a nonempty regular file under configured depot bytes and selected-profile chunk capacity,
    publishes through a capacity-one joined worker, and returns freshly
-   authenticated zeroize-on-drop plaintext pages of at most 64 KiB. Exact
+   authenticated zeroize-on-drop plaintext windows of at most 1 MiB. Exact
    retry, cancellation/admission boundaries, policy/rekey races, shutdown and
    zeroization closure, direct-Iroh later synchronization, receiver read, and
    peerless restart read have focused automation. Separately, the
@@ -799,8 +799,8 @@ physical reclamation finalizes.
 `read_page` exact-loads the current application projection, checks its
 startup-authenticated route/content/depot capability and finite-custody state,
 streams only the requested authenticated range, and performs a final
-policy/lifecycle check before disclosing a nonempty page of at most 64 KiB,
-spanning at most two canonical chunks. Stopped `read_into` applies the same
+policy/lifecycle check before disclosing a nonempty window of at most 1 MiB,
+spanning at most 17 canonical chunks when unaligned. Stopped `read_into` applies the same
 lifecycle boundary before each bounded page. Publication and read results echo
 the exact original TTL. Plaintext is
 held in a zeroize-on-drop value; caller copies become caller custody. Rekey,

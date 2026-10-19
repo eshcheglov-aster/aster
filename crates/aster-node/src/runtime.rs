@@ -76,14 +76,14 @@ use aster_redb_store::{
     MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
     MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
-    MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
-    NumberedEventPublishOutcome, PendingBlobLifetimeTransition, PendingBlobSource,
-    PreparedBlobCustodySend, RecordSenderProjection, RecordTransferId, RejectedControl,
-    ReservedEventOnceCommit, RetainedBlobSource, RouteCacheOutcome, ScopeRekeyPublicationIntent,
-    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
-    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
-    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
-    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    MAX_SELECTED_BLOB_CHUNKS, MutableTransferCursorClass, MutableTransferCursorMode,
+    NumberedEventOperationRequest, NumberedEventPublishOutcome, PendingBlobLifetimeTransition,
+    PendingBlobSource, PreparedBlobCustodySend, RecordSenderProjection, RecordTransferId,
+    RejectedControl, ReservedEventOnceCommit, RetainedBlobSource, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
+    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -105,10 +105,14 @@ mod blob_progress_test;
 pub(crate) mod blob_ranges_stream;
 #[cfg(test)]
 mod blob_ranges_stream_test;
+#[allow(dead_code)] // Activated as the profile-5 driver is wired through Task 7.
+mod blob_stream;
 #[cfg(test)]
 #[path = "runtime/convergence_test.rs"]
 mod convergence_test;
 
+#[cfg(test)]
+use crate::event_pages::SEMANTIC_PROTOCOL_V9;
 #[cfg(test)]
 use crate::event_pages::empty_set_commitment;
 #[cfg(test)]
@@ -145,10 +149,12 @@ use crate::{
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
-        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition,
-        BridgeRouteDisposition, EventApplyDisposition, EventDirection, EventInterest,
-        EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
-        MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
+        BlobInterest, BlobInterestSelector, BlobObjectId, BlobPublicationAbsentV1,
+        BlobPublicationCommitV1, BlobPublicationOpenV1, BlobPublicationResumeV1,
+        BlobRangeDisposition, BlobStreamPlanV1, BridgeRouteDisposition, EventApplyDisposition,
+        EventDirection, EventInterest, EventInterestSelector, Frame, FrameEmissionPolicy,
+        MAX_EVENT_INTEREST_BYTES, MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass,
+        MutableTransferId,
     },
     mission::{
         MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError,
@@ -472,6 +478,7 @@ const MUTABLE_V8_CONTACT_RESERVE_BYTES: usize = MUTABLE_V5_CONTACT_RESERVE_BYTES
 const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
     3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
+const BLOB_CONTACT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const DEMO_MISSION_BUNDLE_FILE: &str = "mission.unprotected-reference.bundle";
 const DEMO_SIGNED_REGISTRY_FILE: &str = "signed-public-rekey-registry.bin";
 const DEMO_SCOPE: &str = "demo/mesh";
@@ -608,6 +615,15 @@ fn inbound_contact_collision(local: EndpointId, peer: EndpointId) -> InboundCont
     } else {
         InboundContactCollision::YieldFallbackOutbound
     }
+}
+
+fn is_expected_contact_collision(local: EndpointId, peer: EndpointId, error: &NodeError) -> bool {
+    local > peer
+        && matches!(
+            error,
+            NodeError::Carrier(CarrierError::ContactCollision)
+                | NodeError::Mission(MissionSessionError::Carrier(CarrierError::ContactCollision))
+        )
 }
 
 fn selected_reconciliation_limits() -> Result<ReconciliationLimits, NodeError> {
@@ -3136,6 +3152,13 @@ impl LiveEmissionPolicy {
     }
 }
 
+/// Stable profile-5 transport identifier for operator contact metrics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum BlobStreamTransport {
+    IrohQuicV1 = 1,
+}
+
 /// Metrics for one completed contact from this local node's point of view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerReceipt {
@@ -3191,6 +3214,24 @@ pub struct PeerReceipt {
     pub blob_remaining: usize,
     /// Blob range attempts deferred by a typed durable capacity boundary.
     pub blob_deferred: usize,
+    /// Profile-5 attempts completed during this contact.
+    pub blob_stream_attempts: u16,
+    /// Stable selected profile-5 adapter, absent when no stream attempt ran.
+    pub blob_stream_transport: Option<BlobStreamTransport>,
+    /// Authenticated profile-5 data bytes observed by this receiver.
+    pub blob_stream_received_bytes: u64,
+    /// Bytes resent before a durable checkpoint during this contact.
+    pub blob_stream_retransmitted_bytes: u64,
+    /// Greatest absolute receive limit advertised during this contact.
+    pub blob_stream_receive_limit_bytes: u64,
+    /// Greatest Store-confirmed cumulative profile-5 checkpoint.
+    pub blob_stream_checkpoint_bytes: u64,
+    /// Greatest observed Store checkpoint commit latency.
+    pub blob_stream_checkpoint_latency_ms: u64,
+    /// Durable profile-5 writer commits completed during this contact.
+    pub blob_stream_writer_commits: u32,
+    /// Attempts that resumed through a different eligible adapter.
+    pub blob_stream_failover_recoveries: u16,
     /// Mission-control transfers offered from local durable state.
     pub controls_offered: usize,
     /// Mission-control transfers fetched from the remote durable state.
@@ -3243,6 +3284,70 @@ pub struct PeerReceipt {
     pub bridge_delivered: usize,
     /// Locally selected bridge routes deferred by the per-direction contact bound.
     pub bridge_remaining: usize,
+}
+
+impl PeerReceipt {
+    fn account_blob_stream_attempt(
+        &mut self,
+        attempt: blob_stream::BlobStreamAttemptOutcome,
+    ) -> Result<(), NodeError> {
+        let metrics = attempt.metrics;
+        let attempts = self
+            .blob_stream_attempts
+            .checked_add(1)
+            .ok_or_else(|| NodeError::Protocol("Blob stream attempt count overflow".into()))?;
+        let transport = match self.blob_stream_transport {
+            Some(existing) if existing != metrics.transport => {
+                return Err(NodeError::Protocol(
+                    "Blob stream contact used multiple transport identifiers".into(),
+                ));
+            }
+            Some(existing) => Some(existing),
+            None => Some(metrics.transport),
+        };
+        let received_bytes = self
+            .blob_stream_received_bytes
+            .checked_add(metrics.received_bytes)
+            .ok_or_else(|| {
+                NodeError::Protocol("Blob stream received byte count overflow".into())
+            })?;
+        let retransmitted_bytes = self
+            .blob_stream_retransmitted_bytes
+            .checked_add(metrics.retransmitted_bytes)
+            .ok_or_else(|| {
+                NodeError::Protocol("Blob stream retransmitted byte count overflow".into())
+            })?;
+        let receive_limit_bytes = self
+            .blob_stream_receive_limit_bytes
+            .max(metrics.receive_limit_bytes);
+        let checkpoint_bytes = self
+            .blob_stream_checkpoint_bytes
+            .max(metrics.checkpoint_bytes);
+        let checkpoint_latency_ms = self
+            .blob_stream_checkpoint_latency_ms
+            .max(metrics.checkpoint_latency_ms);
+        let writer_commits = self
+            .blob_stream_writer_commits
+            .checked_add(metrics.writer_commits)
+            .ok_or_else(|| {
+                NodeError::Protocol("Blob stream writer commit count overflow".into())
+            })?;
+        let failover_recoveries = self
+            .blob_stream_failover_recoveries
+            .checked_add(metrics.failover_recoveries)
+            .ok_or_else(|| NodeError::Protocol("Blob stream failover count overflow".into()))?;
+
+        self.blob_stream_attempts = attempts;
+        self.blob_stream_transport = transport;
+        self.blob_stream_received_bytes = received_bytes;
+        self.blob_stream_retransmitted_bytes = retransmitted_bytes;
+        self.blob_stream_receive_limit_bytes = receive_limit_bytes;
+        self.blob_stream_checkpoint_bytes = checkpoint_bytes;
+        self.blob_stream_checkpoint_latency_ms = checkpoint_latency_ms;
+        self.blob_stream_writer_commits = writer_commits;
+        self.blob_stream_failover_recoveries = failover_recoveries;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3355,6 +3460,22 @@ pub struct NodeReceipt {
     pub blob_remaining: u64,
     /// Blob range attempts deferred by durable capacity.
     pub blob_deferred: u64,
+    /// Completed profile-5 attempts across successful contacts.
+    pub blob_stream_attempts: u64,
+    /// Authenticated profile-5 bytes received across successful contacts.
+    pub blob_stream_received_bytes: u64,
+    /// Profile-5 bytes retransmitted across successful contacts.
+    pub blob_stream_retransmitted_bytes: u64,
+    /// Greatest absolute profile-5 receive limit observed.
+    pub blob_stream_receive_limit_bytes: u64,
+    /// Greatest cumulative durable profile-5 checkpoint observed.
+    pub blob_stream_checkpoint_bytes: u64,
+    /// Greatest profile-5 checkpoint commit latency observed.
+    pub blob_stream_checkpoint_latency_ms: u64,
+    /// Durable profile-5 writer commits across successful contacts.
+    pub blob_stream_writer_commits: u64,
+    /// Cross-transport profile-5 recovery attempts across successful contacts.
+    pub blob_stream_failover_recoveries: u64,
     /// Final application-visible Blob publication count.
     pub blobs: u64,
     /// Final paired Blob acceptance marker count.
@@ -3557,34 +3678,79 @@ fn account_data_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
 }
 
 fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Result<(), NodeError> {
-    total.blob_ranges_fetched = total
+    let blob_ranges_fetched = total
         .blob_ranges_fetched
         .checked_add(
             u64::try_from(contact.blob_ranges_fetched)
                 .map_err(|_| NodeError::Protocol("contact Blob range count exceeds u64".into()))?,
         )
         .ok_or_else(|| NodeError::Protocol("aggregate Blob range count overflow".into()))?;
-    total.blob_bytes_fetched = total
+    let blob_bytes_fetched = total
         .blob_bytes_fetched
         .checked_add(
             u64::try_from(contact.blob_bytes_fetched)
                 .map_err(|_| NodeError::Protocol("contact Blob byte count exceeds u64".into()))?,
         )
         .ok_or_else(|| NodeError::Protocol("aggregate Blob byte count overflow".into()))?;
-    total.blob_remaining =
+    let blob_remaining =
         total
             .blob_remaining
             .checked_add(u64::try_from(contact.blob_remaining).map_err(|_| {
                 NodeError::Protocol("contact Blob remaining count exceeds u64".into())
             })?)
             .ok_or_else(|| NodeError::Protocol("aggregate Blob remaining count overflow".into()))?;
-    total.blob_deferred =
+    let blob_deferred =
         total
             .blob_deferred
             .checked_add(u64::try_from(contact.blob_deferred).map_err(|_| {
                 NodeError::Protocol("contact Blob deferral count exceeds u64".into())
             })?)
             .ok_or_else(|| NodeError::Protocol("aggregate Blob deferral count overflow".into()))?;
+    let blob_stream_attempts = total
+        .blob_stream_attempts
+        .checked_add(u64::from(contact.blob_stream_attempts))
+        .ok_or_else(|| NodeError::Protocol("aggregate Blob stream attempt overflow".into()))?;
+    let blob_stream_received_bytes = total
+        .blob_stream_received_bytes
+        .checked_add(contact.blob_stream_received_bytes)
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate Blob stream received bytes overflow".into())
+        })?;
+    let blob_stream_retransmitted_bytes = total
+        .blob_stream_retransmitted_bytes
+        .checked_add(contact.blob_stream_retransmitted_bytes)
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate Blob stream retransmitted bytes overflow".into())
+        })?;
+    let blob_stream_writer_commits = total
+        .blob_stream_writer_commits
+        .checked_add(u64::from(contact.blob_stream_writer_commits))
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate Blob stream writer commits overflow".into())
+        })?;
+    let blob_stream_failover_recoveries = total
+        .blob_stream_failover_recoveries
+        .checked_add(u64::from(contact.blob_stream_failover_recoveries))
+        .ok_or_else(|| NodeError::Protocol("aggregate Blob stream failovers overflow".into()))?;
+
+    total.blob_ranges_fetched = blob_ranges_fetched;
+    total.blob_bytes_fetched = blob_bytes_fetched;
+    total.blob_remaining = blob_remaining;
+    total.blob_deferred = blob_deferred;
+    total.blob_stream_attempts = blob_stream_attempts;
+    total.blob_stream_received_bytes = blob_stream_received_bytes;
+    total.blob_stream_retransmitted_bytes = blob_stream_retransmitted_bytes;
+    total.blob_stream_receive_limit_bytes = total
+        .blob_stream_receive_limit_bytes
+        .max(contact.blob_stream_receive_limit_bytes);
+    total.blob_stream_checkpoint_bytes = total
+        .blob_stream_checkpoint_bytes
+        .max(contact.blob_stream_checkpoint_bytes);
+    total.blob_stream_checkpoint_latency_ms = total
+        .blob_stream_checkpoint_latency_ms
+        .max(contact.blob_stream_checkpoint_latency_ms);
+    total.blob_stream_writer_commits = blob_stream_writer_commits;
+    total.blob_stream_failover_recoveries = blob_stream_failover_recoveries;
     Ok(())
 }
 
@@ -7723,6 +7889,9 @@ enum TestBlobContactFault {
     CompletedCacheRepairCapabilityLifetimeDiscontinuity = 45,
     CompletedCacheRepairFinalComparisonLifetimeExpiry = 46,
     CompletedCacheRepairFinalComparisonLifetimeDiscontinuity = 47,
+    StreamAfterCheckpoint = 48,
+    StreamCustodyPreludeTamper = 49,
+    GroupedPackDeferredAppend = 50,
 }
 
 #[cfg(test)]
@@ -7753,6 +7922,8 @@ struct TestBlobContactFaultState {
     fired: AtomicBool,
     result_frames_after_fault: AtomicU64,
     logical_digest_after_fault: StdMutex<Option<[u8; 32]>>,
+    grouped_pack_checkpoint:
+        StdMutex<Option<(aster_redb_store::BlobStreamCryptoResume, u64, usize)>>,
 }
 
 #[cfg(test)]
@@ -7763,6 +7934,7 @@ impl TestBlobContactFaultState {
             fired: AtomicBool::new(false),
             result_frames_after_fault: AtomicU64::new(0),
             logical_digest_after_fault: StdMutex::new(None),
+            grouped_pack_checkpoint: StdMutex::new(None),
         }
     }
 
@@ -8397,7 +8569,12 @@ impl AuthenticatedEventRouteCache {
                         // exact retained bytes and immutable projection, so
                         // advance this cache proof without treating a normal
                         // custody checkpoint as source corruption.
+                        let projection_changed =
+                            existing.metadata_fingerprint != claim.metadata_fingerprint;
                         existing.metadata_fingerprint = claim.metadata_fingerprint;
+                        if projection_changed {
+                            inner.pending_blob_completions.remove(&claim.transfer_id);
+                        }
                         Ok(())
                     }
                 }
@@ -10065,6 +10242,13 @@ fn blob_completion_capability_for_contact(
             manifest_bytes,
             sealed,
         ),
+        BlobContactMode::StreamV1 => store.custody_v2_completed_retained_blob(
+            projection,
+            retention,
+            blob,
+            manifest_bytes,
+            sealed,
+        ),
     }
     .map_err(NodeError::from)
 }
@@ -11657,6 +11841,60 @@ fn blob_claim_fits_network_bound(claim: &AuthenticatedBlobRouteClaim) -> bool {
         && claim.chunk_count <= MAX_NETWORK_BLOB_CHUNKS
 }
 
+fn blob_projection_fits_contact_bound(
+    store: &Store,
+    projection: &BlobSourceProjection,
+    mode: BlobContactMode,
+) -> bool {
+    if !mode.stream_v1_enabled() {
+        return blob_projection_fits_network_bound(projection);
+    }
+    let limits = store.blob_depot_limits();
+    mutable_source_fits_transfer_bound(projection.sealed_len)
+        && projection.sealed_len
+            <= u64::try_from(MAX_BLOB_NETWORK_SOURCE_BYTES).expect("Blob source bound fits u64")
+        && projection.total_len != 0
+        && projection.total_len <= limits.max_bytes()
+        && projection.chunk_size == aster_mesh::SELECTED_BLOB_CHUNK_SIZE
+        && projection.chunk_count <= limits.max_chunks()
+        && projection.chunk_count
+            == projection
+                .total_len
+                .div_ceil(u64::from(projection.chunk_size))
+}
+
+fn blob_claim_fits_contact_bound(
+    store: &Store,
+    claim: &AuthenticatedBlobRouteClaim,
+    mode: BlobContactMode,
+) -> bool {
+    if !mode.stream_v1_enabled() {
+        return blob_claim_fits_network_bound(claim);
+    }
+    let limits = store.blob_depot_limits();
+    mutable_source_fits_transfer_bound(claim.exact_len)
+        && claim.exact_len
+            <= u64::try_from(MAX_BLOB_NETWORK_SOURCE_BYTES).expect("Blob source bound fits u64")
+        && claim.has_canonical_manifest_shape()
+        && claim.total_len <= limits.max_bytes()
+        && claim.chunk_count <= limits.max_chunks()
+}
+
+fn blob_plan_fits_contact_bound(
+    store: &Store,
+    plan: &VerifiedBlobTransferPlan,
+    mode: Option<BlobContactMode>,
+) -> bool {
+    let total_len = plan.manifest().total_len();
+    let chunk_count = plan.manifest().chunk_count();
+    if mode == Some(BlobContactMode::StreamV1) {
+        let limits = store.blob_depot_limits();
+        total_len <= limits.max_bytes() && chunk_count <= limits.max_chunks()
+    } else {
+        total_len <= MAX_NETWORK_BLOB_BYTES && chunk_count <= MAX_NETWORK_BLOB_CHUNKS
+    }
+}
+
 fn repair_blob_sender_cache_miss(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -11664,7 +11902,7 @@ fn repair_blob_sender_cache_miss(
     expected: &BlobSourceProjection,
     blob_contact_mode: BlobContactMode,
 ) -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
-    if !blob_projection_fits_network_bound(expected) {
+    if !blob_projection_fits_contact_bound(store, expected, blob_contact_mode) {
         return Ok(None);
     }
     (|| -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
@@ -11878,6 +12116,11 @@ fn cached_mutable_sender_snapshot_with_blob_mode(
                             retained.push(item.clone());
                         })?
                     }
+                    BlobContactMode::StreamV1 => {
+                        store.visit_custody_v2_retained_blob_sources(Some(policy), |item| {
+                            retained.push(item.clone());
+                        })?
+                    }
                 }
                 for item in retained {
                     let projection = item.source;
@@ -11901,7 +12144,7 @@ fn cached_mutable_sender_snapshot_with_blob_mode(
                         // capability/final-comparison boundary.
                         continue;
                     }
-                    if !blob_projection_fits_network_bound(&projection) {
+                    if !blob_projection_fits_contact_bound(store, &projection, blob_contact_mode) {
                         // Projection-only bounds are checked before any exact
                         // source-row load, byte clone, cryptographic open, or
                         // depot capability acquisition. Local-only oversized
@@ -11935,7 +12178,7 @@ fn cached_mutable_sender_snapshot_with_blob_mode(
                             "injected outbound Blob projection/cache mismatch".into(),
                         ));
                     }
-                    if !blob_claim_fits_network_bound(&claim)
+                    if !blob_claim_fits_contact_bound(store, &claim, blob_contact_mode)
                         || !verifier.is_current_source_route_lineage(
                             &claim.scope,
                             claim.key_epoch,
@@ -12121,7 +12364,7 @@ fn load_verified_mutable_for_peer(
                 "outbound completed Blob inventory retained a pending cache claim".into(),
             ));
         }
-        if !blob_claim_fits_network_bound(claim) {
+        if !blob_claim_fits_contact_bound(store, claim, blob_contact_mode) {
             return Err(NodeError::Protocol(
                 "outbound Blob is local-only outside selected network bounds".into(),
             ));
@@ -12262,8 +12505,7 @@ fn load_verified_mutable_for_peer(
                 NodeError::Protocol(format!("outbound Blob transfer plan is invalid: {error}"))
             })
             .map_err(|error| fatal_blob_coherence("outbound Blob transfer plan", error))?;
-        if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-            || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+        if !blob_plan_fits_contact_bound(store, &plan, Some(blob_contact_mode))
             || !claim.matches_verified(&blob, &stored.sealed)
         {
             return Err(NodeError::FatalBlobCoherence(
@@ -12412,7 +12654,7 @@ fn load_verified_mutable_for_contact_peer(
         blob_contact_mode,
     )?;
     let finite_blob = if let MutableTransferId::Blob(_) = id
-        && blob_contact_mode.finite_transfer_enabled()
+        && blob_contact_mode.source_custody_v1_enabled()
     {
         let route = verifier.verify_blob(&bytes)?;
         let BlobContentVerification::ContentVerified { blob, .. } =
@@ -12891,6 +13133,7 @@ fn cache_committed_record_route_claim(
     cache.insert_mutable(verifier, claim)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cache_staged_blob_after_transition(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -12899,6 +13142,7 @@ fn cache_staged_blob_after_transition(
     blob: &ContentVerifiedBlobEnvelope,
     manifest_bytes: &[u8],
     sealed: &[u8],
+    blob_contact_mode: BlobContactMode,
 ) -> Result<(), NodeError> {
     #[cfg(test)]
     if cache.fire_test_blob_contact_fault(TestBlobContactFault::PostStage) {
@@ -12914,13 +13158,9 @@ fn cache_staged_blob_after_transition(
         TestBlobContactFault::PostStageLifetimeDiscontinuity,
     )?;
     let transition = (|| -> Result<(), NodeError> {
-        let blob_contact_mode = if blob.ttl_ms().is_some() {
-            BlobContactMode::CustodyV1
-        } else {
-            BlobContactMode::DurableOnly
-        };
         let projection = match blob_contact_mode {
             BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(expected)?,
+            BlobContactMode::StreamV1 => store.custody_v2_blob_source_projection(expected)?,
             BlobContactMode::DurableOnly => store.blob_source_projection(expected)?,
         }
         .ok_or_else(|| {
@@ -12995,6 +13235,14 @@ struct ReceivedBlobCustody {
     expected_exchange_id: u64,
 }
 
+struct DeferredFiniteBlobStreamAdmission {
+    source: BlobTransferId,
+    blob: ContentVerifiedBlobEnvelope,
+    manifest_bytes: Vec<u8>,
+    plan: VerifiedBlobTransferPlan,
+    sealed: Vec<u8>,
+}
+
 #[cfg(test)]
 fn take_test_blob_receive_replay() -> bool {
     TEST_BLOB_RECEIVE_FAULT
@@ -13049,6 +13297,7 @@ fn apply_test_blob_receive_fault(
     Ok(Some(custody))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_received_mutable(
     store: &Store,
     guard: &EventLaneGuard,
@@ -13057,6 +13306,8 @@ fn accept_received_mutable(
     id: MutableTransferId,
     sealed: &[u8],
     blob_custody: Option<ReceivedBlobCustody>,
+    blob_contact_mode: Option<BlobContactMode>,
+    deferred_finite_stream: Option<&mut Option<DeferredFiniteBlobStreamAdmission>>,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     guard.check(store)?;
     if sealed.len() > MAX_OBJECT_BYTES {
@@ -13222,18 +13473,39 @@ fn accept_received_mutable(
                     "Blob receive interest lacks the exact current content grant".into(),
                 ));
             };
-            require_blob_claim_presence(blob.ttl_ms(), blob_custody.is_some())?;
             verifier.verify_current_blob_lineage(&blob)?;
             let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
                 NodeError::Protocol(format!("received Blob transfer plan is invalid: {error}"))
             })?;
-            if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-                || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
-            {
+            if !blob_plan_fits_contact_bound(store, &plan, blob_contact_mode) {
                 return Err(NodeError::Protocol(
                     "received Blob manifest exceeds selected network bounds".into(),
                 ));
             }
+            if blob_contact_mode == Some(BlobContactMode::StreamV1)
+                && blob.ttl_ms().is_some()
+                && blob_custody.is_none()
+            {
+                let admission = deferred_finite_stream.ok_or_else(|| {
+                    NodeError::Protocol(
+                        "finite Blob stream metadata lacks a contact-local admission slot".into(),
+                    )
+                })?;
+                if admission.is_some() {
+                    return Err(NodeError::Protocol(
+                        "finite Blob stream lane selected more than one initial source".into(),
+                    ));
+                }
+                *admission = Some(DeferredFiniteBlobStreamAdmission {
+                    source: expected,
+                    blob,
+                    manifest_bytes,
+                    plan,
+                    sealed: sealed.to_vec(),
+                });
+                return Ok((MutableApplyDisposition::Inserted, None));
+            }
+            require_blob_claim_presence(blob.ttl_ms(), blob_custody.is_some())?;
             let cache = contact_mutable_route_cache(verifier)?;
             let lifecycle = cache.lock_blob_lifecycle()?;
             guard.check(store)?;
@@ -13301,6 +13573,13 @@ fn accept_received_mutable(
                     verified,
                     receiver_sample,
                 )
+            } else if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                store.stage_verified_durable_blob_stream_v9_with_policy(
+                    guard.policy(),
+                    &blob,
+                    sealed,
+                    &plan,
+                )
             } else {
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
             };
@@ -13313,6 +13592,13 @@ fn accept_received_mutable(
                     &plan,
                     verified,
                     receiver_sample,
+                )
+            } else if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                store.stage_verified_durable_blob_stream_v9_with_policy(
+                    guard.policy(),
+                    &blob,
+                    sealed,
+                    &plan,
                 )
             } else {
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
@@ -13349,6 +13635,31 @@ fn accept_received_mutable(
                                 "injected Blob staging retry coherence failure",
                             )))
                         } else {
+                            if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                                store.stage_verified_durable_blob_stream_v9_with_policy(
+                                    guard.policy(),
+                                    &blob,
+                                    sealed,
+                                    &plan,
+                                )
+                            } else {
+                                store.stage_verified_blob_source_with_policy(
+                                    guard.policy(),
+                                    &blob,
+                                    sealed,
+                                    &plan,
+                                )
+                            }
+                        };
+                        #[cfg(not(test))]
+                        let retry = if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                            store.stage_verified_durable_blob_stream_v9_with_policy(
+                                guard.policy(),
+                                &blob,
+                                sealed,
+                                &plan,
+                            )
+                        } else {
                             store.stage_verified_blob_source_with_policy(
                                 guard.policy(),
                                 &blob,
@@ -13356,13 +13667,6 @@ fn accept_received_mutable(
                                 &plan,
                             )
                         };
-                        #[cfg(not(test))]
-                        let retry = store.stage_verified_blob_source_with_policy(
-                            guard.policy(),
-                            &blob,
-                            sealed,
-                            &plan,
-                        );
                         match retry {
                             Ok(outcome) => Ok(outcome),
                             Err(retry) if equivalent_blob_capacity_error(&original, &retry) => {
@@ -13401,6 +13705,13 @@ fn accept_received_mutable(
                     &blob,
                     &manifest_bytes,
                     sealed,
+                    blob_contact_mode.unwrap_or_else(|| {
+                        if blob.ttl_ms().is_some() {
+                            BlobContactMode::CustodyV1
+                        } else {
+                            BlobContactMode::DurableOnly
+                        }
+                    }),
                 )?;
             }
             #[cfg(test)]
@@ -13436,13 +13747,24 @@ fn accept_received_mutable_for_contact(
     bytes: &[u8],
     custody: Option<ReceivedBlobCustody>,
     blob_contact_mode: BlobContactMode,
+    deferred_finite_stream: &mut Option<DeferredFiniteBlobStreamAdmission>,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
-    if custody.is_some() && !blob_contact_mode.finite_transfer_enabled() {
+    if custody.is_some() && !blob_contact_mode.source_custody_v1_enabled() {
         return Err(NodeError::Protocol(
             "Blob custody authority arrived outside negotiated profile 4".into(),
         ));
     }
-    accept_received_mutable(store, guard, verifier, admission, id, bytes, custody)
+    accept_received_mutable(
+        store,
+        guard,
+        verifier,
+        admission,
+        id,
+        bytes,
+        custody,
+        Some(blob_contact_mode),
+        Some(deferred_finite_stream),
+    )
 }
 
 fn require_blob_claim_presence(
@@ -14709,6 +15031,22 @@ fn dispatch_selected_blob_command(worker: &BlobWorkerSender, command: SelectedBl
     };
     match worker.sender.try_send(command) {
         Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(command))
+            if matches!(
+                &command.command,
+                SelectedBlobCommand::ClosePublishStream { .. }
+            ) =>
+        {
+            // Losing cleanup would permanently retain the singleton upload
+            // slot. Wait for bounded lane capacity without blocking the actor;
+            // the command retains its worker permit through delivery or close.
+            let sender = worker.sender.clone();
+            tokio::spawn(async move {
+                if let Err(error) = sender.send(command).await {
+                    error.0.reject();
+                }
+            });
+        }
         Err(mpsc::error::TrySendError::Full(command)) => command.reject_resource_limit(),
         Err(mpsc::error::TrySendError::Closed(command)) => command.reject(),
     }
@@ -14775,12 +15113,16 @@ fn spawn_blob_maintenance_turn_background(
     store: Arc<Store>,
     budget: BlobMaintenanceBudget,
     custody_sample: Option<CustodySample>,
+    allow_idle_skip: bool,
     #[cfg(all(test, unix))] gate: Option<BlobMaintenanceTestGate>,
 ) -> JoinHandle<Result<BlobMaintenanceProgress, NodeError>> {
     tokio::task::spawn_blocking(move || {
         #[cfg(all(test, unix))]
         if let Some(gate) = gate {
             gate.enter();
+        }
+        if allow_idle_skip && let Some(idle) = store.blob_maintenance_idle_progress()? {
+            return Ok(idle);
         }
         store
             .run_blob_maintenance_turn_with_sample(budget, custody_sample)
@@ -14813,6 +15155,7 @@ async fn run_blob_maintenance_turn_background(
             store,
             budget,
             custody_sample,
+            false,
             #[cfg(all(test, unix))]
             None,
         )
@@ -14831,6 +15174,7 @@ async fn run_selected_blob_worker(
     mut application: SelectedBlobNode,
     mut commands: mpsc::Receiver<BlobWorkerCommand>,
     admission: Arc<AtomicBool>,
+    publication_wake: Arc<tokio::sync::Notify>,
     inject_fatal_on_shutdown: bool,
     #[cfg(all(test, unix))] test_gate: Option<BlobMaintenanceTestGate>,
 ) -> Result<(), NodeError> {
@@ -14882,16 +15226,20 @@ async fn run_selected_blob_worker(
             }
         };
         application = returned;
-        if let Err(error) = result {
-            // `execute_live` returns a raw NodeError only for fatal internal
-            // coherence after a durable commit. Ordinary application errors
-            // have already been returned through the command response.
-            admission.store(false, Ordering::Release);
-            commands.close();
-            while let Ok(command) = commands.try_recv() {
-                command.reject();
+        match result {
+            Ok(true) => publication_wake.notify_one(),
+            Ok(false) => {}
+            Err(error) => {
+                // `execute_live` returns a raw NodeError only for fatal internal
+                // coherence after a durable commit. Ordinary application errors
+                // have already been returned through the command response.
+                admission.store(false, Ordering::Release);
+                commands.close();
+                while let Ok(command) = commands.try_recv() {
+                    command.reject();
+                }
+                return Err(error);
             }
-            return Err(error);
         }
     }
     if inject_fatal_on_shutdown {
@@ -15293,11 +15641,19 @@ async fn start_node_with_shutdown_ownership(
         identity,
         mission_authority,
     );
+    let blob_depot_limits = forwarding.blob_depot_limits();
+    let max_publish_bytes = blob_depot_limits.max_bytes().min(
+        blob_depot_limits
+            .max_chunks()
+            .min(MAX_SELECTED_BLOB_CHUNKS)
+            .saturating_mul(u64::from(aster_mesh::SELECTED_BLOB_CHUNK_SIZE)),
+    );
     let selected_blobs = SelectedBlobHandle::new(
         application_sender,
         application_admission.clone(),
         identity,
         mission_authority,
+        max_publish_bytes,
     );
     let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
     let selected_controls = SelectedControlHandle::new(control_sender, identity, mission_authority);
@@ -16496,13 +16852,16 @@ async fn run_node_actor_inner(
     #[cfg(all(test, unix))]
     let blob_worker_test_gate = blob_maintenance_gate.clone();
     let (blob_worker_completion_sender, mut blob_worker_completion_receiver) = oneshot::channel();
+    let blob_publication_wake = Arc::new(tokio::sync::Notify::new());
     let blob_worker_task = {
         let admission = application_admission.clone();
+        let publication_wake = blob_publication_wake.clone();
         tokio::spawn(inherit_node_output(async move {
             let result = run_selected_blob_worker(
                 blob_application,
                 blob_worker_receiver,
                 admission,
+                publication_wake,
                 blob_worker_fatal_on_shutdown,
                 #[cfg(all(test, unix))]
                 blob_worker_test_gate,
@@ -17069,6 +17428,18 @@ async fn run_node_actor_inner(
                 // that received operational priority over an exact deadline
                 // wake. The loop head rechecks every queue before retrying.
             }
+            _ = blob_publication_wake.notified(), if !application_tick_pending => {
+                // Coalesce successful new publications into the existing bounded
+                // contact scheduler. Chunk writes, reads and exact retries never
+                // produce this edge; busy peers retain it until a contact launches.
+                if automatic_nearby {
+                    event_contact_wake.arm_event(automatic_candidates.iter().copied());
+                } else {
+                    event_contact_wake.arm_event(configured_peers.iter().map(|peer| peer.carrier));
+                }
+                application_tick_yield_required = false;
+                application_tick_pending = true;
+            }
             _ = ticker.tick(), if !application_tick_pending => {
                 control_yield_required = false;
                 discovery_yield_required = false;
@@ -17174,6 +17545,7 @@ async fn run_node_actor_inner(
                         store.clone(),
                         blob_maintenance_runtime_budget(),
                         Some(custody_sample),
+                        true,
                         #[cfg(all(test, unix))]
                         blob_maintenance_gate.clone(),
                     ));
@@ -17427,7 +17799,7 @@ async fn run_node_actor_inner(
                         {
                             match inbound_contact_collision(local_id, peer) {
                                 InboundContactCollision::KeepPreferredOutbound => {
-                                    connection.close();
+                                    connection.close_for_contact_collision();
                                     println!("CONTACT direction=in carrier_peer={peer} status=collision-resolved resolution=keep-preferred-outbound");
                                     if yield_for_network {
                                         tokio::task::yield_now().await;
@@ -17841,11 +18213,13 @@ async fn run_node_actor_inner(
                             fatal_error = Some(error);
                             break;
                         }
-                        receipt.contact_errors += 1;
-                        let expected_mission = peer
-                            .expected_mission()
-                            .map_or_else(|| "discovered".into(), format_node_id);
-                        node_stderr!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
+                        if !is_expected_contact_collision(local_id, peer.carrier(), &error) {
+                            receipt.contact_errors += 1;
+                            let expected_mission = peer
+                                .expected_mission()
+                                .map_or_else(|| "discovered".into(), format_node_id);
+                            node_stderr!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
+                        }
                     }
                     Some(Err(error)) => {
                         let task = error.id();
@@ -17857,7 +18231,7 @@ async fn run_node_actor_inner(
                                 *last_activity = Instant::now();
                             }
                         }
-                        if !collision_aborted {
+                        if !collision_aborted || !error.is_cancelled() {
                             receipt.contact_errors += 1;
                             node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", terminal_metadata.as_ref().map_or_else(|| "unknown".into(), |metadata| metadata.carrying_peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
                         }
@@ -18302,7 +18676,12 @@ async fn sync_once_with_forwarding(
             "receive-only policy cannot initiate a carrier contact".into(),
         ));
     }
-    timeout(CONTACT_DEADLINE, sync_session(endpoint, contact))
+    let deadline = if contact.mutable_interests.blob_selectors().is_empty() {
+        CONTACT_DEADLINE
+    } else {
+        BLOB_CONTACT_DEADLINE
+    };
+    timeout(deadline, sync_session(endpoint, contact))
         .await
         .map_err(|_| NodeError::Protocol("contact exceeded its total deadline".into()))?
 }
@@ -18390,7 +18769,7 @@ async fn sync_session(
         captured: emission_snapshot,
         custody_clock,
     };
-    let result = CONTACT_EVENT_ROUTE_CACHE
+    let mut result = CONTACT_EVENT_ROUTE_CACHE
         .scope(
             event_route_cache,
             CONTACT_EMISSION_GUARD.scope(
@@ -18411,6 +18790,22 @@ async fn sync_session(
             ),
         )
         .await;
+    // A preferred peer can reject our simultaneous fallback before its own
+    // incoming connection reaches this actor. Preserve that explicit QUIC
+    // signal independently of local abort timing, without reclassifying
+    // protocol, authentication, bounds, storage or fatal-coherence failures.
+    if connection.local_id() > connection.remote_id()
+        && connection.was_rejected_for_contact_collision()
+        && matches!(
+            &result,
+            Err(NodeError::Carrier(CarrierError::Transport(_)))
+                | Err(NodeError::Mission(MissionSessionError::Carrier(
+                    CarrierError::Transport(_)
+                )))
+        )
+    {
+        result = Err(NodeError::Carrier(CarrierError::ContactCollision));
+    }
     if result.is_err() {
         connection.close();
     }
@@ -21739,11 +22134,20 @@ struct MutableClassContact<'a> {
 enum BlobContactMode {
     DurableOnly,
     CustodyV1,
+    StreamV1,
 }
 
 impl BlobContactMode {
-    const fn finite_transfer_enabled(self) -> bool {
+    const fn finite_lifecycle_enabled(self) -> bool {
+        matches!(self, Self::CustodyV1 | Self::StreamV1)
+    }
+
+    const fn source_custody_v1_enabled(self) -> bool {
         matches!(self, Self::CustodyV1)
+    }
+
+    const fn stream_v1_enabled(self) -> bool {
+        matches!(self, Self::StreamV1)
     }
 
     fn from_authenticated_profiles(
@@ -21764,6 +22168,9 @@ impl BlobContactMode {
         match (semantic_version, profile) {
             (SEMANTIC_PROTOCOL_V7, TransferProfileId::BlobRangesStreamV1) => Ok(Self::DurableOnly),
             (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobRangesStreamV1) => Ok(Self::CustodyV1),
+            (crate::event_pages::SEMANTIC_PROTOCOL_V9, TransferProfileId::BlobStreamV1) => {
+                Ok(Self::StreamV1)
+            }
             _ => Err(NodeError::Protocol(
                 "Blob lane selected an incompatible semantic/profile pair".into(),
             )),
@@ -21975,6 +22382,83 @@ fn settle_mutable_transfer_cursor(
         let mut state = harness.0.lock().expect("settlement harness lock");
         state.successful_cas += 1;
     });
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredBlobCursorSettlement {
+    peer: NodeId,
+    direction: EventDirection,
+    expected: Option<[u8; 32]>,
+    source: BlobTransferId,
+}
+
+impl DeferredBlobCursorSettlement {
+    const fn new(
+        peer: NodeId,
+        direction: EventDirection,
+        expected: Option<[u8; 32]>,
+        source: BlobTransferId,
+    ) -> Self {
+        Self {
+            peer,
+            direction,
+            expected,
+            source,
+        }
+    }
+
+    fn settle(self, store: &Store) -> Result<(), NodeError> {
+        let mut expected = self.expected;
+        settle_mutable_transfer_cursor(
+            store,
+            self.peer,
+            MutableClass::Blob,
+            self.direction,
+            &mut expected,
+            MutableTransferId::Blob(self.source),
+        )
+    }
+}
+
+fn blob_stream_cursor_settlement(
+    store: &Store,
+    peer: NodeId,
+    direction: EventDirection,
+    source: BlobTransferId,
+    deferred: Option<DeferredBlobCursorSettlement>,
+) -> Result<DeferredBlobCursorSettlement, NodeError> {
+    if let Some(deferred) = deferred {
+        if deferred.peer != peer || deferred.direction != direction || deferred.source != source {
+            return Err(NodeError::Protocol(
+                "deferred Blob cursor settlement differs from stream selection".into(),
+            ));
+        }
+        return Ok(deferred);
+    }
+    let expected = store.mutable_transfer_cursor(
+        peer,
+        MutableTransferCursorClass::Blob,
+        mutable_transfer_cursor_mode(direction),
+    )?;
+    Ok(DeferredBlobCursorSettlement::new(
+        peer, direction, expected, source,
+    ))
+}
+
+fn settle_completed_blob_stream_cursor(
+    store: &Store,
+    settlement: &mut Option<DeferredBlobCursorSettlement>,
+    outcome: blob_stream::BlobStreamAttemptOutcome,
+) -> Result<(), NodeError> {
+    if matches!(
+        outcome.code,
+        crate::stream_transfer::StreamResultCode::Promoted
+            | crate::stream_transfer::StreamResultCode::AlreadyPresent
+    ) && let Some(settlement) = settlement.take()
+    {
+        settlement.settle(store)?;
+    }
     Ok(())
 }
 
@@ -22548,7 +23032,7 @@ impl MutableFetchSettlement {
         class: MutableClass,
         direction: EventDirection,
         receipt: &mut PeerReceipt,
-    ) -> Result<Frame, NodeError> {
+    ) -> Result<(Frame, MutableTransferId, MutableApplyDisposition), NodeError> {
         let (pending_id, verified_digest) = self.pending.ok_or_else(|| {
             NodeError::Protocol("mutable fetch result lacks a pending fetch".into())
         })?;
@@ -22582,7 +23066,7 @@ impl MutableFetchSettlement {
                 .checked_add(1)
                 .ok_or_else(|| NodeError::Protocol("Blob deferral count overflow".into()))?;
         }
-        Ok(acknowledgement)
+        Ok((acknowledgement, pending_id, disposition))
     }
 
     const fn is_pending(&self) -> bool {
@@ -22664,8 +23148,34 @@ async fn defer_mutable_lane_from_reserved_class_skip(
 
 #[derive(Debug)]
 enum MutableReconciliationOutcome {
-    Complete(MutableDifference),
+    Complete {
+        difference: MutableDifference,
+        blob_common: Vec<BlobTransferId>,
+    },
     Deferred,
+}
+
+fn common_pending_blob_sources(
+    snapshot: &AuthenticatedMutableSenderSnapshot,
+    inventory: &InventorySnapshot,
+    difference: &MutableDifference,
+) -> Vec<BlobTransferId> {
+    if snapshot.class != MutableClass::Blob {
+        return Vec::new();
+    }
+    snapshot
+        .blob_claims
+        .iter()
+        .filter(|(source, claim)| {
+            claim.retention == BlobSourceRetention::Pending
+                && inventory.contains(&ItemId::new(*source.as_bytes()))
+                && difference
+                    .local_only
+                    .binary_search(&MutableTransferId::Blob(**source))
+                    .is_err()
+        })
+        .map(|(source, _)| *source)
+        .collect()
 }
 
 async fn sync_mutable_interests(
@@ -22929,7 +23439,10 @@ async fn sync_mutable_reconciliation_lane(
         record_mutable_lane_deferred(receipt)?;
         Ok(MutableReconciliationOutcome::Deferred)
     } else {
-        Ok(MutableReconciliationOutcome::Complete(difference))
+        Ok(MutableReconciliationOutcome::Complete {
+            blob_common: common_pending_blob_sources(source_snapshot, &inventory, &difference),
+            difference,
+        })
     }
 }
 
@@ -23017,6 +23530,7 @@ fn blob_source_projection_for_contact(
     match mode {
         BlobContactMode::DurableOnly => store.durable_contact_blob_source_projection(source),
         BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(source),
+        BlobContactMode::StreamV1 => store.custody_v2_blob_source_projection(source),
     }
 }
 
@@ -23028,6 +23542,7 @@ fn pending_blob_source_for_contact(
     match mode {
         BlobContactMode::DurableOnly => store.durable_contact_pending_blob_source(source),
         BlobContactMode::CustodyV1 => store.custody_v1_pending_blob_source(source),
+        BlobContactMode::StreamV1 => store.custody_v2_pending_blob_source(source),
     }
 }
 
@@ -23045,6 +23560,8 @@ fn retained_blob_source_matches_verified_for_contact(
         }
         BlobContactMode::CustodyV1 => store
             .custody_v1_retained_blob_source_matches_verified(projection, retention, blob, sealed),
+        BlobContactMode::StreamV1 => store
+            .custody_v2_retained_blob_source_matches_verified(projection, retention, blob, sealed),
     }
 }
 
@@ -23059,6 +23576,9 @@ fn next_pending_blob_source_for_contact(
             store.next_durable_pending_blob_source_with_policy(policy, after)
         }
         BlobContactMode::CustodyV1 => store.next_pending_blob_source_with_policy(policy, after),
+        BlobContactMode::StreamV1 => {
+            store.next_blob_stream_v9_pending_source_with_policy(policy, after)
+        }
     }
 }
 
@@ -23075,6 +23595,9 @@ fn pending_blob_carrier_work_for_contact(
         }
         BlobContactMode::CustodyV1 => {
             store.pending_blob_carrier_work_with_policy(policy, source, plan)
+        }
+        BlobContactMode::StreamV1 => {
+            store.pending_blob_stream_v9_carrier_work_with_policy(policy, source, plan)
         }
     }
 }
@@ -23097,6 +23620,7 @@ fn append_blob_carrier_prefix_for_contact(
         BlobContactMode::CustodyV1 => store.append_blob_carrier_prefix_with_policy(
             policy, source, object, total_len, offset, bytes,
         ),
+        BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
     }
 }
 
@@ -23115,6 +23639,7 @@ fn commit_complete_blob_carrier_for_contact(
         BlobContactMode::CustodyV1 => {
             store.commit_complete_blob_carrier_with_policy(policy, source, object, plan)
         }
+        BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
     }
 }
 
@@ -23138,6 +23663,13 @@ fn completed_pending_blob_for_contact(
         BlobContactMode::CustodyV1 => {
             store.completed_pending_blob_with_policy(policy, source, blob, manifest_bytes, plan)
         }
+        BlobContactMode::StreamV1 => store.completed_pending_blob_stream_v9_with_policy(
+            policy,
+            source,
+            blob,
+            manifest_bytes,
+            plan,
+        ),
     }
 }
 
@@ -23159,6 +23691,13 @@ fn apply_verified_blob_for_contact(
             content_completion,
         ),
         BlobContactMode::CustodyV1 => store.apply_verified_blob_with_policy(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+        ),
+        BlobContactMode::StreamV1 => store.apply_verified_blob_stream_v9_with_policy(
             policy,
             plan,
             lineage,
@@ -23288,14 +23827,110 @@ fn load_pending_blob_plan(
             NodeError::Protocol(format!("pending Blob transfer plan is invalid: {error}"))
         })
         .map_err(|error| fatal_blob_coherence("pending Blob transfer plan", error))?;
-    if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-        || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
-    {
+    if !blob_plan_fits_contact_bound(store, &plan, Some(blob_contact_mode)) {
         return Err(NodeError::FatalBlobCoherence(
             "pending Blob plan exceeds selected network bounds".into(),
         ));
     }
     Ok(Some((blob, manifest_bytes, plan)))
+}
+
+struct CompletedBlobStreamSource {
+    blob: ContentVerifiedBlobEnvelope,
+    plan: VerifiedBlobTransferPlan,
+    completion: BlobDepotCompletion,
+    projection: BlobSourceProjection,
+    retention: BlobSourceRetention,
+    sealed: Vec<u8>,
+}
+
+fn load_completed_blob_stream_source(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    source: BlobTransferId,
+) -> Result<Option<CompletedBlobStreamSource>, NodeError> {
+    let cache = contact_mutable_route_cache(verifier)
+        .map_err(|error| fatal_blob_coherence("completed Blob stream cache binding", error))?;
+    let _lifecycle = cache
+        .lock_blob_lifecycle()
+        .map_err(|error| fatal_blob_coherence("completed Blob stream lifecycle lock", error))?;
+    let retained =
+        match blob_source_projection_for_contact(store, source, BlobContactMode::StreamV1) {
+            Ok(retained) => retained,
+            Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
+            Err(error) => {
+                return Err(fatal_blob_coherence(
+                    "completed Blob stream projection",
+                    error.into(),
+                ));
+            }
+        };
+    let Some(retained) = retained else {
+        return Ok(None);
+    };
+    let retention @ BlobSourceRetention::Completed { .. } = retained.retention else {
+        return Ok(None);
+    };
+    let claim = cache
+        .get_blob(verifier, source)
+        .map_err(|error| fatal_blob_coherence("completed Blob stream cache claim", error))?
+        .ok_or_else(|| {
+            NodeError::FatalBlobCoherence(
+                "completed Blob stream source lacks its authenticated cache claim".into(),
+            )
+        })?;
+    if !claim.matches_projection(&retained.source) || claim.retention != retention {
+        return Err(NodeError::FatalBlobCoherence(
+            "completed Blob stream source conflicts with its authenticated cache claim".into(),
+        ));
+    }
+    let sealed = retained_blob_sealed(store, &retained.source, retention)?;
+    let route = verifier
+        .verify_blob(&sealed)
+        .map_err(NodeError::from)
+        .map_err(|error| fatal_blob_coherence("completed Blob stream authentication", error))?;
+    if BlobTransferId::new(route.envelope_id()) != source {
+        return Err(NodeError::FatalBlobCoherence(
+            "completed Blob stream identity differs from its durable source".into(),
+        ));
+    }
+    let BlobContentVerification::ContentVerified {
+        blob,
+        manifest_bytes,
+    } = verifier
+        .verify_blob_content(route, &sealed)
+        .map_err(NodeError::from)
+        .map_err(|error| fatal_blob_coherence("completed Blob stream content grant", error))?
+    else {
+        return Err(NodeError::FatalBlobCoherence(
+            "completed Blob stream source lost its content grant".into(),
+        ));
+    };
+    if !claim.matches_verified(&blob, &sealed) {
+        return Err(NodeError::FatalBlobCoherence(
+            "completed Blob stream source differs from its cache claim".into(),
+        ));
+    }
+    let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
+        NodeError::Protocol(format!("completed Blob stream plan is invalid: {error}"))
+    })?;
+    let completion = blob_completion_capability_for_contact(
+        store,
+        &retained.source,
+        retention,
+        &blob,
+        &manifest_bytes,
+        &sealed,
+        BlobContactMode::StreamV1,
+    )?;
+    Ok(Some(CompletedBlobStreamSource {
+        blob,
+        plan,
+        completion,
+        projection: retained.source,
+        retention,
+        sealed,
+    }))
 }
 
 fn pending_blob_claim_is_current(
@@ -23668,6 +24303,7 @@ enum BlobCapacityRecoveryVisibility {
     LocalAllVisible,
     DurableOnly,
     CustodyV1,
+    CustodyV2,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23715,6 +24351,7 @@ fn recover_contact_blob_capacity_after_cleanup(
     let visibility = match blob_contact_mode {
         BlobContactMode::DurableOnly => BlobCapacityRecoveryVisibility::DurableOnly,
         BlobContactMode::CustodyV1 => BlobCapacityRecoveryVisibility::CustodyV1,
+        BlobContactMode::StreamV1 => BlobCapacityRecoveryVisibility::CustodyV2,
     };
     recover_blob_capacity_after_cleanup_with_visibility(
         store,
@@ -23763,7 +24400,9 @@ fn recover_blob_capacity_after_cleanup_with_visibility(
         BlobCapacityRecoveryVisibility::LocalAllVisible => {
             store.run_blob_capacity_gc_for(target, budget, custody_sample)?;
         }
-        BlobCapacityRecoveryVisibility::DurableOnly | BlobCapacityRecoveryVisibility::CustodyV1 => {
+        BlobCapacityRecoveryVisibility::DurableOnly
+        | BlobCapacityRecoveryVisibility::CustodyV1
+        | BlobCapacityRecoveryVisibility::CustodyV2 => {
             store.run_durable_blob_capacity_gc_for(target, budget, custody_sample)?;
         }
     }
@@ -23781,6 +24420,15 @@ fn recover_blob_capacity_after_cleanup_with_visibility(
             )?,
         BlobCapacityRecoveryVisibility::CustodyV1 => store
             .run_custody_blob_pressure_recovery_after_cleanup(
+                error,
+                incoming_priority,
+                content,
+                (incoming_depot_chunks, incoming_depot_variants),
+                budget,
+                custody_sample,
+            )?,
+        BlobCapacityRecoveryVisibility::CustodyV2 => store
+            .run_custody_v2_blob_pressure_recovery_after_cleanup(
                 error,
                 incoming_priority,
                 content,
@@ -23856,7 +24504,7 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
     source: BlobTransferId,
     blob_contact_mode: BlobContactMode,
 ) -> Result<PendingBlobLifetimeTransition, NodeError> {
-    if blob_contact_mode != BlobContactMode::CustodyV1 {
+    if !blob_contact_mode.finite_lifecycle_enabled() {
         return Err(NodeError::Protocol(
             "durable-only Blob contact became lifetime-unavailable".into(),
         ));
@@ -23869,7 +24517,15 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
     let claim = cache
         .get_blob(verifier, source)
         .map_err(|error| fatal_blob_coherence("pending Blob lifetime cache lookup", error))?;
-    let transition = store.settle_custody_v1_pending_blob_lifetime_unavailability(source)?;
+    let transition = match blob_contact_mode {
+        BlobContactMode::CustodyV1 => {
+            store.settle_custody_v1_pending_blob_lifetime_unavailability(source)?
+        }
+        BlobContactMode::StreamV1 => {
+            store.settle_custody_v2_pending_blob_lifetime_unavailability(source)?
+        }
+        BlobContactMode::DurableOnly => unreachable!("checked finite transfer mode"),
+    };
     if matches!(
         transition,
         PendingBlobLifetimeTransition::Missing | PendingBlobLifetimeTransition::ExpiredRetired
@@ -24921,6 +25577,7 @@ fn serve_verified_blob_range_in_schedule(
                 usize::try_from(requested_len).expect("u32 fits usize"),
                 plan,
             ),
+            BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
         }
     };
     #[cfg(not(test))]
@@ -24946,6 +25603,7 @@ fn serve_verified_blob_range_in_schedule(
             usize::try_from(requested_len).expect("u32 fits usize"),
             plan,
         ),
+        BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
     };
     #[cfg(test)]
     if result.is_ok() && cache.fire_test_blob_contact_fault(TestBlobContactFault::RangePostcheck) {
@@ -24988,7 +25646,7 @@ async fn sync_mutable_transfer_lane(
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
     receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
+) -> Result<BlobSyncLaneOutcome, NodeError> {
     let DirectedMutableLane {
         guard,
         source_snapshot,
@@ -25009,6 +25667,8 @@ async fn sync_mutable_transfer_lane(
     )?;
     let mut transferred = 0usize;
     let mut deferred_capacity = 0usize;
+    let mut stream_settlement = None;
+    let mut finite_stream_admission = None;
     match direction {
         EventDirection::ToSessionResponder => {
             let limit = difference.local_only.len().min(capacity);
@@ -25031,65 +25691,72 @@ async fn sync_mutable_transfer_lane(
                     receiver_interest,
                     blob_contact_mode,
                 )?;
-                let (response, verified_digest) =
-                    if class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled() {
-                        request_blob_source_offer_frame(
-                            store,
-                            guard,
-                            connection,
-                            mission,
-                            direction,
-                            receipt,
-                            |mission| {
-                                let prepared = authorize_outbound_blob_claim(
-                                    store,
-                                    guard,
-                                    mission,
-                                    source_snapshot,
-                                    id,
-                                    direction,
-                                    &loaded,
-                                )?;
-                                let claim = prepared.as_ref().map(|prepared| prepared.claim);
-                                Ok((
-                                    Frame::MutableOffer {
-                                        direction,
-                                        id,
-                                        bytes: loaded.bytes,
-                                        claim,
-                                    },
-                                    prepared,
-                                ))
-                            },
-                        )
-                        .await?
-                    } else {
-                        (
-                            request_mission_frame(
-                                connection,
+                let (response, verified_digest) = if class == MutableClass::Blob
+                    && blob_contact_mode.source_custody_v1_enabled()
+                {
+                    request_blob_source_offer_frame(
+                        store,
+                        guard,
+                        connection,
+                        mission,
+                        direction,
+                        receipt,
+                        |mission| {
+                            let prepared = authorize_outbound_blob_claim(
+                                store,
+                                guard,
                                 mission,
+                                source_snapshot,
+                                id,
+                                direction,
+                                &loaded,
+                            )?;
+                            let claim = prepared.as_ref().map(|prepared| prepared.claim);
+                            Ok((
                                 Frame::MutableOffer {
                                     direction,
                                     id,
                                     bytes: loaded.bytes,
-                                    claim: None,
+                                    claim,
                                 },
-                                receipt,
-                            )
-                            .await?,
-                            None,
+                                prepared,
+                            ))
+                        },
+                    )
+                    .await?
+                } else {
+                    (
+                        request_mission_frame(
+                            connection,
+                            mission,
+                            Frame::MutableOffer {
+                                direction,
+                                id,
+                                bytes: loaded.bytes,
+                                claim: None,
+                            },
+                            receipt,
                         )
-                    };
-                let disposition = settle_mutable_apply_result(
-                    store,
-                    peer,
-                    class,
-                    direction,
-                    &mut cursor,
-                    id,
-                    response,
-                    verified_digest,
-                )?;
+                        .await?,
+                        None,
+                    )
+                };
+                let defer_stream_cursor =
+                    class == MutableClass::Blob && blob_contact_mode.stream_v1_enabled();
+                let disposition = if defer_stream_cursor {
+                    require_mutable_apply_result(response, class, direction, id, verified_digest)?
+                } else {
+                    settle_mutable_apply_result(
+                        store,
+                        peer,
+                        class,
+                        direction,
+                        &mut cursor,
+                        id,
+                        response,
+                        verified_digest,
+                    )?
+                };
                 receipt.offered += 1;
                 match disposition {
                     MutableApplyDisposition::Inserted => {}
@@ -25101,6 +25768,19 @@ async fn sync_mutable_transfer_lane(
                         deferred_capacity = deferred_capacity.checked_add(1).ok_or_else(|| {
                             NodeError::Protocol("mutable capacity deferral count overflow".into())
                         })?;
+                    }
+                }
+                if class == MutableClass::Blob
+                    && disposition != MutableApplyDisposition::DeferredCapacity
+                    && stream_settlement.is_none()
+                {
+                    let MutableTransferId::Blob(source) = id else {
+                        unreachable!("Blob lane contains only Blob transfer identifiers")
+                    };
+                    if defer_stream_cursor {
+                        stream_settlement = Some(DeferredBlobCursorSettlement::new(
+                            peer, direction, cursor, source,
+                        ));
                     }
                 }
                 transferred += 1;
@@ -25117,28 +25797,29 @@ async fn sync_mutable_transfer_lane(
                     ));
                 }
                 guard.check(store)?;
-                let (response, opened_custody) =
-                    if class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled() {
-                        request_blob_source_fetch_frame(
+                let (response, opened_custody) = if class == MutableClass::Blob
+                    && blob_contact_mode.source_custody_v1_enabled()
+                {
+                    request_blob_source_fetch_frame(
+                        connection,
+                        mission,
+                        direction,
+                        Frame::MutableFetch { direction, id },
+                        receipt,
+                    )
+                    .await?
+                } else {
+                    (
+                        request_mission_frame(
                             connection,
                             mission,
-                            direction,
                             Frame::MutableFetch { direction, id },
                             receipt,
                         )
-                        .await?
-                    } else {
-                        (
-                            request_mission_frame(
-                                connection,
-                                mission,
-                                Frame::MutableFetch { direction, id },
-                                receipt,
-                            )
-                            .await?,
-                            None,
-                        )
-                    };
+                        .await?,
+                        None,
+                    )
+                };
                 let Frame::MutableObject {
                     direction: response_direction,
                     id: received,
@@ -25196,6 +25877,7 @@ async fn sync_mutable_transfer_lane(
                     &bytes,
                     custody,
                     blob_contact_mode,
+                    &mut finite_stream_admission,
                 )?;
                 #[cfg(test)]
                 if class == MutableClass::Blob {
@@ -25211,17 +25893,29 @@ async fn sync_mutable_transfer_lane(
                 let result = observe_and_fault_test_blob_settlement(store, result, verified_digest);
                 let acknowledgement =
                     request_mission_frame(connection, mission, result, receipt).await?;
-                settle_mutable_fetch_result_ack(
-                    store,
-                    peer,
-                    class,
-                    direction,
-                    &mut cursor,
-                    received,
-                    disposition,
-                    acknowledgement,
-                    verified_digest,
-                )?;
+                let defer_stream_cursor =
+                    class == MutableClass::Blob && blob_contact_mode.stream_v1_enabled();
+                if defer_stream_cursor {
+                    require_mutable_fetch_result_ack(
+                        acknowledgement,
+                        direction,
+                        received,
+                        disposition,
+                        verified_digest,
+                    )?;
+                } else {
+                    settle_mutable_fetch_result_ack(
+                        store,
+                        peer,
+                        class,
+                        direction,
+                        &mut cursor,
+                        received,
+                        disposition,
+                        acknowledgement,
+                        verified_digest,
+                    )?;
+                }
                 match disposition {
                     MutableApplyDisposition::Inserted => receipt.inserted += 1,
                     MutableApplyDisposition::Duplicate => receipt.duplicates += 1,
@@ -25232,6 +25926,19 @@ async fn sync_mutable_transfer_lane(
                         deferred_capacity = deferred_capacity.checked_add(1).ok_or_else(|| {
                             NodeError::Protocol("mutable capacity deferral count overflow".into())
                         })?;
+                    }
+                }
+                if class == MutableClass::Blob
+                    && disposition != MutableApplyDisposition::DeferredCapacity
+                    && stream_settlement.is_none()
+                {
+                    let MutableTransferId::Blob(source) = received else {
+                        unreachable!("Blob lane contains only Blob transfer identifiers")
+                    };
+                    if defer_stream_cursor {
+                        stream_settlement = Some(DeferredBlobCursorSettlement::new(
+                            peer, direction, cursor, source,
+                        ));
                     }
                 }
                 receipt.fetched += 1;
@@ -25272,7 +25979,204 @@ async fn sync_mutable_transfer_lane(
         ));
     }
     add_unscheduled_mutable(receipt, remaining)?;
-    Ok(())
+    Ok(BlobSyncLaneOutcome {
+        settlement: stream_settlement,
+        finite_admission: finite_stream_admission,
+    })
+}
+
+#[derive(Default)]
+struct BlobSyncLaneOutcome {
+    settlement: Option<DeferredBlobCursorSettlement>,
+    finite_admission: Option<DeferredFiniteBlobStreamAdmission>,
+}
+
+#[derive(Default)]
+struct BlobServeLaneOutcome {
+    source: Option<BlobTransferId>,
+    finite_admission: Option<DeferredFiniteBlobStreamAdmission>,
+}
+
+#[derive(Default)]
+struct BlobStreamReceiveCandidates {
+    preferred: Option<BlobTransferId>,
+    common_pending: Vec<BlobTransferId>,
+}
+
+impl BlobStreamReceiveCandidates {
+    fn sources(&self) -> &[BlobTransferId] {
+        self.preferred
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&self.common_pending)
+    }
+}
+
+struct BlobClassExchange {
+    to_responder_candidates: BlobStreamReceiveCandidates,
+    to_initiator_candidates: BlobStreamReceiveCandidates,
+    local_interest: BlobInterest,
+    peer_interest: BlobInterest,
+    to_responder: Option<DeferredBlobCursorSettlement>,
+    to_initiator: Option<DeferredBlobCursorSettlement>,
+    to_responder_admission: Option<DeferredFiniteBlobStreamAdmission>,
+    to_initiator_admission: Option<DeferredFiniteBlobStreamAdmission>,
+}
+
+async fn request_completed_pack_publication(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    direction: EventDirection,
+    source: Option<&blob_stream::CompletedPackStreamSource>,
+    receipt: &mut PeerReceipt,
+) -> Result<Option<BlobPublicationResumeV1>, NodeError> {
+    let Some(source) = source else {
+        let absent = BlobPublicationAbsentV1 { direction };
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::BlobPublicationAbsent(absent),
+            receipt,
+        )
+        .await?;
+        if response != Frame::BlobPublicationAbsent(absent) {
+            return Err(NodeError::Protocol(
+                "absent Blob publication acknowledgement differs".into(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    let signed_open = source.publication.authenticated_open().to_vec();
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobPublicationOpen(BlobPublicationOpenV1 {
+            signed_open: signed_open.clone(),
+        }),
+        receipt,
+    )
+    .await?;
+    if response
+        != Frame::BlobPublicationOpen(BlobPublicationOpenV1 {
+            signed_open: signed_open.clone(),
+        })
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication-open acknowledgement differs".into(),
+        ));
+    }
+    let signed_commitment = source.publication.authenticated_commitment().to_vec();
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobPublicationCommit(BlobPublicationCommitV1 {
+            signed_commitment: signed_commitment.clone(),
+        }),
+        receipt,
+    )
+    .await?;
+    let Frame::BlobPublicationResume(resume) = response else {
+        return Err(NodeError::Protocol(
+            "Blob publication commitment lacks receiver resume authority".into(),
+        ));
+    };
+    if resume.direction != direction
+        || resume.stream_id != *source.open.open().stream_id().as_bytes()
+        || resume.open_digest != source.open.open().digest()
+        || resume.durable_plaintext_offset > source.open.open().total_len()
+        || resume.durable_wire_offset > source.publication.wire_len()
+        || resume.next_segment_index > source.commitment.commitment().segment_count()
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication resume authority differs".into(),
+        ));
+    }
+    Ok(Some(resume))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn respond_completed_pack_publication(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    local_interest: &BlobInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<Option<blob_stream::ReceivedPackStream>, NodeError> {
+    let mut signed_open = None;
+    let mut absent = false;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _, _| match frame {
+            Frame::BlobPublicationAbsent(received) if received.direction == direction => {
+                absent = true;
+                Ok((Frame::BlobPublicationAbsent(received), true))
+            }
+            Frame::BlobPublicationOpen(open) => {
+                signed_open = Some(open.signed_open.clone());
+                Ok((Frame::BlobPublicationOpen(open), false))
+            }
+            _ => Err(NodeError::Protocol(
+                "Blob publication phase received an invalid first record".into(),
+            )),
+        },
+    )
+    .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if absent {
+        if !complete {
+            return Err(NodeError::Protocol(
+                "absent Blob publication did not complete its phase".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if complete {
+        return Err(NodeError::Protocol(
+            "Blob publication open completed before commitment".into(),
+        ));
+    }
+    let signed_open = signed_open
+        .ok_or_else(|| NodeError::Protocol("Blob publication phase lost its signed open".into()))?;
+
+    let mut admitted = None;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) =
+        respond_mission_frame(connection, mission, wire_budget, |frame, _, mission| {
+            let Frame::BlobPublicationCommit(commitment) = frame else {
+                return Err(NodeError::Protocol(
+                    "Blob publication open was not followed by commitment".into(),
+                ));
+            };
+            let received = blob_stream::admit_completed_pack_source(
+                store,
+                mission,
+                verifier,
+                guard,
+                local_interest,
+                &signed_open,
+                &commitment.signed_commitment,
+            )?;
+            let resume = received.resume_authority(direction);
+            admitted = Some(received);
+            Ok((Frame::BlobPublicationResume(resume), true))
+        })
+        .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if !complete {
+        return Err(NodeError::Protocol(
+            "Blob publication commitment did not complete its phase".into(),
+        ));
+    }
+    admitted
+        .map(Some)
+        .ok_or_else(|| NodeError::Protocol("Blob publication admission was not retained".into()))
 }
 
 async fn sync_mutable_class(
@@ -25282,7 +26186,7 @@ async fn sync_mutable_class(
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassContact<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<Option<(BlobInterest, BlobInterest)>, NodeError> {
+) -> Result<Option<BlobClassExchange>, NodeError> {
     let MutableClassContact {
         guard,
         interests,
@@ -25323,7 +26227,16 @@ async fn sync_mutable_class(
         }
         return Ok(match (local_interest, peer_interest) {
             (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
-                Some((local, peer))
+                Some(BlobClassExchange {
+                    to_responder_candidates: BlobStreamReceiveCandidates::default(),
+                    to_initiator_candidates: BlobStreamReceiveCandidates::default(),
+                    local_interest: local,
+                    peer_interest: peer,
+                    to_responder: None,
+                    to_initiator: None,
+                    to_responder_admission: None,
+                    to_initiator_admission: None,
+                })
             }
             _ => None,
         });
@@ -25353,7 +26266,13 @@ async fn sync_mutable_class(
         receipt,
     )
     .await?;
-    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let mut to_responder_common = Vec::new();
+    let to_responder_outcome = if let MutableReconciliationOutcome::Complete {
+        difference,
+        blob_common,
+    } = outcome
+    {
+        to_responder_common = blob_common;
         sync_mutable_transfer_lane(
             store,
             connection,
@@ -25363,8 +26282,10 @@ async fn sync_mutable_class(
             &difference,
             receipt,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        BlobSyncLaneOutcome::default()
+    };
 
     let to_initiator = DirectedMutableLane {
         guard,
@@ -25384,7 +26305,13 @@ async fn sync_mutable_class(
         receipt,
     )
     .await?;
-    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let mut to_initiator_common = Vec::new();
+    let to_initiator_outcome = if let MutableReconciliationOutcome::Complete {
+        difference,
+        blob_common,
+    } = outcome
+    {
+        to_initiator_common = blob_common;
         sync_mutable_transfer_lane(
             store,
             connection,
@@ -25394,11 +26321,28 @@ async fn sync_mutable_class(
             &difference,
             receipt,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        BlobSyncLaneOutcome::default()
+    };
     Ok(match (local_interest, peer_interest) {
         (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
-            Some((local, peer))
+            Some(BlobClassExchange {
+                to_responder_candidates: BlobStreamReceiveCandidates {
+                    preferred: to_responder_outcome.settlement.map(|value| value.source),
+                    common_pending: to_responder_common,
+                },
+                to_initiator_candidates: BlobStreamReceiveCandidates {
+                    preferred: to_initiator_outcome.settlement.map(|value| value.source),
+                    common_pending: to_initiator_common,
+                },
+                local_interest: local,
+                peer_interest: peer,
+                to_responder: to_responder_outcome.settlement,
+                to_initiator: to_initiator_outcome.settlement,
+                to_responder_admission: to_responder_outcome.finite_admission,
+                to_initiator_admission: to_initiator_outcome.finite_admission,
+            })
         }
         _ => None,
     })
@@ -25442,7 +26386,161 @@ async fn sync_mutable_classes(
             blob_interests = exchanged;
         }
     }
-    if let Some((local, peer)) = blob_interests {
+    if let Some(mut exchange) = blob_interests {
+        if blob_contact_mode == BlobContactMode::StreamV1 {
+            let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
+                NodeError::Protocol("Blob stream profile digest is missing".into())
+            })?;
+            // Retained manifests and pending custody checkpoints keep their
+            // receiver-authored recovery path. A direction with no retained
+            // work may use the completed-pack fast path instead.
+            let query = BlobStreamPlanV1 {
+                direction: EventDirection::ToSessionResponder,
+                selection: None,
+            };
+            let response =
+                request_mission_frame(connection, mission, Frame::BlobStreamPlan(query), receipt)
+                    .await?;
+            let Frame::BlobStreamPlanReply(to_responder) = response else {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan query received another response".into(),
+                ));
+            };
+            if to_responder.direction != EventDirection::ToSessionResponder {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan reply crossed directions".into(),
+                ));
+            }
+            if let Some(selection) = to_responder.selection {
+                let mut settlement = Some(blob_stream_cursor_settlement(
+                    store,
+                    mission.peer().mission_id(),
+                    EventDirection::ToSessionResponder,
+                    selection.source_id,
+                    exchange.to_responder.take(),
+                )?);
+                let outcome = Box::pin(blob_stream::send(
+                    store,
+                    connection,
+                    mission,
+                    verifier,
+                    guard,
+                    EventDirection::ToSessionResponder,
+                    selection,
+                    &exchange.peer_interest,
+                    profile_digest,
+                ))
+                .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
+                settle_completed_blob_stream_cursor(store, &mut settlement, outcome)?;
+            } else {
+                if let Some(settlement) = exchange.to_responder.take() {
+                    settlement.settle(store)?;
+                }
+                let to_responder = blob_stream::select_completed_pack_source(
+                    store,
+                    mission,
+                    verifier,
+                    guard,
+                    &exchange.peer_interest,
+                )?;
+                if let Some(resume) = request_completed_pack_publication(
+                    connection,
+                    mission,
+                    EventDirection::ToSessionResponder,
+                    to_responder.as_ref(),
+                    receipt,
+                )
+                .await?
+                {
+                    let outcome = Box::pin(blob_stream::send_completed_pack(
+                        store,
+                        connection,
+                        mission,
+                        guard,
+                        EventDirection::ToSessionResponder,
+                        to_responder.expect("advertised completed pack source"),
+                        resume,
+                        profile_digest,
+                    ))
+                    .await?;
+                    receipt.account_blob_stream_attempt(outcome)?;
+                }
+            }
+            let to_initiator = blob_stream::select_receive_plan(
+                store,
+                verifier,
+                guard,
+                EventDirection::ToSessionInitiator,
+                &exchange.local_interest,
+                &exchange.to_initiator_candidates,
+                exchange.to_initiator_admission.as_ref(),
+            )?;
+            let response = request_mission_frame(
+                connection,
+                mission,
+                Frame::BlobStreamPlan(to_initiator),
+                receipt,
+            )
+            .await?;
+            if response != Frame::BlobStreamPlanReply(to_initiator) {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan acknowledgement differs".into(),
+                ));
+            }
+            if let Some(selection) = to_initiator.selection {
+                let mut settlement = Some(blob_stream_cursor_settlement(
+                    store,
+                    mission.peer().mission_id(),
+                    EventDirection::ToSessionInitiator,
+                    selection.source_id,
+                    exchange.to_initiator.take(),
+                )?);
+                let outcome = Box::pin(blob_stream::receive(
+                    store,
+                    connection,
+                    mission,
+                    verifier,
+                    guard,
+                    EventDirection::ToSessionInitiator,
+                    selection,
+                    profile_digest,
+                    exchange.to_initiator_admission.take(),
+                ))
+                .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
+                settle_completed_blob_stream_cursor(store, &mut settlement, outcome)?;
+            } else {
+                if let Some(settlement) = exchange.to_initiator.take() {
+                    settlement.settle(store)?;
+                }
+                let to_initiator = respond_completed_pack_publication(
+                    store,
+                    connection,
+                    mission,
+                    verifier,
+                    guard,
+                    EventDirection::ToSessionInitiator,
+                    &exchange.local_interest,
+                    receipt,
+                )
+                .await?;
+                if let Some(received) = to_initiator {
+                    let outcome = Box::pin(blob_stream::receive_completed_pack(
+                        store,
+                        connection,
+                        mission,
+                        guard,
+                        EventDirection::ToSessionInitiator,
+                        received,
+                        profile_digest,
+                    ))
+                    .await?;
+                    receipt.account_blob_stream_attempt(outcome)?;
+                }
+            }
+            return Ok(());
+        }
         // Carrier recovery is symmetric and direction-ordered: the initiator
         // first serves the responder's newly staged source, then fetches its
         // own pending source from the responder. Each half streams a bounded
@@ -25455,7 +26553,7 @@ async fn sync_mutable_classes(
             guard,
             blob_contact_mode,
             EventDirection::ToSessionResponder,
-            &peer,
+            &exchange.peer_interest,
             receipt,
         )
         .await?;
@@ -25467,7 +26565,7 @@ async fn sync_mutable_classes(
             guard,
             blob_contact_mode,
             EventDirection::ToSessionInitiator,
-            &local,
+            &exchange.local_interest,
             receipt,
         )
         .await?;
@@ -26701,9 +27799,14 @@ async fn serve_connection_with_forwarding(
         captured: emission_snapshot,
         custody_clock,
     };
+    let deadline = if mutable_interests.blob_selectors().is_empty() {
+        CONTACT_DEADLINE
+    } else {
+        BLOB_CONTACT_DEADLINE
+    };
     let close = connection.clone();
     match timeout(
-        CONTACT_DEADLINE,
+        deadline,
         CONTACT_EVENT_ROUTE_CACHE.scope(
             event_route_cache,
             CONTACT_EMISSION_GUARD.scope(
@@ -28042,7 +29145,10 @@ async fn serve_mutable_reconciliation_lane(
         .checked_add(responder.rounds())
         .and_then(|rounds| rounds.checked_add(reverse.rounds()))
         .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
-    Ok(MutableReconciliationOutcome::Complete(difference))
+    Ok(MutableReconciliationOutcome::Complete {
+        blob_common: common_pending_blob_sources(source_snapshot, &inventory, &difference),
+        difference,
+    })
 }
 
 async fn serve_mutable_transfer_lane(
@@ -28053,7 +29159,7 @@ async fn serve_mutable_transfer_lane(
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
     receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
+) -> Result<BlobServeLaneOutcome, NodeError> {
     let DirectedMutableLane {
         guard,
         source_snapshot,
@@ -28071,11 +29177,13 @@ async fn serve_mutable_transfer_lane(
     let mut fetch_settlement = MutableFetchSettlement::default();
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
+    let mut stream_source = None;
+    let mut finite_stream_admission = None;
     loop {
         guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
         let protect_blob_sources =
-            class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled();
+            class == MutableClass::Blob && blob_contact_mode.source_custody_v1_enabled();
         let source_request = protect_blob_sources
             && direction == EventDirection::ToSessionResponder
             && !authorization.is_consumed();
@@ -28150,6 +29258,7 @@ async fn serve_mutable_transfer_lane(
                         &bytes,
                         custody,
                         blob_contact_mode,
+                        &mut finite_stream_admission,
                     )?;
                     match disposition {
                         MutableApplyDisposition::Inserted => receipt.inserted += 1,
@@ -28179,6 +29288,15 @@ async fn serve_mutable_transfer_lane(
                     #[cfg(test)]
                     let response =
                         observe_and_fault_test_blob_settlement(store, response, verified_digest);
+                    if class == MutableClass::Blob
+                        && disposition != MutableApplyDisposition::DeferredCapacity
+                        && stream_source.is_none()
+                    {
+                        let MutableTransferId::Blob(source) = id else {
+                            unreachable!("Blob lane contains only Blob transfer identifiers")
+                        };
+                        stream_source = Some(source);
+                    }
                     Ok((response, false, None))
                 }
                 Frame::MutableFetch {
@@ -28234,8 +29352,17 @@ async fn serve_mutable_transfer_lane(
                     let authority_digest = fetch_settlement
                         .pending
                         .and_then(|(_, verified_digest)| verified_digest);
-                    let acknowledgement =
+                    let (acknowledgement, settled_id, disposition) =
                         fetch_settlement.acknowledge(frame, class, direction, receipt)?;
+                    if class == MutableClass::Blob
+                        && disposition != MutableApplyDisposition::DeferredCapacity
+                        && stream_source.is_none()
+                    {
+                        let MutableTransferId::Blob(source) = settled_id else {
+                            unreachable!("Blob lane contains only Blob transfer identifiers")
+                        };
+                        stream_source = Some(source);
+                    }
                     #[cfg(test)]
                     let acknowledgement = observe_and_fault_test_blob_settlement(
                         store,
@@ -28289,7 +29416,10 @@ async fn serve_mutable_transfer_lane(
         .await?;
         account(receipt, request_bytes, response_bytes)?;
         if complete {
-            return Ok(());
+            return Ok(BlobServeLaneOutcome {
+                source: stream_source,
+                finite_admission: finite_stream_admission,
+            });
         }
     }
 }
@@ -28301,7 +29431,7 @@ async fn serve_mutable_class(
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassContact<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<Option<(BlobInterest, BlobInterest)>, NodeError> {
+) -> Result<Option<BlobClassExchange>, NodeError> {
     let MutableClassContact {
         guard,
         interests,
@@ -28353,7 +29483,13 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let mut to_responder_common = Vec::new();
+    let to_responder_outcome = if let MutableReconciliationOutcome::Complete {
+        difference,
+        blob_common,
+    } = outcome
+    {
+        to_responder_common = blob_common;
         serve_mutable_transfer_lane(
             store,
             connection,
@@ -28363,8 +29499,10 @@ async fn serve_mutable_class(
             &difference,
             receipt,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        BlobServeLaneOutcome::default()
+    };
 
     let to_initiator = DirectedMutableLane {
         guard,
@@ -28384,7 +29522,13 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let mut to_initiator_common = Vec::new();
+    let to_initiator_outcome = if let MutableReconciliationOutcome::Complete {
+        difference,
+        blob_common,
+    } = outcome
+    {
+        to_initiator_common = blob_common;
         serve_mutable_transfer_lane(
             store,
             connection,
@@ -28394,11 +29538,28 @@ async fn serve_mutable_class(
             &difference,
             receipt,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        BlobServeLaneOutcome::default()
+    };
     Ok(match (local_interest, peer_interest) {
         (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
-            Some((local, peer))
+            Some(BlobClassExchange {
+                to_responder_candidates: BlobStreamReceiveCandidates {
+                    preferred: to_responder_outcome.source,
+                    common_pending: to_responder_common,
+                },
+                to_initiator_candidates: BlobStreamReceiveCandidates {
+                    preferred: to_initiator_outcome.source,
+                    common_pending: to_initiator_common,
+                },
+                local_interest: local,
+                peer_interest: peer,
+                to_responder: None,
+                to_initiator: None,
+                to_responder_admission: to_responder_outcome.finite_admission,
+                to_initiator_admission: to_initiator_outcome.finite_admission,
+            })
         }
         _ => None,
     })
@@ -28442,7 +29603,170 @@ async fn serve_mutable_classes(
             blob_interests = exchanged;
         }
     }
-    if let Some((local, peer)) = blob_interests {
+    if let Some(mut exchange) = blob_interests {
+        if blob_contact_mode == BlobContactMode::StreamV1 {
+            let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
+                NodeError::Protocol("Blob stream profile digest is missing".into())
+            })?;
+            let wire_budget = exchange_wire_budget(receipt)?;
+            let mut to_responder = None;
+            let (complete, request_bytes, response_bytes) =
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, _| {
+                    let Frame::BlobStreamPlan(query) = frame else {
+                        return Err(NodeError::Protocol(
+                            "Blob stream plan phase received another request".into(),
+                        ));
+                    };
+                    if query
+                        != (BlobStreamPlanV1 {
+                            direction: EventDirection::ToSessionResponder,
+                            selection: None,
+                        })
+                    {
+                        return Err(NodeError::Protocol(
+                            "Blob stream responder plan query differs".into(),
+                        ));
+                    }
+                    let plan = blob_stream::select_receive_plan(
+                        store,
+                        verifier,
+                        guard,
+                        EventDirection::ToSessionResponder,
+                        &exchange.local_interest,
+                        &exchange.to_responder_candidates,
+                        exchange.to_responder_admission.as_ref(),
+                    )?;
+                    to_responder = plan.selection;
+                    Ok((Frame::BlobStreamPlanReply(plan), true))
+                })
+                .await?;
+            if !complete {
+                return Err(NodeError::Protocol(
+                    "Blob stream responder plan did not complete".into(),
+                ));
+            }
+            account(receipt, request_bytes, response_bytes)?;
+            if let Some(selection) = to_responder {
+                let outcome = Box::pin(blob_stream::receive(
+                    store,
+                    connection,
+                    mission,
+                    verifier,
+                    guard,
+                    EventDirection::ToSessionResponder,
+                    selection,
+                    profile_digest,
+                    exchange.to_responder_admission.take(),
+                ))
+                .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
+            } else {
+                let to_responder = respond_completed_pack_publication(
+                    store,
+                    connection,
+                    mission,
+                    verifier,
+                    guard,
+                    EventDirection::ToSessionResponder,
+                    &exchange.local_interest,
+                    receipt,
+                )
+                .await?;
+                if let Some(received) = to_responder {
+                    let outcome = Box::pin(blob_stream::receive_completed_pack(
+                        store,
+                        connection,
+                        mission,
+                        guard,
+                        EventDirection::ToSessionResponder,
+                        received,
+                        profile_digest,
+                    ))
+                    .await?;
+                    receipt.account_blob_stream_attempt(outcome)?;
+                }
+            }
+            let wire_budget = exchange_wire_budget(receipt)?;
+            let mut to_initiator = None;
+            let (complete, request_bytes, response_bytes) =
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, mission| {
+                    let Frame::BlobStreamPlan(plan) = frame else {
+                        return Err(NodeError::Protocol(
+                            "Blob stream plan phase received another request".into(),
+                        ));
+                    };
+                    if plan.direction != EventDirection::ToSessionInitiator {
+                        return Err(NodeError::Protocol(
+                            "Blob stream initiator plan crossed directions".into(),
+                        ));
+                    }
+                    if let Some(selection) = plan.selection {
+                        blob_stream::validate_send_plan(
+                            store,
+                            mission,
+                            verifier,
+                            guard,
+                            selection,
+                            &exchange.peer_interest,
+                        )?;
+                    }
+                    to_initiator = plan.selection;
+                    Ok((Frame::BlobStreamPlanReply(plan), true))
+                })
+                .await?;
+            if !complete {
+                return Err(NodeError::Protocol(
+                    "Blob stream initiator plan did not complete".into(),
+                ));
+            }
+            account(receipt, request_bytes, response_bytes)?;
+            if let Some(selection) = to_initiator {
+                let outcome = Box::pin(blob_stream::send(
+                    store,
+                    connection,
+                    mission,
+                    verifier,
+                    guard,
+                    EventDirection::ToSessionInitiator,
+                    selection,
+                    &exchange.peer_interest,
+                    profile_digest,
+                ))
+                .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
+            } else {
+                let to_initiator = blob_stream::select_completed_pack_source(
+                    store,
+                    mission,
+                    verifier,
+                    guard,
+                    &exchange.peer_interest,
+                )?;
+                if let Some(resume) = request_completed_pack_publication(
+                    connection,
+                    mission,
+                    EventDirection::ToSessionInitiator,
+                    to_initiator.as_ref(),
+                    receipt,
+                )
+                .await?
+                {
+                    let outcome = Box::pin(blob_stream::send_completed_pack(
+                        store,
+                        connection,
+                        mission,
+                        guard,
+                        EventDirection::ToSessionInitiator,
+                        to_initiator.expect("advertised completed pack source"),
+                        resume,
+                        profile_digest,
+                    ))
+                    .await?;
+                    receipt.account_blob_stream_attempt(outcome)?;
+                }
+            }
+            return Ok(());
+        }
         // Mirror the initiator's fixed order without role-dependent carrier
         // authority: fetch the responder-bound range, then serve the
         // initiator-bound range.
@@ -28454,7 +29778,7 @@ async fn serve_mutable_classes(
             guard,
             blob_contact_mode,
             EventDirection::ToSessionResponder,
-            &local,
+            &exchange.local_interest,
             receipt,
         )
         .await?;
@@ -28466,7 +29790,7 @@ async fn serve_mutable_classes(
             guard,
             blob_contact_mode,
             EventDirection::ToSessionInitiator,
-            &peer,
+            &exchange.peer_interest,
             receipt,
         )
         .await?;
@@ -31378,6 +32702,7 @@ mod tests {
             application_admission.clone(),
             services.member.identity(),
             services.member.mission_authority_id(),
+            MAX_NETWORK_BLOB_BYTES,
         );
         let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
@@ -31681,6 +33006,7 @@ mod tests {
             application_admission.clone(),
             identity,
             mission_authority,
+            MAX_NETWORK_BLOB_BYTES,
         );
         let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
@@ -31759,16 +33085,23 @@ mod tests {
             .await
             .expect("maintenance actor loop-gate deadline")
             .expect("maintenance actor loop gate");
-        let mut blob_operation = tokio::spawn(async move {
-            selected
-                .subscribe(BlobSubscriptionRequest {
-                    operation_key: b"maintenance-priority-blob".to_vec(),
-                    topic: Topic::new("opaque").expect("priority Blob topic"),
-                    scope: Scope::new("test/runtime").expect("priority Blob scope"),
-                    include_descendant_scopes: false,
-                })
-                .await
-        });
+        let mut blob_operation = std::pin::pin!(selected.subscribe(BlobSubscriptionRequest {
+            operation_key: b"maintenance-priority-blob".to_vec(),
+            topic: Topic::new("opaque").expect("priority Blob topic"),
+            scope: Scope::new("test/runtime").expect("priority Blob scope"),
+            include_descendant_scopes: false,
+        }));
+        // Queue the request before releasing the actor. Spawning the future
+        // alone lets the first maintenance tick race ahead of its initial poll.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(blob_operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            application_sender.capacity(),
+            APPLICATION_COMMAND_CAPACITY - 1
+        );
         before_loop_release
             .send(())
             .expect("release maintenance actor loop");
@@ -31799,8 +33132,7 @@ mod tests {
         worker_release.notify_one();
         let mutation_result = timeout(Duration::from_secs(10), &mut blob_operation)
             .await
-            .expect("Blob operation response deadline")
-            .expect("Blob operation task");
+            .expect("Blob operation response deadline");
         timeout(Duration::from_secs(10), first_reached_receiver.recv())
             .await
             .expect("periodic maintenance reaches blocking gate deadline")
@@ -31952,6 +33284,93 @@ mod tests {
     }
 
     #[test]
+    fn contact_collision_exemption_requires_typed_rejection_and_nonpreferred_identity() {
+        let first = expected_peer(911, 29_911).carrier.id;
+        let second = expected_peer(912, 29_912).carrier.id;
+        let (lower, higher) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        for error in [
+            NodeError::Carrier(CarrierError::ContactCollision),
+            NodeError::Mission(MissionSessionError::Carrier(CarrierError::ContactCollision)),
+        ] {
+            assert!(is_expected_contact_collision(higher, lower, &error));
+            assert!(!is_expected_contact_collision(lower, higher, &error));
+            assert!(!is_expected_contact_collision(lower, lower, &error));
+        }
+        for error in [
+            NodeError::Carrier(CarrierError::Transport(
+                "closed by peer: complete (code 0)".into(),
+            )),
+            NodeError::Carrier(CarrierError::Transport(
+                "closed by peer: preferred-contact-collision (code 3)".into(),
+            )),
+            NodeError::Carrier(CarrierError::Transport("connection reset".into())),
+            NodeError::Carrier(CarrierError::Timeout("contact")),
+            NodeError::Protocol("carrier contact collision".into()),
+            NodeError::FatalBlobCoherence("carrier contact collision".into()),
+        ] {
+            assert!(!is_expected_contact_collision(higher, lower, &error));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_contact_collision_handles_both_terminal_abort_orders() {
+        let first = expected_peer(913, 29_913).carrier.id;
+        let second = expected_peer(914, 29_914).carrier.id;
+        let (lower, higher) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        // 0: remote rejection before the actor sees the competing inbound;
+        // 1: result already ready when the actor marks and aborts the task;
+        // 2: the local collision cancellation wins before a result exists.
+        for order in 0..3 {
+            let mut contacts = JoinSet::new();
+            let (release, released) = oneshot::channel();
+            let abort = contacts.spawn(async {
+                released.await.unwrap();
+                Err::<(), _>(NodeError::Carrier(CarrierError::ContactCollision))
+            });
+            let mut collision_cancelled = BTreeSet::new();
+            if order != 2 {
+                release.send(()).unwrap();
+                timeout(Duration::from_secs(1), async {
+                    while !abort.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("contact must finish before collision abort");
+            }
+            if order != 0 {
+                collision_cancelled.insert(abort.id());
+                abort.abort();
+            }
+            match contacts.join_next_with_id().await.unwrap() {
+                Ok((task, result)) => {
+                    assert_ne!(order, 2);
+                    assert_eq!(collision_cancelled.remove(&task), order == 1);
+                    assert!(is_expected_contact_collision(
+                        higher,
+                        lower,
+                        &result.unwrap_err()
+                    ));
+                }
+                Err(error) => {
+                    assert_eq!(order, 2);
+                    assert!(error.is_cancelled());
+                    assert!(collision_cancelled.remove(&error.id()));
+                }
+            }
+            assert!(collision_cancelled.is_empty());
+        }
+    }
+
+    #[test]
     fn contact_election_prefers_lower_identity_then_bounds_higher_fallback() {
         let first = expected_peer(901, 29_901).carrier.id;
         let second = expected_peer(902, 29_902).carrier.id;
@@ -32098,6 +33517,12 @@ mod tests {
             receiptful_event_offers: 6,
             mutable_remaining: 5,
             deferred_mutable_lanes: 1,
+            blob_stream_attempts: 1,
+            blob_stream_received_bytes: 10,
+            blob_stream_receive_limit_bytes: 20,
+            blob_stream_checkpoint_bytes: 10,
+            blob_stream_checkpoint_latency_ms: 3,
+            blob_stream_writer_commits: 2,
             ..PeerReceipt::default()
         };
         let second = PeerReceipt {
@@ -32114,11 +33539,19 @@ mod tests {
             receiptful_event_offers: 23,
             mutable_remaining: 17,
             deferred_mutable_lanes: 2,
+            blob_stream_attempts: 2,
+            blob_stream_received_bytes: 30,
+            blob_stream_receive_limit_bytes: 40,
+            blob_stream_checkpoint_bytes: 30,
+            blob_stream_checkpoint_latency_ms: 5,
+            blob_stream_writer_commits: 4,
             ..PeerReceipt::default()
         };
 
         account_data_receipt(&mut total, &first).expect("first successful contact");
+        account_blob_receipt(&mut total, &first).expect("first Blob contact metrics");
         account_data_receipt(&mut total, &second).expect("second successful contact");
+        account_blob_receipt(&mut total, &second).expect("second Blob contact metrics");
 
         assert_eq!(total.data_offered, 9);
         assert_eq!(total.data_fetched, 14);
@@ -32133,6 +33566,12 @@ mod tests {
         assert_eq!(total.receiptful_event_offers, 29);
         assert_eq!(total.mutable_remaining, 22);
         assert_eq!(total.deferred_mutable_lanes, 3);
+        assert_eq!(total.blob_stream_attempts, 3);
+        assert_eq!(total.blob_stream_received_bytes, 40);
+        assert_eq!(total.blob_stream_receive_limit_bytes, 40);
+        assert_eq!(total.blob_stream_checkpoint_bytes, 30);
+        assert_eq!(total.blob_stream_checkpoint_latency_ms, 5);
+        assert_eq!(total.blob_stream_writer_commits, 6);
     }
 
     #[test]
@@ -32157,6 +33596,115 @@ mod tests {
                 if message == "aggregate data fetched count overflow"
         ));
         assert_eq!(total, before);
+    }
+
+    #[test]
+    fn blob_stream_contact_metrics_fail_atomically_on_overflow() {
+        let mut receipt = PeerReceipt {
+            blob_stream_received_bytes: u64::MAX,
+            ..PeerReceipt::default()
+        };
+        let before = receipt.clone();
+        let attempt = blob_stream::BlobStreamAttemptOutcome {
+            code: crate::stream_transfer::StreamResultCode::Promoted,
+            metrics: blob_stream::BlobStreamAttemptMetrics {
+                transport: BlobStreamTransport::IrohQuicV1,
+                received_bytes: 1,
+                retransmitted_bytes: 0,
+                receive_limit_bytes: 8,
+                checkpoint_bytes: 4,
+                checkpoint_latency_ms: 1,
+                writer_commits: 1,
+                failover_recoveries: 0,
+            },
+        };
+
+        assert!(receipt.account_blob_stream_attempt(attempt).is_err());
+        assert_eq!(receipt, before);
+    }
+
+    #[test]
+    fn blob_stream_cursor_settlement_is_deferred_until_terminal_ack() {
+        let state = root("blob-stream-deferred-cursor");
+        fs::create_dir_all(&state).unwrap();
+        let services = control_test_services([0x91; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .unwrap();
+        let peer = services.other.identity();
+        let source = BlobTransferId::new([0x37; 32]);
+        let mut settlement = Some(DeferredBlobCursorSettlement::new(
+            peer,
+            EventDirection::ToSessionResponder,
+            None,
+            source,
+        ));
+        let metrics = blob_stream::BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes: 0,
+            retransmitted_bytes: 0,
+            receive_limit_bytes: 0,
+            checkpoint_bytes: 0,
+            checkpoint_latency_ms: 0,
+            writer_commits: 0,
+            failover_recoveries: 0,
+        };
+
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .unwrap(),
+            None
+        );
+        settle_completed_blob_stream_cursor(
+            &store,
+            &mut settlement,
+            blob_stream::BlobStreamAttemptOutcome {
+                code: crate::stream_transfer::StreamResultCode::DeferredCapacity,
+                metrics,
+            },
+        )
+        .unwrap();
+        assert!(settlement.is_some());
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .unwrap(),
+            None
+        );
+        settle_completed_blob_stream_cursor(
+            &store,
+            &mut settlement,
+            blob_stream::BlobStreamAttemptOutcome {
+                code: crate::stream_transfer::StreamResultCode::Promoted,
+                metrics,
+            },
+        )
+        .unwrap();
+        assert!(settlement.is_none());
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .unwrap(),
+            Some(*source.as_bytes())
+        );
+
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
@@ -32996,12 +34544,16 @@ mod tests {
         assert!(!settlement.is_pending());
         assert_eq!(
             acknowledgement,
-            Frame::MutableFetchResultAck {
-                direction,
+            (
+                Frame::MutableFetchResultAck {
+                    direction,
+                    id,
+                    disposition: MutableApplyDisposition::Duplicate,
+                    custody_digest: None,
+                },
                 id,
-                disposition: MutableApplyDisposition::Duplicate,
-                custody_digest: None,
-            }
+                MutableApplyDisposition::Duplicate,
+            )
         );
         assert!(
             settlement
@@ -33036,12 +34588,16 @@ mod tests {
         assert_eq!(settlement.deferred_capacity(), 1);
         assert_eq!(
             deferred_ack,
-            Frame::MutableFetchResultAck {
-                direction,
-                id: other_id,
-                disposition: MutableApplyDisposition::DeferredCapacity,
-                custody_digest: None,
-            }
+            (
+                Frame::MutableFetchResultAck {
+                    direction,
+                    id: other_id,
+                    disposition: MutableApplyDisposition::DeferredCapacity,
+                    custody_digest: None,
+                },
+                other_id,
+                MutableApplyDisposition::DeferredCapacity,
+            )
         );
         require_mutable_fetch_result_ack(
             Frame::MutableFetchResultAck {
@@ -34689,6 +36245,8 @@ mod tests {
                         MutableTransferId::State(historical_state),
                         &historical_state_source.sealed,
                         None,
+                        None,
+                        None,
                     )
                     .expect("accept post-startup historical State")
                     .0,
@@ -34710,6 +36268,8 @@ mod tests {
                         MutableTransferId::State(historical_state),
                         &historical_state_source.sealed,
                         None,
+                        None,
+                        None,
                     )
                     .expect("accept duplicate historical State")
                     .0,
@@ -34728,6 +36288,8 @@ mod tests {
                         },
                         MutableTransferId::Record(historical_record),
                         &historical_record_source.sealed,
+                        None,
+                        None,
                         None,
                     )
                     .expect("accept post-startup historical Record")
@@ -36322,7 +37884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v7_profile_offer_is_first_protected_exchange_after_four_flight_handshake() {
+    async fn v9_profile_offer_is_first_protected_exchange_after_four_flight_handshake() {
         let mut issued = issue_missions(2);
         let client_mission = issued.remove(0);
         let server_mission = issued.remove(0);
@@ -36362,23 +37924,8 @@ mod tests {
                 let profiles = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
                     .await
                     .expect("serve profiles")
-                    .expect("semantic v7 profiles");
-                let response_plan = EventTurnPlanV1::Empty {
-                    direction: EventDirection::ToSessionInitiator,
-                    transfer_profile_digest: profiles.digest,
-                    selected_profile: TransferProfileId::EventPagesV1,
-                    set_commitment: empty_set_commitment(),
-                };
-                let request_plan = serve_event_turn_plans(
-                    &connection,
-                    &mut mission,
-                    &profiles,
-                    response_plan.clone(),
-                    &mut receipt,
-                )
-                .await
-                .expect("serve plans");
-                (profiles, receipt, request_plan, response_plan)
+                    .expect("semantic v9 profiles");
+                (profiles, receipt)
             }
         });
 
@@ -36405,31 +37952,17 @@ mod tests {
         let client_profiles = sync_transfer_profiles(&connection, &mut mission, &mut receipt)
             .await
             .expect("sync profiles")
-            .expect("semantic v7 profiles");
-        let request_plan = EventTurnPlanV1::Empty {
-            direction: EventDirection::ToSessionResponder,
-            transfer_profile_digest: client_profiles.digest,
-            selected_profile: TransferProfileId::EventPagesV1,
-            set_commitment: empty_set_commitment(),
-        };
-        let response_plan = sync_event_turn_plans(
-            &connection,
-            &mut mission,
-            &client_profiles,
-            request_plan.clone(),
-            &mut receipt,
-        )
-        .await
-        .expect("sync plans");
-        let (server_profiles, server_receipt, server_request_plan, server_response_plan) =
-            server_task.await.expect("server task");
+            .expect("semantic v9 profiles");
+        let (server_profiles, server_receipt) = server_task.await.expect("server task");
 
         assert_eq!(client_profiles, server_profiles);
-        assert_eq!(server_request_plan, request_plan);
-        assert_eq!(response_plan, server_response_plan);
-        assert_eq!(receipt.protected_frames, 4);
-        assert_eq!(server_receipt.protected_frames, 4);
-        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(
+            client_profiles.negotiated.profile(LaneId::Blob),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(receipt.protected_frames, 2);
+        assert_eq!(server_receipt.protected_frames, 2);
+        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V9);
         client.close().await;
         server.close().await;
     }
@@ -38238,37 +39771,97 @@ mod tests {
                 0,
             )
             .unwrap();
-            let blob_contact_mode = if mission.semantic_version() == SEMANTIC_PROTOCOL_V8 {
-                BlobContactMode::CustodyV1
+            if mission.semantic_version() == SEMANTIC_PROTOCOL_V9 {
+                let to_responder = BlobStreamPlanV1 {
+                    direction: EventDirection::ToSessionResponder,
+                    selection: None,
+                };
+                assert_eq!(
+                    request_mission_frame(
+                        connection,
+                        mission,
+                        Frame::BlobStreamPlan(to_responder),
+                        receipt,
+                    )
+                    .await
+                    .expect("empty retained Blob responder plan"),
+                    Frame::BlobStreamPlanReply(to_responder)
+                );
+                assert!(
+                    request_completed_pack_publication(
+                        connection,
+                        mission,
+                        EventDirection::ToSessionResponder,
+                        None,
+                        receipt,
+                    )
+                    .await
+                    .expect("empty Blob stream publication send")
+                    .is_none()
+                );
+                let to_initiator = BlobStreamPlanV1 {
+                    direction: EventDirection::ToSessionInitiator,
+                    selection: None,
+                };
+                assert_eq!(
+                    request_mission_frame(
+                        connection,
+                        mission,
+                        Frame::BlobStreamPlan(to_initiator),
+                        receipt,
+                    )
+                    .await
+                    .expect("empty retained Blob initiator plan"),
+                    Frame::BlobStreamPlanReply(to_initiator)
+                );
+                assert!(
+                    respond_completed_pack_publication(
+                        &store,
+                        connection,
+                        mission,
+                        &verifier,
+                        &guard,
+                        EventDirection::ToSessionInitiator,
+                        &BlobInterest::empty(),
+                        receipt,
+                    )
+                    .await
+                    .expect("empty Blob stream publication receive")
+                    .is_none()
+                );
             } else {
-                BlobContactMode::DurableOnly
-            };
-            blob_ranges_stream::send(
-                &store,
-                connection,
-                mission,
-                &mut verifier,
-                &guard,
-                blob_contact_mode,
-                EventDirection::ToSessionResponder,
-                &BlobInterest::empty(),
-                receipt,
-            )
-            .await
-            .unwrap();
-            blob_ranges_stream::receive(
-                &store,
-                connection,
-                mission,
-                &mut verifier,
-                &guard,
-                blob_contact_mode,
-                EventDirection::ToSessionInitiator,
-                &BlobInterest::empty(),
-                receipt,
-            )
-            .await
-            .unwrap();
+                let blob_contact_mode = if mission.semantic_version() == SEMANTIC_PROTOCOL_V8 {
+                    BlobContactMode::CustodyV1
+                } else {
+                    BlobContactMode::DurableOnly
+                };
+                blob_ranges_stream::send(
+                    &store,
+                    connection,
+                    mission,
+                    &mut verifier,
+                    &guard,
+                    blob_contact_mode,
+                    EventDirection::ToSessionResponder,
+                    &BlobInterest::empty(),
+                    receipt,
+                )
+                .await
+                .unwrap();
+                blob_ranges_stream::receive(
+                    &store,
+                    connection,
+                    mission,
+                    &mut verifier,
+                    &guard,
+                    blob_contact_mode,
+                    EventDirection::ToSessionInitiator,
+                    &BlobInterest::empty(),
+                    receipt,
+                )
+                .await
+                .unwrap();
+            }
             drop(guard);
             drop(store);
             fs::remove_dir_all(state).unwrap();
@@ -39202,6 +40795,7 @@ mod tests {
             application_admission.clone(),
             identity,
             mission_authority,
+            MAX_NETWORK_BLOB_BYTES,
         );
         let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let controls = SelectedControlHandle::new(control_sender, identity, mission_authority);
@@ -40205,6 +41799,53 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[tokio::test]
+    async fn full_blob_worker_lane_preserves_publish_stream_cleanup() {
+        let (sender, mut received) = mpsc::channel(1);
+        let worker = BlobWorkerSender {
+            sender,
+            priority: BlobOperationalPriorityGate::default(),
+        };
+        dispatch_selected_blob_command(
+            &worker,
+            SelectedBlobCommand::CloseReadStream { token: [0x11; 32] },
+        );
+        dispatch_selected_blob_command(
+            &worker,
+            SelectedBlobCommand::ClosePublishStream { token: [0x22; 32] },
+        );
+        assert_eq!(
+            worker.priority.outstanding(),
+            2,
+            "cleanup must retain its worker permit"
+        );
+        drop(received.recv().await.expect("lane filler"));
+        let cleanup = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .expect("cleanup enqueue deadline")
+            .expect("publish cleanup command");
+        assert!(matches!(&cleanup.command,
+            SelectedBlobCommand::ClosePublishStream { token } if *token == [0x22; 32]));
+        drop(cleanup);
+        assert_eq!(worker.priority.outstanding(), 0);
+        worker.priority.notified().await;
+
+        dispatch_selected_blob_command(
+            &worker,
+            SelectedBlobCommand::CloseReadStream { token: [0x33; 32] },
+        );
+        dispatch_selected_blob_command(
+            &worker,
+            SelectedBlobCommand::ClosePublishStream { token: [0x44; 32] },
+        );
+        assert_eq!(worker.priority.outstanding(), 2);
+        drop(received);
+        tokio::time::timeout(Duration::from_secs(1), worker.priority.notified())
+            .await
+            .expect("closed worker releases pending cleanup permit");
+        assert_eq!(worker.priority.outstanding(), 0);
+    }
+
     fn live_blob_request(
         operation_key: &[u8],
         topic: &Topic,
@@ -40602,6 +42243,7 @@ mod tests {
             application_admission.clone(),
             identity,
             mission_authority,
+            MAX_NETWORK_BLOB_BYTES,
         );
         let responses = prefill_mixed_application_commands(&application_sender);
 
@@ -43401,6 +45043,219 @@ mod tests {
         fs::remove_dir_all(test_root).expect("three-node outbound cleanup");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_blob_publications_wake_contacts_before_the_periodic_sync() {
+        blob_publications_wake_contacts_before_the_periodic_sync(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonpreferred_blob_publications_wake_normal_peer_before_periodic_sync() {
+        blob_publications_wake_contacts_before_the_periodic_sync(false).await;
+    }
+
+    async fn blob_publications_wake_contacts_before_the_periodic_sync(source_is_elected: bool) {
+        use crate::application::{BlobPublishOptions, BlobPublishStreamRequest, BlobReadRequest};
+
+        let test_root = root(if source_is_elected {
+            "blob-publication-contact-wake"
+        } else {
+            "nonpreferred-blob-publication-contact-wake"
+        });
+        let first_state = test_root.join("first");
+        let second_state = test_root.join("second");
+        let first_id = NodeIdentity::load_or_create(&first_state).unwrap().id();
+        let second_id = NodeIdentity::load_or_create(&second_state).unwrap().id();
+        let (source_state, source_carrier, receiver_state, receiver_carrier) =
+            if (first_id < second_id) == source_is_elected {
+                (first_state, first_id, second_state, second_id)
+            } else {
+                (second_state, second_id, first_state, first_id)
+            };
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests =
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )]);
+        let mut source_config = NodeConfig {
+            state: source_state,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission: source_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: receiver_carrier,
+                    address: "127.0.0.1:0".parse().unwrap(),
+                },
+                mission: receiver_mission.identity,
+            }],
+            mutable_interests: interests.clone(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let mut receiver_config = NodeConfig {
+            state: receiver_state,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission: receiver_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: source_carrier,
+                    address: "127.0.0.1:0".parse().unwrap(),
+                },
+                mission: source_mission.identity,
+            }],
+            mutable_interests: interests,
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let contact_window_started = Instant::now();
+        let (source, receiver, initial_contacts) = if source_is_elected {
+            // The elected source has the reachable outbound route and its
+            // passive peer cannot trigger an independent periodic contact.
+            let (source, receiver) = start_test_pair(
+                source_config,
+                receiver_config,
+                source_carrier,
+                receiver_carrier,
+            )
+            .await;
+            (source, receiver, 1)
+        } else {
+            // Keep both peers Normal: ReceiveOnly deliberately omits mutable
+            // classes. Reserve the lower peer's address while the higher peer
+            // starts, then give the lower peer the actual reverse route.
+            // The lower peer performs one initial empty contact; its next
+            // periodic tick is 120 seconds away and the higher peer's normal
+            // election fallback needs 180 seconds of inactivity.
+            let receiver_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let receiver_address = receiver_socket.local_addr().unwrap();
+            receiver_config.bind = receiver_address;
+            receiver_config.sync_interval = Duration::from_secs(120);
+            source_config.peers[0].carrier.address = receiver_address;
+            let source = start_node(source_config).await.unwrap();
+            receiver_config.peers[0].carrier.address = running_ipv4(&source);
+            drop(receiver_socket);
+            let receiver = start_node(receiver_config).await.unwrap();
+            assert_eq!(running_ipv4(&receiver), receiver_address);
+            (source, receiver, 1)
+        };
+        let source_events = source.selected_events();
+        let receiver_events = receiver.selected_events();
+        wait_for_authenticated_contacts(&source_events, initial_contacts, "source initial empty")
+            .await;
+        wait_for_authenticated_contacts(
+            &receiver_events,
+            initial_contacts,
+            "receiver initial empty",
+        )
+        .await;
+        let source_blobs = source.selected_blobs();
+        let receiver_blobs = receiver.selected_blobs();
+        let started = Instant::now();
+        let bytes = b"new finite-independent Blob publication wake";
+        let file_path = test_root.join("source.bin");
+        fs::write(&file_path, bytes).unwrap();
+        let retained = source_blobs
+            .publish(
+                live_blob_request(b"wake/retained", &topic, &scope),
+                File::open(&file_path).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(retained.inserted);
+        wait_for_authenticated_contacts(
+            &source_events,
+            initial_contacts + 1,
+            "retained publication source wake",
+        )
+        .await;
+        wait_for_authenticated_contacts(
+            &receiver_events,
+            initial_contacts + 1,
+            "retained publication receiver wake",
+        )
+        .await;
+        assert_eq!(
+            read_live_blob_pages(
+                &receiver_blobs,
+                BlobReadRequest {
+                    id: retained.id,
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                }
+            )
+            .await,
+            bytes
+        );
+
+        let mut stream = source_blobs
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: live_blob_request(b"wake/stream", &topic, &scope),
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .await
+            .unwrap();
+        stream
+            .write(0, zeroize::Zeroizing::new(bytes.to_vec()))
+            .await
+            .unwrap();
+        let packed = stream.finish().await.unwrap();
+        assert!(packed.inserted);
+        wait_for_authenticated_contacts(
+            &source_events,
+            initial_contacts + 2,
+            "stream finish source wake",
+        )
+        .await;
+        wait_for_authenticated_contacts(
+            &receiver_events,
+            initial_contacts + 2,
+            "stream finish receiver wake",
+        )
+        .await;
+        let mut read = receiver_blobs
+            .open_read_stream(BlobReadRequest {
+                id: packed.id,
+                topic,
+                scope,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            read.next(bytes.len())
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_slice(),
+            bytes
+        );
+        assert!(read.next(1).await.unwrap().is_none());
+        drop(read);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "both publications must propagate before the 60-second periodic tick"
+        );
+        assert!(
+            contact_window_started.elapsed() < Duration::from_secs(40),
+            "neither node may reach its next periodic tick during the test"
+        );
+        let (source_receipt, receiver_receipt) =
+            tokio::join!(source.shutdown(), receiver.shutdown());
+        for receipt in [source_receipt.unwrap(), receiver_receipt.unwrap()] {
+            assert_eq!(receipt.contact_errors, 0);
+            assert_eq!(receipt.direct_contacts, receipt.contacts);
+        }
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
     #[tokio::test]
     async fn live_selected_blob_converges_over_direct_iroh_and_restarts_peerless() {
         use crate::application::{ApplicationErrorKind, BlobReadPageRequest, BlobReadRequest};
@@ -43519,8 +45374,8 @@ mod tests {
             topic: topic.clone(),
             scope: scope.clone(),
         };
-        // A committed range resets the stall timer; contacts and duplicate
-        // ranges do not. The absolute cap never moves, even under trickle progress.
+        // A durable checkpoint resets the stall timer; contacts and duplicate
+        // checkpoints do not. The absolute cap never moves, even under trickle progress.
         let receiver_status = receiver_running.selected_events();
         progress
             .wait(CONTACT_DEADLINE, Duration::from_secs(60), || async {
@@ -43595,8 +45450,9 @@ mod tests {
             assert_eq!(receipt.relay_contacts, 0);
             assert_eq!(receipt.unknown_path_contacts, 0);
         }
-        assert!(receiver_receipt.blob_ranges_fetched > 0);
-        assert!(receiver_receipt.blob_bytes_fetched > 0);
+        assert!(receiver_receipt.blob_stream_attempts > 0);
+        assert!(receiver_receipt.blob_stream_received_bytes > 0);
+        assert!(receiver_receipt.blob_stream_checkpoint_bytes > 0);
         assert_eq!(receiver_receipt.blobs, 1);
         assert_eq!(receiver_receipt.blob_finalized_variants, 1);
 
@@ -46413,6 +48269,65 @@ mod tests {
         forwarding_age_ms: u64,
         sample: CustodySample,
     ) -> BlobTransferId {
+        publish_test_finite_blob_with_profile(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            plaintext,
+            ttl_ms,
+            forwarding_age_ms,
+            sample,
+            false,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "finite Blob fixture keeps authenticated lifetime inputs explicit"
+    )]
+    fn publish_test_finite_blob_stream_v9(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+        ttl_ms: u64,
+        forwarding_age_ms: u64,
+        sample: CustodySample,
+    ) -> BlobTransferId {
+        publish_test_finite_blob_with_profile(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            plaintext,
+            ttl_ms,
+            forwarding_age_ms,
+            sample,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "finite Blob fixture keeps authenticated lifetime inputs explicit"
+    )]
+    fn publish_test_finite_blob_with_profile(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+        ttl_ms: u64,
+        forwarding_age_ms: u64,
+        sample: CustodySample,
+        stream_v9: bool,
+    ) -> BlobTransferId {
         let prepared = aster_mesh::prepare_blob(
             &mut std::io::Cursor::new(plaintext),
             aster_mesh::SELECTED_BLOB_CHUNK_SIZE,
@@ -46471,28 +48386,47 @@ mod tests {
         let plan = blob
             .transfer_plan(&manifest_bytes)
             .expect("finite Blob transfer plan");
+        let stage = if stream_v9 {
+            store.test_stage_verified_finite_blob_stream_v9_with_policy(
+                &policy,
+                &blob,
+                &sealed.bytes,
+                &plan,
+                forwarding_age_ms,
+                sample,
+            )
+        } else {
+            store.test_stage_verified_finite_blob_source_with_policy(
+                &policy,
+                &blob,
+                &sealed.bytes,
+                &plan,
+                forwarding_age_ms,
+                sample,
+            )
+        };
         assert_eq!(
-            store
-                .test_stage_verified_finite_blob_source_with_policy(
-                    &policy,
-                    &blob,
-                    &sealed.bytes,
-                    &plan,
-                    forwarding_age_ms,
-                    sample,
-                )
-                .expect("stage finite Blob source"),
+            stage.expect("stage finite Blob source"),
             BlobSourceStageOutcome::Inserted
         );
-        let completion = store
-            .completed_pending_blob_with_policy(
+        let completion = if stream_v9 {
+            store.completed_pending_blob_stream_v9_with_policy(
                 &policy,
                 BlobTransferId::new(blob.envelope_id()),
                 &blob,
                 &manifest_bytes,
                 &plan,
             )
-            .expect("complete finite Blob source");
+        } else {
+            store.completed_pending_blob_with_policy(
+                &policy,
+                BlobTransferId::new(blob.envelope_id()),
+                &blob,
+                &manifest_bytes,
+                &plan,
+            )
+        }
+        .expect("complete finite Blob source");
         let content = {
             let depot = store
                 .blob_depot_for_authenticated_read(&completion)
@@ -46507,9 +48441,18 @@ mod tests {
         let lineage = sealer
             .verify_current_blob_lineage(&blob)
             .expect("finite Blob current lineage");
-        store
-            .apply_verified_blob_with_policy(&policy, &plan, &lineage, &completion, &content)
-            .expect("promote finite Blob source");
+        if stream_v9 {
+            store.apply_verified_blob_stream_v9_with_policy(
+                &policy,
+                &plan,
+                &lineage,
+                &completion,
+                &content,
+            )
+        } else {
+            store.apply_verified_blob_with_policy(&policy, &plan, &lineage, &completion, &content)
+        }
+        .expect("promote finite Blob source");
         BlobTransferId::new(blob.envelope_id())
     }
 
@@ -47926,6 +49869,71 @@ mod tests {
         claim
     }
 
+    fn stage_test_pending_blob_stream_v9(
+        store: &Store,
+        cache: &AuthenticatedEventRouteCache,
+        mission: &UnprotectedReferenceMission,
+        source: BlobTransferId,
+        sealed: &[u8],
+    ) -> AuthenticatedBlobRouteClaim {
+        let mut verifier = open_test_sealer(mission);
+        let route = verifier
+            .verify_blob(sealed)
+            .expect("verify pending v9 test Blob route");
+        assert_eq!(BlobTransferId::new(route.envelope_id()), source);
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier
+            .verify_blob_content(route, sealed)
+            .expect("verify pending v9 test Blob content")
+        else {
+            panic!("pending v9 test Blob lost content access");
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("pending v9 test Blob plan");
+        let policy = store
+            .control_policy_snapshot()
+            .expect("pending v9 test Blob policy");
+        let _lifecycle = cache
+            .lock_blob_lifecycle()
+            .expect("pending v9 test Blob lifecycle lock");
+        let stage = if blob.ttl_ms().is_some() {
+            let sample = CustodySample {
+                clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                tick_ms: 0,
+            };
+            store.test_stage_verified_finite_blob_stream_v9_with_policy(
+                &policy, &blob, sealed, &plan, 100, sample,
+            )
+        } else {
+            store.stage_verified_durable_blob_stream_v9_with_policy(&policy, &blob, sealed, &plan)
+        };
+        assert!(matches!(
+            stage.expect("stage pending v9 test Blob"),
+            BlobSourceStageOutcome::Inserted | BlobSourceStageOutcome::Duplicate
+        ));
+        let projection = store
+            .blob_source_projection(source)
+            .expect("pending v9 test Blob projection lookup")
+            .expect("pending v9 test Blob projection");
+        assert_eq!(projection.retention, BlobSourceRetention::Pending);
+        let claim = AuthenticatedBlobRouteClaim::from_verified(
+            store,
+            &blob,
+            sealed,
+            &projection.source,
+            projection.retention,
+            None,
+        )
+        .expect("pending v9 test Blob claim");
+        cache
+            .insert_blob(&verifier, claim.clone())
+            .expect("cache pending v9 test Blob claim");
+        claim
+    }
+
     #[test]
     fn pending_blob_cleanup_fails_closed_on_exact_cache_contradictions() {
         #[derive(Clone, Copy, Debug)]
@@ -48354,6 +50362,7 @@ mod tests {
             &blob,
             &manifest_bytes,
             &sealed,
+            BlobContactMode::DurableOnly,
         )
         .expect_err("post-stage cache failure must be fatal");
         assert!(matches!(stage_error, NodeError::FatalBlobCoherence(_)));
@@ -48966,6 +50975,1473 @@ mod tests {
         blob_ranges_stream_completion_case(Some(true)).await;
     }
 
+    async fn blob_stream_completed_pack_resume_case(
+        preseed_segments: usize,
+        grouped_interruption: bool,
+    ) {
+        let store_limits = if grouped_interruption {
+            // The grouped case exceeds the ordinary 64 MiB Store payload
+            // ceiling, including when the committed source is reopened.
+            StoreLimits::new(StoreLimits::default().max_items(), 512 * 1024 * 1024)
+                .expect("grouped checkpoint fixture Store limit")
+        } else {
+            StoreLimits::default()
+        };
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root(&format!(
+            "blob-stream-resume-{preseed_segments}-{grouped_interruption}-source"
+        ));
+        let receiver_root = root(&format!(
+            "blob-stream-resume-{preseed_segments}-{grouped_interruption}-receiver"
+        ));
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&source_root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&receiver_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let offline = start_node_with_forwarding(
+            NodeConfig {
+                state: source_root.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: source_mission.credentials.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default().with_store_limits(store_limits),
+        )
+        .await
+        .expect("start provisional stream source");
+        let (checkpoint_group_bytes, checkpoint_callback_bytes) =
+            blob_stream::completed_pack_checkpoint_test_bounds();
+        let total_len = if grouped_interruption {
+            // Leave a full callback after the first grouped commit, plus
+            // room for split encrypted records before the final short tail.
+            usize::try_from(
+                checkpoint_group_bytes
+                    + 2 * checkpoint_callback_bytes
+                    + 2 * aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64
+                    + 37,
+            )
+            .expect("grouped checkpoint fixture length fits usize")
+        } else {
+            2 * aster_mesh::BLOB_STREAM_SEGMENT_BYTES
+        };
+        let mut stream = offline
+            .selected_blobs()
+            .open_publish_stream(crate::application::BlobPublishStreamRequest {
+                publication: live_blob_request(b"runtime/provisional-contact", &topic, &scope),
+                options: crate::application::BlobPublishOptions::durable(),
+                total_len: total_len as u64,
+            })
+            .await
+            .expect("open provisional source stream");
+        let mut source_hash = Sha256::new();
+        for (index, offset) in (0..total_len)
+            .step_by(aster_mesh::BLOB_STREAM_SEGMENT_BYTES)
+            .enumerate()
+        {
+            let length = (total_len - offset).min(aster_mesh::BLOB_STREAM_SEGMENT_BYTES);
+            let bytes = vec![0x71_u8.wrapping_add(index as u8); length];
+            source_hash.update(&bytes);
+            stream
+                .write(offset as u64, zeroize::Zeroizing::new(bytes))
+                .await
+                .expect("write provisional segment");
+        }
+        let source_hash: [u8; 32] = source_hash.finalize().into();
+        let published = stream.finish().await.expect("promote source stream");
+        offline.shutdown().await.expect("stop provisional source");
+
+        let source_store = Arc::new(
+            Store::open_with_limits_for_mission(
+                source_root.join(STORE_FILE),
+                store_limits,
+                authority,
+            )
+            .unwrap(),
+        );
+        let mut receiver_store = Arc::new(
+            Store::open_with_limits_for_mission(
+                receiver_root.join(STORE_FILE),
+                store_limits,
+                authority,
+            )
+            .unwrap(),
+        );
+        let receiver_credentials = receiver_mission.credentials.clone();
+        let source_policy = source_store.control_policy_snapshot().unwrap();
+        let source_publication = source_store
+            .blob_stream_for_content_with_policy(
+                &source_policy,
+                &topic,
+                &scope,
+                aster_mesh::BlobId::from_bytes(*published.id.as_bytes()),
+            )
+            .unwrap()
+            .expect("source stream publication");
+        let verifier = open_test_sealer(&receiver_credentials);
+        let open = verifier
+            .verify_blob_stream_open(source_publication.authenticated_open())
+            .expect("verify source stream open");
+        let commitment = verifier
+            .verify_blob_stream_commitment(&open, source_publication.authenticated_commitment())
+            .expect("verify source stream commitment");
+        let receiver_policy = receiver_store.control_policy_snapshot().unwrap();
+        let operation =
+            aster_redb_store::BlobOperationKey::new(open.open().operation_key().to_vec())
+                .expect("stream operation key");
+        let (reservation, _) = receiver_store
+            .reserve_blob_stream_with_policy(
+                &receiver_policy,
+                aster_redb_store::BlobStreamReservationRequest {
+                    operation: &operation,
+                    source: aster_redb_store::BlobStreamSource::AuthenticatedPeer(
+                        source_mission.identity,
+                    ),
+                },
+                &open,
+            )
+            .expect("reserve receiver resume pack");
+        let mut receiver_pack = receiver_store
+            .open_blob_stream_pack_session(&receiver_policy, &reservation, &open)
+            .expect("open receiver resume pack");
+        let mut source_reader = source_store
+            .open_blob_stream_read_session_with_policy(
+                &source_policy,
+                &source_publication,
+                &open,
+                &commitment,
+            )
+            .expect("open source pack reader");
+        let mut decryptor = verifier
+            .begin_blob_stream_decrypt(&open)
+            .expect("open receiver resume decryptor");
+        for _ in 0..preseed_segments {
+            let encoded = source_reader
+                .next_encrypted_segment()
+                .expect("read source segment")
+                .expect("source segment for durable resume prefix");
+            let segment = aster_mesh::EncryptedBlobStreamSegment::decode(&encoded)
+                .expect("decode source segment");
+            let plaintext = decryptor
+                .decrypt_segment(&segment)
+                .expect("authenticate source segment");
+            receiver_pack
+                .append_encoded_segment(&plaintext, &segment, &encoded)
+                .expect("append receiver resume segment");
+        }
+        let resumed = if preseed_segments == 0 {
+            // A fresh receiver has no committed checkpoint. Checkpointing an
+            // empty pack would fabricate generation 1 with zero progress,
+            // which is not a canonical publication-resume authority.
+            let initial = receiver_pack.progress();
+            assert_eq!(
+                initial,
+                aster_redb_store::BlobStreamDurableProgress::default()
+            );
+            initial
+        } else {
+            receiver_pack
+                .checkpoint(&receiver_store, &receiver_policy)
+                .expect("checkpoint receiver resume segment")
+        };
+        let mut durable_wire_offset = resumed.durable_wire_offset();
+        drop(receiver_pack);
+        if grouped_interruption {
+            let fault_state = Arc::new(TestBlobContactFaultState::new(
+                TestBlobContactFault::GroupedPackDeferredAppend,
+            ));
+            let mut receiver_cache =
+                test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+            Arc::get_mut(&mut receiver_cache)
+                .expect("unique receiver cache")
+                .blob_contact_fault = Some(Arc::clone(&fault_state));
+            let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+            let (source_result, receiver_result) = TEST_SEMANTIC_VERSION
+                .scope(
+                    std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                    blob_contact_test_pair_with_caches_results(
+                        receiver_store.clone(),
+                        receiver_mission.credentials.clone(),
+                        interests(),
+                        receiver_cache,
+                        source_store.clone(),
+                        source_mission.credentials.clone(),
+                        interests(),
+                        source_cache,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                    ),
+                )
+                .await;
+            assert!(source_result.is_err(), "interrupted source cannot settle");
+            assert!(
+                matches!(receiver_result, Err(NodeError::Protocol(ref message))
+                    if message == "Blob stream: injected failure after grouped pack deferred append"),
+                "receiver must fail at the intended deferred-append boundary: {receiver_result:?}"
+            );
+            assert!(fault_state.fired.load(Ordering::Acquire));
+            let (durable, appended, partial_bytes) = fault_state
+                .grouped_pack_checkpoint
+                .lock()
+                .expect("grouped observation lock")
+                .take()
+                .expect("recorded grouped checkpoint and uncommitted tail");
+            assert!(durable.progress().durable_wire_offset() >= checkpoint_group_bytes);
+            assert_eq!(durable.progress().generation(), 1);
+            assert!(appended > durable.progress().durable_wire_offset());
+            assert!(appended < source_publication.wire_len());
+            assert!(partial_bytes > 0, "interrupt with a split encrypted record");
+            assert_eq!(
+                receiver_store.blob_stats().unwrap().publications,
+                0,
+                "deferred appends cannot publish content"
+            );
+            drop(receiver_store);
+            receiver_store = Arc::new(
+                Store::open_with_limits_for_mission(
+                    receiver_root.join(STORE_FILE),
+                    store_limits,
+                    authority,
+                )
+                .expect("reopen receiver after grouped interruption"),
+            );
+            let policy = receiver_store.control_policy_snapshot().unwrap();
+            let (reservation, progress) = receiver_store
+                .reserve_blob_stream_with_policy(
+                    &policy,
+                    aster_redb_store::BlobStreamReservationRequest {
+                        operation: &operation,
+                        source: aster_redb_store::BlobStreamSource::AuthenticatedPeer(
+                            source_mission.identity,
+                        ),
+                    },
+                    &open,
+                )
+                .expect("recover interrupted reservation");
+            assert_eq!(progress, durable.progress());
+            let recovered = receiver_store
+                .open_blob_stream_pack_session(&policy, &reservation, &open)
+                .expect("interruption releases the writer lease across Store reopen");
+            let crypto = recovered.crypto_resume();
+            assert_eq!(crypto.progress(), durable.progress());
+            assert_eq!(
+                crypto.plaintext_checkpoint(),
+                durable.plaintext_checkpoint(),
+                "uncommitted plaintext cannot replace the durable frontier"
+            );
+            assert_eq!(
+                crypto.ciphertext_checkpoint(),
+                durable.ciphertext_checkpoint(),
+                "uncommitted ciphertext cannot replace the durable frontier"
+            );
+            durable_wire_offset = progress.durable_wire_offset();
+            drop(recovered);
+        }
+        let (sent, received, _, _) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair(
+                    receiver_store.clone(),
+                    receiver_mission.credentials.clone(),
+                    interests(),
+                    source_store.clone(),
+                    source_mission.credentials.clone(),
+                    interests(),
+                ),
+            )
+            .await;
+        assert_eq!(received.blob_stream_attempts, 2);
+        assert_eq!(sent.blob_stream_attempts, 2);
+        assert_eq!(
+            received.blob_stream_received_bytes,
+            source_publication.wire_len() - durable_wire_offset,
+            "resumed contact transfers only the missing encrypted suffix"
+        );
+        let policy = receiver_store.control_policy_snapshot().unwrap();
+        let received = receiver_store
+            .blob_stream_for_content_with_policy(
+                &policy,
+                &topic,
+                &scope,
+                aster_mesh::BlobId::from_bytes(*published.id.as_bytes()),
+            )
+            .unwrap()
+            .expect("receiver promotes publisher-signed stream publication");
+        assert!(received.authenticated_open().len() > 32);
+        assert!(received.authenticated_commitment().len() > 32);
+        let mut readback = receiver_store
+            .open_blob_stream_read_session_with_policy(&policy, &received, &open, &commitment)
+            .expect("open received completed pack");
+        let mut decryptor = verifier.begin_blob_stream_decrypt(&open).unwrap();
+        let mut received_hash = Sha256::new();
+        let mut received_len = 0_u64;
+        while let Some(encoded) = readback.next_encrypted_segment().unwrap() {
+            let segment = aster_mesh::EncryptedBlobStreamSegment::decode(&encoded).unwrap();
+            let plaintext = decryptor.decrypt_segment(&segment).unwrap();
+            received_len += plaintext.len() as u64;
+            received_hash.update(&plaintext);
+        }
+        decryptor
+            .finish(&commitment)
+            .expect("verify complete readback");
+        assert_eq!(received_len, total_len as u64);
+        assert_eq!(<[u8; 32]>::from(received_hash.finalize()), source_hash);
+        drop(readback);
+
+        // The first contact also offers the newly received publication back to
+        // its publisher. Both halves of a later contact must settle without
+        // replaying any payload or advancing either publication marker.
+        let (received_again, sent_again, _, _) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                ),
+            )
+            .await;
+        for receipt in [received_again, sent_again] {
+            assert_eq!(receipt.blob_stream_attempts, 2);
+            assert_eq!(receipt.blob_stream_received_bytes, 0);
+            assert_eq!(receipt.blob_stream_writer_commits, 0);
+        }
+        for store in [&source_store, &receiver_store] {
+            let stats = store
+                .blob_stats()
+                .expect("idempotent completed stream stats");
+            assert_eq!(stats.publications, 1);
+            assert_eq!(stats.last_acceptance_marker, 1);
+        }
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_stream_resume_transfers_only_the_missing_suffix() {
+        blob_stream_completed_pack_resume_case(1, false).await;
+    }
+
+    #[tokio::test]
+    async fn blob_stream_resume_settles_after_all_data_is_durable() {
+        blob_stream_completed_pack_resume_case(2, false).await;
+    }
+
+    #[tokio::test]
+    async fn blob_stream_completed_pack_echo_and_repeated_contact_are_idempotent() {
+        blob_stream_completed_pack_resume_case(0, false).await;
+    }
+
+    #[tokio::test]
+    async fn blob_stream_grouped_checkpoint_interruption_reopens_exact_durable_prefix() {
+        timeout(
+            Duration::from_secs(5 * 60),
+            blob_stream_completed_pack_resume_case(0, true),
+        )
+        .await
+        .expect("grouped checkpoint interruption and reopen deadline");
+    }
+
+    #[tokio::test]
+    async fn blob_stream_multiple_publications_converge_across_contacts_and_reopen() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-round-robin-source");
+        let receiver_root = root("blob-stream-round-robin-receiver");
+        for path in [&source_root, &receiver_root] {
+            fs::create_dir_all(path).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let offline = start_node(NodeConfig {
+            state: source_root.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: source_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start stream publisher");
+        for (operation, value) in [
+            (b"round-robin/a".as_slice(), 0x31),
+            (b"round-robin/b".as_slice(), 0x32),
+        ] {
+            let mut stream = offline
+                .selected_blobs()
+                .open_publish_stream(crate::application::BlobPublishStreamRequest {
+                    publication: live_blob_request(operation, &topic, &scope),
+                    options: crate::application::BlobPublishOptions::durable(),
+                    total_len: 4096,
+                })
+                .await
+                .expect("open stream publication");
+            stream
+                .write(0, zeroize::Zeroizing::new(vec![value; 4096]))
+                .await
+                .expect("write stream publication");
+            stream.finish().await.expect("finish stream publication");
+        }
+        offline.shutdown().await.expect("stop stream publisher");
+        let mut source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let policy = source_store.control_policy_snapshot().unwrap();
+        let mut publications = source_store
+            .blob_stream_publications_with_policy(&policy)
+            .unwrap();
+        publications.sort_unstable_by_key(|publication| *publication.stream_id().as_bytes());
+        assert_eq!(publications.len(), 2);
+        let peer = receiver_mission.identity;
+        // A cursor whose publication disappeared must wrap instead of blocking
+        // the entire lane. The legacy manifest cursor is a separate namespace.
+        assert!(
+            publications
+                .iter()
+                .all(|publication| publication.stream_id().as_bytes() != &[0xff; 32])
+        );
+        assert!(
+            source_store
+                .compare_and_advance_mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::BlobStream,
+                    MutableTransferCursorMode::OfferToPeer,
+                    None,
+                    [0xff; 32],
+                )
+                .unwrap()
+        );
+        assert!(
+            source_store
+                .compare_and_advance_mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                    None,
+                    [0x5b; 32],
+                )
+                .unwrap()
+        );
+        for round in 0..3 {
+            let (sent, received, _, _) = TEST_SEMANTIC_VERSION
+                .scope(
+                    std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                    blob_contact_test_pair(
+                        receiver_store.clone(),
+                        receiver_mission.credentials.clone(),
+                        interests(),
+                        source_store.clone(),
+                        source_mission.credentials.clone(),
+                        interests(),
+                    ),
+                )
+                .await;
+            assert_eq!(sent.blob_stream_attempts, 2);
+            assert_eq!(received.blob_stream_attempts, 2);
+            assert_eq!(
+                sent.blob_stream_received_bytes, 0,
+                "echo is already present"
+            );
+            assert_eq!(
+                received.blob_stream_received_bytes,
+                if round < 2 {
+                    publications[round].wire_len()
+                } else {
+                    0
+                }
+            );
+            let stats = receiver_store.blob_stats().unwrap();
+            assert_eq!(stats.publications, (round + 1).min(2) as u64);
+            assert_eq!(stats.last_acceptance_marker, (round + 1).min(2) as u64);
+            assert_eq!(source_store.blob_stats().unwrap().last_acceptance_marker, 2);
+            assert_eq!(
+                source_store
+                    .mutable_transfer_cursor(
+                        peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::OfferToPeer,
+                    )
+                    .unwrap(),
+                Some([0x5b; 32])
+            );
+            let expected = *publications[round % 2].stream_id().as_bytes();
+            assert_eq!(
+                source_store
+                    .mutable_transfer_cursor(
+                        peer,
+                        MutableTransferCursorClass::BlobStream,
+                        MutableTransferCursorMode::OfferToPeer,
+                    )
+                    .unwrap(),
+                Some(expected)
+            );
+            if round == 0 {
+                drop(source_store);
+                source_store = Arc::new(
+                    Store::open_for_mission(source_root.join(STORE_FILE), authority)
+                        .expect("reopen stream scheduler"),
+                );
+                assert_eq!(
+                    source_store
+                        .mutable_transfer_cursor(
+                            peer,
+                            MutableTransferCursorClass::BlobStream,
+                            MutableTransferCursorMode::OfferToPeer,
+                        )
+                        .unwrap(),
+                    Some(expected)
+                );
+            }
+        }
+        let policy = receiver_store.control_policy_snapshot().unwrap();
+        for publication in publications {
+            assert!(
+                receiver_store
+                    .blob_stream_for_content_with_policy(
+                        &policy,
+                        &topic,
+                        &scope,
+                        publication.blob_id(),
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_completes_retained_sixteen_mib_shape_in_one_contact() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-source-16mib");
+        let receiver_root = root("blob-stream-v9-receiver-16mib");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&source_root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&receiver_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let size_mib = std::env::var("ASTER_TEST_BLOB_STREAM_MIB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=256).contains(value))
+            .unwrap_or(16);
+        let benchmark_bytes = 1024_u64 * 1_048_576;
+        let benchmark_store_limits =
+            StoreLimits::new(StoreLimits::default().max_items(), benchmark_bytes)
+                .expect("stream benchmark Store limits");
+        let benchmark_depot_limits = BlobDepotLimits::new(benchmark_bytes, 65_536, 16)
+            .expect("stream benchmark depot limits");
+        let benchmark_forwarding = SelectedForwardingConfig::default()
+            .with_store_limits(benchmark_store_limits)
+            .with_blob_depot_limits(benchmark_depot_limits);
+        let plaintext = vec![0x5a; size_mib * 1_048_576];
+        let offline = start_node_with_forwarding(
+            NodeConfig {
+                state: source_root.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: source_mission.credentials.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            benchmark_forwarding,
+        )
+        .await
+        .expect("start stream benchmark source");
+        let mut stream = offline
+            .selected_blobs()
+            .open_publish_stream(crate::application::BlobPublishStreamRequest {
+                publication: live_blob_request(b"runtime/stream-benchmark", &topic, &scope),
+                options: crate::application::BlobPublishOptions::durable(),
+                total_len: plaintext.len() as u64,
+            })
+            .await
+            .expect("open stream benchmark publication");
+        for (index, segment) in plaintext
+            .chunks(aster_mesh::BLOB_STREAM_SEGMENT_BYTES)
+            .enumerate()
+        {
+            stream
+                .write(
+                    (index * aster_mesh::BLOB_STREAM_SEGMENT_BYTES) as u64,
+                    zeroize::Zeroizing::new(segment.to_vec()),
+                )
+                .await
+                .expect("write stream benchmark segment");
+        }
+        let published = stream
+            .finish()
+            .await
+            .expect("finish stream benchmark source");
+        offline
+            .shutdown()
+            .await
+            .expect("stop stream benchmark source");
+
+        let source_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                source_root.join(STORE_FILE),
+                benchmark_store_limits,
+                benchmark_depot_limits,
+                authority,
+            )
+            .unwrap(),
+        );
+        let receiver_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                receiver_root.join(STORE_FILE),
+                benchmark_store_limits,
+                benchmark_depot_limits,
+                authority,
+            )
+            .unwrap(),
+        );
+        let receiver_credentials = receiver_mission.credentials.clone();
+        let started = std::time::Instant::now();
+        let (received, sent, _, _) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                ),
+            )
+            .await;
+        let contact_elapsed = started.elapsed();
+        assert_eq!(received.semantic_version, SEMANTIC_PROTOCOL_V9);
+        assert_eq!(sent.semantic_version, SEMANTIC_PROTOCOL_V9);
+        let policy = receiver_store.control_policy_snapshot().unwrap();
+        let publication = receiver_store
+            .blob_stream_for_content_with_policy(
+                &policy,
+                &topic,
+                &scope,
+                aster_mesh::BlobId::from_bytes(*published.id.as_bytes()),
+            )
+            .unwrap()
+            .expect("profile-5 transfer promotes the exact stream publication");
+        assert_eq!(received.blob_ranges_fetched, 0);
+        assert_eq!(sent.blob_ranges_fetched, 0);
+        assert_eq!(received.blob_stream_attempts, 1);
+        assert_eq!(sent.blob_stream_attempts, 1);
+        assert_eq!(
+            received.blob_stream_transport,
+            Some(BlobStreamTransport::IrohQuicV1)
+        );
+        assert_eq!(
+            sent.blob_stream_transport,
+            Some(BlobStreamTransport::IrohQuicV1)
+        );
+        assert!(received.blob_stream_received_bytes >= plaintext.len() as u64);
+        assert_eq!(
+            received.blob_stream_checkpoint_bytes,
+            received.blob_stream_received_bytes
+        );
+        assert!(received.blob_stream_receive_limit_bytes >= plaintext.len() as u64);
+        assert!(received.blob_stream_writer_commits > 0);
+        assert_eq!(sent.blob_stream_received_bytes, 0);
+        let verifier = open_test_sealer(&receiver_credentials);
+        let open = verifier
+            .verify_blob_stream_open(publication.authenticated_open())
+            .expect("verify received stream open");
+        let commitment = verifier
+            .verify_blob_stream_commitment(&open, publication.authenticated_commitment())
+            .expect("verify received stream commitment");
+        let mut reader = receiver_store
+            .open_blob_stream_read_session_with_policy(&policy, &publication, &open, &commitment)
+            .expect("open received stream pack");
+        let mut decryptor = verifier
+            .begin_blob_stream_decrypt(&open)
+            .expect("open received stream decryptor");
+        let mut actual = Vec::with_capacity(plaintext.len());
+        while let Some(encoded) = reader
+            .next_encrypted_segment()
+            .expect("read stream segment")
+        {
+            let segment = aster_mesh::EncryptedBlobStreamSegment::decode(&encoded)
+                .expect("decode received stream segment");
+            actual.extend_from_slice(
+                &decryptor
+                    .decrypt_segment(&segment)
+                    .expect("decrypt received stream segment"),
+            );
+        }
+        decryptor
+            .finish(&commitment)
+            .expect("authenticate received stream completion");
+        assert_eq!(actual, plaintext);
+        eprintln!(
+            "live_blob_stream_v9 bytes={} contact_ms={} verified_read_ms={} total_ms={} max_checkpoint_ms={} writer_commits={}",
+            plaintext.len(),
+            contact_elapsed.as_millis(),
+            started
+                .elapsed()
+                .saturating_sub(contact_elapsed)
+                .as_millis(),
+            started.elapsed().as_millis(),
+            received.blob_stream_checkpoint_latency_ms,
+            received.blob_stream_writer_commits,
+        );
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_reopens_an_existing_pending_source_without_metadata_difference() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-reopen-source");
+        let receiver_root = root("blob-stream-v9-reopen-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let plaintext = vec![0x6b; 2 * 1_048_576];
+        let source = publish_test_blob(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &plaintext,
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .unwrap()
+            .expect("completed v9 reopen source")
+            .sealed;
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+        stage_test_pending_blob_stream_v9(
+            &receiver_store,
+            &receiver_cache,
+            &receiver_mission.credentials,
+            source,
+            &sealed,
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let route = source_verifier.verify_blob(&sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = source_verifier.verify_blob_content(route, &sealed).unwrap()
+        else {
+            panic!("v9 reopen source lost content access");
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).unwrap();
+        let receiver_policy = receiver_store.control_policy_snapshot().unwrap();
+        let initial = receiver_store
+            .blob_stream_checkpoint_with_policy(&receiver_policy, source, &plan)
+            .unwrap();
+        let owned = {
+            let mut depot = source_store.blob_depot().unwrap();
+            aster_mesh::BlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .unwrap();
+            plan.read_stream_extent(&mut depot, 0, 1_048_576)
+                .unwrap()
+                .expect("first v9 recovery extent")
+        };
+        let verified = plan.verify_stream_extent(&owned, 1_048_576).unwrap();
+        let batch = aster_redb_store::VerifiedBlobStreamCheckpointBatch::from_extents(
+            [verified],
+            4 * 1_048_576,
+        )
+        .unwrap();
+        let checkpoint = match receiver_store
+            .commit_blob_stream_batch_with_policy(&receiver_policy, source, &plan, initial, batch)
+            .unwrap()
+        {
+            aster_redb_store::BlobStreamCommitOutcome::Advanced(checkpoint) => checkpoint,
+            outcome => panic!("first recovery extent unexpectedly completed: {outcome:?}"),
+        };
+        assert!(checkpoint.durable_encoded_offset > 0);
+        assert!(checkpoint.next_carrier_index > 0);
+        assert_eq!(checkpoint.generation, initial.generation + 1);
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "v9 pre-open recovery failed: client={client:?} server={server:?}"
+        );
+        assert!(
+            receiver_store.get_blob(source).unwrap().is_some(),
+            "pre-existing pending source was not selected and promoted"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    async fn retained_blob_contact_skips_an_unavailable_peer_source(prestage_current: bool) {
+        let mut missions = issue_missions(3);
+        let receiver_mission = missions.pop().unwrap();
+        let authority = receiver_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let roots = [
+            root("blob-stream-v9-peer-source-a"),
+            root("blob-stream-v9-peer-source-b"),
+            root("blob-stream-v9-peer-receiver"),
+        ];
+        for root in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        let receiver_store =
+            Arc::new(Store::open_for_mission(roots[2].join(STORE_FILE), authority).unwrap());
+        let mut sources = Vec::new();
+        for (index, mission) in missions.into_iter().enumerate() {
+            let store = Arc::new(
+                Store::open_for_mission(roots[index].join(STORE_FILE), authority).unwrap(),
+            );
+            let source = publish_test_blob(
+                &store,
+                &mut open_test_sealer(&mission.credentials),
+                &topic,
+                &scope,
+                1,
+                &vec![0x71 + index as u8; 64 * 1024],
+            );
+            sources.push((store, source, mission));
+        }
+        // Force the unavailable source to sort first, which previously made
+        // every contact request it from a peer that had never held it.
+        sources.sort_by_key(|(_, source, _)| *source);
+        let (source_store, source, source_mission) = sources.pop().unwrap();
+        let (offline_store, offline, _offline_mission) = sources.pop().unwrap();
+        assert!(offline < source);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+        let offline_sealed = offline_store.get_blob(offline).unwrap().unwrap().sealed;
+        stage_test_pending_blob_stream_v9(
+            &receiver_store,
+            &receiver_cache,
+            &receiver_mission.credentials,
+            offline,
+            &offline_sealed,
+        );
+        if prestage_current {
+            let sealed = source_store.get_blob(source).unwrap().unwrap().sealed;
+            stage_test_pending_blob_stream_v9(
+                &receiver_store,
+                &receiver_cache,
+                &receiver_mission.credentials,
+                source,
+                &sealed,
+            );
+        }
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "available peer source did not complete: client={client:?} server={server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_some());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver_store.get_blob(offline).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(offline)
+                .unwrap()
+                .is_some()
+        );
+        drop(source_store);
+        drop(offline_store);
+        drop(receiver_store);
+        for root in roots {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_skips_pending_sources_absent_at_the_current_peer() {
+        retained_blob_contact_skips_an_unavailable_peer_source(true).await;
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_prefers_new_admission_over_an_unrelated_pending_source() {
+        retained_blob_contact_skips_an_unavailable_peer_source(false).await;
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_reauthenticates_finite_pending_source_before_credit() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-finite-source");
+        let receiver_root = root("blob-stream-v9-finite-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_finite_blob_stream_v9(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0x7d; 2 * 1_048_576],
+            10 * 60 * 1_000,
+            100,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .unwrap()
+            .expect("completed finite profile-5 source")
+            .sealed;
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+        stage_test_pending_blob_stream_v9(
+            &receiver_store,
+            &receiver_cache,
+            &receiver_mission.credentials,
+            source,
+            &sealed,
+        );
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "finite profile-5 contact failed: client={client:?} server={server:?}"
+        );
+        assert!(
+            receiver_store.get_blob(source).unwrap().is_some(),
+            "finite profile-5 source was not promoted after custody-v2 prelude"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_authenticates_finite_source_before_initial_admission() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-finite-initial-source");
+        let receiver_root = root("blob-stream-v9-finite-initial-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_finite_blob_stream_v9(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0x8e; 2 * 1_048_576],
+            10 * 60 * 1_000,
+            100,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "initial finite profile-5 contact failed: client={client:?} server={server:?}"
+        );
+        assert!(
+            receiver_store.get_blob(source).unwrap().is_some(),
+            "finite profile-5 source was not admitted and promoted after custody-v2"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_rejects_initial_finite_custody_before_admission() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-finite-reject-source");
+        let receiver_root = root("blob-stream-v9-finite-reject-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_finite_blob_stream_v9(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0xa7; 2 * 1_048_576],
+            10 * 60 * 1_000,
+            100,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let fault = install_test_blob_contact_fault(
+            source_mission.credentials.identity(),
+            TestBlobContactFault::StreamCustodyPreludeTamper,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(fault.fired.load(Ordering::Acquire));
+        assert!(
+            client.is_err() && server.is_err(),
+            "tampered custody prelude did not terminate both halves: client={client:?} server={server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            None
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_reconnects_from_first_durable_checkpoint() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-checkpoint-source");
+        let receiver_root = root("blob-stream-v9-checkpoint-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let mut plaintext = vec![0_u8; 20 * 1_048_576];
+        for (index, bytes) in plaintext.chunks_exact_mut(8).enumerate() {
+            bytes.copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        let source = publish_test_blob(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &plaintext,
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .unwrap()
+            .expect("checkpoint source")
+            .sealed;
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let route = source_verifier.verify_blob(&sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = source_verifier.verify_blob_content(route, &sealed).unwrap()
+        else {
+            panic!("checkpoint source lost content access");
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).unwrap();
+        let layout = aster_mesh::BlobStreamLayout::from_plan(&plan).unwrap();
+        assert!(
+            layout.total_encoded_len()
+                > aster_redb_store::MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES as u64
+        );
+        assert!(layout.total_encoded_len() < receiver_store.blob_depot_limits().max_bytes());
+        let receiver_policy = receiver_store.control_policy_snapshot().unwrap();
+        let fault = install_test_blob_contact_fault(
+            receiver_mission.credentials.identity(),
+            TestBlobContactFault::StreamAfterCheckpoint,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+
+        let (first_client, first_server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials.clone(),
+                    interests(),
+                    Arc::clone(&source_cache),
+                    receiver_store.clone(),
+                    receiver_mission.credentials.clone(),
+                    interests(),
+                    Arc::clone(&receiver_cache),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            fault.fired.load(Ordering::Acquire),
+            "contact stopped before its first durable checkpoint: client={first_client:?} server={first_server:?}"
+        );
+        assert!(
+            first_client.is_err() && first_server.is_err(),
+            "checkpoint fault did not terminate both contact halves: client={first_client:?} server={first_server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_some()
+        );
+        let checkpoint = receiver_store
+            .blob_stream_checkpoint_with_policy(&receiver_policy, source, &plan)
+            .unwrap();
+        assert!(checkpoint.durable_encoded_offset > 0);
+        assert!(checkpoint.durable_encoded_offset < plan.manifest().total_len());
+        assert_eq!(checkpoint.generation, 2);
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            None,
+            "failed stream must not settle its metadata cursor"
+        );
+
+        let (second_client, second_server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            second_client.is_ok() && second_server.is_ok(),
+            "checkpoint reconnect failed: client={second_client:?} server={second_server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_some());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            Some(*source.as_bytes())
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
     async fn blob_ranges_stream_completion_case(interrupt: Option<bool>) {
         let mut missions = issue_missions(2);
         let a = missions.pop().unwrap();
@@ -49439,8 +52915,14 @@ mod tests {
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
-        let client_receipt = TEST_BLOB_SETTLEMENT_HARNESS
-            .scope(
+        let semantic_version = TEST_SEMANTIC_VERSION
+            .try_with(std::cell::Cell::get)
+            .ok()
+            .flatten()
+            .unwrap_or(SEMANTIC_PROTOCOL_V8);
+        let client_receipt = with_test_semantic_version(
+            semantic_version,
+            TEST_BLOB_SETTLEMENT_HARNESS.scope(
                 client_settlement_harness.unwrap_or_default(),
                 TEST_BLOB_RECEIVE_FAULT.scope(
                     std::cell::Cell::new(client_receive_fault),
@@ -49484,8 +52966,9 @@ mod tests {
                         ),
                     ),
                 ),
-            )
-            .await;
+            ),
+        )
+        .await;
         if client_receipt.is_err() {
             client.close().await;
         }
@@ -49809,7 +53292,7 @@ mod tests {
             let mode = BlobContactMode::from_authenticated_profiles(semantic_version, None)
                 .expect("v5-v6 durable-only Blob mode");
             assert_eq!(mode, BlobContactMode::DurableOnly);
-            assert!(!mode.finite_transfer_enabled());
+            assert!(!mode.finite_lifecycle_enabled());
         }
         let v7 = negotiated(
             SEMANTIC_PROTOCOL_V7,
@@ -49840,10 +53323,24 @@ mod tests {
             BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_custody))
                 .expect("v8 custody-capable stream mode");
         assert_eq!(custody_mode, BlobContactMode::CustodyV1);
-        assert!(custody_mode.finite_transfer_enabled());
+        assert!(custody_mode.finite_lifecycle_enabled());
+        assert!(custody_mode.source_custody_v1_enabled());
+        assert!(!custody_mode.stream_v1_enabled());
+        let v9_stream = negotiated(
+            SEMANTIC_PROTOCOL_V9,
+            TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+                .expect("v9 transfer offer"),
+        );
+        let stream_mode =
+            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V9, Some(&v9_stream))
+                .expect("v9 Blob stream mode");
+        assert_eq!(stream_mode, BlobContactMode::StreamV1);
+        assert!(stream_mode.finite_lifecycle_enabled());
+        assert!(!stream_mode.source_custody_v1_enabled());
+        assert!(stream_mode.stream_v1_enabled());
         assert!(matches!(
             BlobContactMode::from_authenticated_profiles(
-                SEMANTIC_PROTOCOL_V8 + 1,
+                SEMANTIC_PROTOCOL_V9 + 1,
                 Some(&v8_custody),
             ),
             Err(NodeError::Protocol(_))
@@ -49914,7 +53411,7 @@ mod tests {
                     clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
                     tick_ms: 0,
                 },
-                SEMANTIC_PROTOCOL_V8 + 1,
+                SEMANTIC_PROTOCOL_V9 + 1,
                 TransferProfileId::BlobRangesStreamV1 as u16,
             )
             .expect("stage unsupported received provenance");
@@ -54213,10 +57710,15 @@ mod tests {
         cache
     }
 
-    fn legacy_event_with_blob_stream_offer() -> TransferProfileOfferV1 {
+    fn legacy_event_with_blob_stream_offer(semantic_version: u16) -> TransferProfileOfferV1 {
+        let blob_profile = if semantic_version >= SEMANTIC_PROTOCOL_V9 {
+            TransferProfileId::BlobStreamV1
+        } else {
+            TransferProfileId::BlobRangesStreamV1
+        };
         TransferProfileOfferV1::from_lanes(vec![
             (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
-            (LaneId::Blob, vec![TransferProfileId::BlobRangesStreamV1]),
+            (LaneId::Blob, vec![blob_profile]),
             (LaneId::Record, vec![TransferProfileId::LegacyV6]),
             (LaneId::State, vec![TransferProfileId::LegacyV6]),
             (LaneId::Event, vec![TransferProfileId::LegacyV6]),
@@ -55373,7 +58875,7 @@ mod tests {
             .expect("custody policy before contact");
         let authorization_count = Arc::new(AtomicU64::new(0));
         let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
+            legacy_event_with_blob_stream_offer(SEMANTIC_PROTOCOL_V9),
             contact_test_pair_with_forwarding_results(
                 TestForwardingNode {
                     store: server_store.clone(),
@@ -55486,34 +58988,37 @@ mod tests {
         );
         let writer_hold = Arc::new(TestCustodyWriterHold::new());
         let authorization_count = Arc::new(AtomicU64::new(0));
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::HoldWriterAfterLease {
-                            transfer_id: source.transfer_id,
-                            state: writer_hold.clone(),
-                        },
-                        TestCustodyPreopenRace::CountAuthorizations {
-                            transfer_id: source.transfer_id,
-                            count: authorization_count.clone(),
-                        },
-                    ],
-                },
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(SEMANTIC_PROTOCOL_V8),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::HoldWriterAfterLease {
+                                transfer_id: source.transfer_id,
+                                state: writer_hold.clone(),
+                            },
+                            TestCustodyPreopenRace::CountAuthorizations {
+                                transfer_id: source.transfer_id,
+                                count: authorization_count.clone(),
+                            },
+                        ],
+                    },
+                ),
             ),
         )
         .await;
@@ -55967,34 +59472,37 @@ mod tests {
             },
         );
 
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::Expire {
-                            transfer_id: expired.transfer_id,
-                            tick_ms: 100,
-                        },
-                        TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
-                        TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
-                        TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
-                        TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
-                    ],
-                },
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(SEMANTIC_PROTOCOL_V8),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::Expire {
+                                transfer_id: expired.transfer_id,
+                                tick_ms: 100,
+                            },
+                            TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
+                            TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
+                            TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
+                            TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
+                        ],
+                    },
+                ),
             ),
         )
         .await;
@@ -56089,7 +59597,7 @@ mod tests {
             services.other.clone(),
         )
         .await;
-        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(finite_source.offered, 1);
         assert_eq!(finite_source.event_pages_sent, 1);
         assert_eq!(finite_source.event_page_entries_sent, 1);
@@ -56240,7 +59748,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(source.offered, EVENT_COUNT);
         assert_eq!(
             source.event_pages_sent,
@@ -56443,7 +59951,7 @@ mod tests {
             TransferProfileId::EventPagesV1 as u16,
             TransferProfileId::LegacyV6 as u16,
             TransferProfileId::LegacyV6 as u16,
-            TransferProfileId::BlobRangesStreamV1 as u16,
+            TransferProfileId::BlobStreamV1 as u16,
             TransferProfileId::LegacyV6 as u16,
         ]);
         assert_eq!(
@@ -58181,7 +61689,7 @@ mod tests {
         let receiver_clock_id = [0x4f; 16];
 
         let (first_receiver, first_source) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
+            legacy_event_with_blob_stream_offer(SEMANTIC_PROTOCOL_V9),
             contact_test_pair_with_forwarding(
                 TestForwardingNode {
                     store: source_store.clone(),

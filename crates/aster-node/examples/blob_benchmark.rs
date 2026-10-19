@@ -3,25 +3,30 @@
 use aster_iroh::{EndpointId, ExpectedPeer};
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
 use aster_node::{
-    MissionExpectedPeer, MutableSourceInterests, NodeConfig, NodeIdentity, SourceInterestSelector,
+    BlobDepotLimits, MissionExpectedPeer, MutableSourceInterests, NodeConfig, NodeIdentity,
+    SelectedForwardingConfig, SourceInterestSelector,
     application::{
-        ApplicationErrorKind, BlobPublishRequest, BlobReadPageRequest, BlobReadRequest,
-        MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope, Topic,
+        ApplicationErrorKind, BlobPublishOptions, BlobPublishRequest, BlobPublishStreamRequest,
+        BlobReadPageRequest, BlobReadRequest, MAX_SELECTED_BLOB_PAGE_BYTES,
+        MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope, Topic,
     },
     mission::UnprotectedReferenceMission,
-    start_node,
+    start_node, start_node_with_forwarding,
 };
 use aster_redb_store::Store;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     error::Error,
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::time::{sleep, timeout};
+use zeroize::Zeroizing;
 type E = Box<dyn Error + Send + Sync>;
 struct Participant {
     state: PathBuf,
@@ -33,6 +38,11 @@ fn participant(root: &Path, name: &str, bytes: Vec<u8>) -> Result<Participant, E
     fs::create_dir(&dir)?;
     let state = dir.join("state");
     fs::create_dir(&state)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+    }
     let mission = UnprotectedReferenceMission::persist(dir.join("mission.bundle"), bytes)?;
     let carrier = NodeIdentity::load_or_create(&state)?.id();
     Ok(Participant {
@@ -98,6 +108,16 @@ fn fixture_bytes(offset: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
+fn retryable_probe_error(kind: ApplicationErrorKind) -> bool {
+    matches!(
+        kind,
+        ApplicationErrorKind::NotFound
+            | ApplicationErrorKind::RequestRejected
+            | ApplicationErrorKind::UnauthorizedOrRevoked
+            | ApplicationErrorKind::PolicyUnsettled
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +138,13 @@ mod tests {
             "large-size fixture must not repeat chunks"
         );
     }
+
+    #[test]
+    fn pre_admission_not_found_is_a_retryable_benchmark_probe() {
+        assert!(retryable_probe_error(ApplicationErrorKind::NotFound));
+        assert!(retryable_probe_error(ApplicationErrorKind::RequestRejected));
+        assert!(!retryable_probe_error(ApplicationErrorKind::Integrity));
+    }
 }
 
 #[tokio::main(worker_threads = 2)]
@@ -126,6 +153,7 @@ async fn main() -> Result<(), E> {
     let root = PathBuf::from(&args[1]);
     let len: u64 = args[2].parse()?;
     let deadline: u64 = args[3].parse()?;
+    let mode = args.get(4).map(String::as_str).unwrap_or("legacy");
     fs::create_dir(&root)?;
     let topic = Topic::new("benchmark.blob")?;
     let scope = Scope::new("test/blob-benchmark")?;
@@ -165,9 +193,94 @@ async fn main() -> Result<(), E> {
         generation.elapsed().as_nanos()
     );
     let local = SocketAddr::from(([127, 0, 0, 1], 0));
-    let peerless = start_node(config(&publisher, local, None, &topic, &scope)).await?;
+    let peerless_config = config(&publisher, local, None, &topic, &scope);
+    let peerless = if mode == "stream-local" {
+        let max_bytes = len
+            .checked_add(64 * 1024 * 1024)
+            .ok_or("stream benchmark depot byte limit overflow")?;
+        let max_chunks = len.div_ceil(64 * 1024).max(1);
+        let forwarding = SelectedForwardingConfig::default()
+            .with_blob_depot_limits(BlobDepotLimits::new(max_bytes, max_chunks, 8)?);
+        start_node_with_forwarding(peerless_config, forwarding).await?
+    } else {
+        start_node(peerless_config).await?
+    };
     let total = Instant::now();
     let publication_start = Instant::now();
+    if mode == "stream-local" {
+        let handle = peerless.selected_blobs();
+        let mut stream = handle
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: BlobPublishRequest {
+                    operation_key: b"benchmark-stream-once".to_vec(),
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    priority: Priority::Priority,
+                    media_type: Some("application/octet-stream".into()),
+                    schema_id: b"benchmark-stream-v1".to_vec(),
+                },
+                options: BlobPublishOptions::durable(),
+                total_len: len,
+            })
+            .await?;
+        let mut input = File::open(&source)?;
+        let mut offset = 0_u64;
+        while offset < len {
+            let segment_len = usize::try_from((len - offset).min(1024 * 1024))?;
+            let mut segment = Zeroizing::new(vec![0_u8; segment_len]);
+            input.read_exact(&mut segment)?;
+            let progress = stream.write(offset, segment).await?;
+            offset = progress.accepted_offset;
+        }
+        let published = stream.finish().await?;
+        let publication_ns = publication_start.elapsed().as_nanos();
+        assert_eq!(published.total_len, len);
+        assert!(published.inserted);
+        println!(
+            "BENCH_STREAM_PUBLICATION {{\"bytes\":{len},\"publication_ns\":{publication_ns},\"bytes_per_second\":{},\"blob_id\":\"{}\"}}",
+            u128::from(len) * 1_000_000_000 / publication_ns.max(1),
+            published.id
+        );
+        let read_start = Instant::now();
+        let mut output_hash = Sha256::new();
+        let mut read_bytes = 0_u64;
+        let mut reader = handle
+            .open_read_stream(BlobReadRequest {
+                id: published.id,
+                topic: topic.clone(),
+                scope: scope.clone(),
+            })
+            .await?;
+        while let Some(frame) = reader.next(MAX_SELECTED_BLOB_PAGE_BYTES).await? {
+            if frame.offset != read_bytes {
+                return Err("stream benchmark read offset mismatch".into());
+            }
+            output_hash.update(&frame.bytes);
+            read_bytes = read_bytes
+                .checked_add(frame.bytes.len() as u64)
+                .ok_or("stream benchmark read length overflow")?;
+        }
+        let read_ns = read_start.elapsed().as_nanos();
+        let actual: String = output_hash
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(read_bytes, len);
+        assert_eq!(actual, expected);
+        println!(
+            "BENCH_STREAM_READ {{\"bytes\":{len},\"read_ns\":{read_ns},\"bytes_per_second\":{}}}",
+            u128::from(len) * 1_000_000_000 / read_ns.max(1),
+        );
+        drop(reader);
+        let shutdown_receipt = peerless.shutdown().await?;
+        receipt("publisher_stream_local", &shutdown_receipt);
+        println!(
+            "BENCH_RESULT {{\"status\":\"stream_local_complete\",\"bytes\":{len},\"source_sha256\":\"{expected}\",\"publication_ns\":{publication_ns},\"total_ns\":{}}}",
+            total.elapsed().as_nanos()
+        );
+        return Ok(());
+    }
     let result = peerless
         .selected_blobs()
         .publish(
@@ -235,7 +348,7 @@ async fn main() -> Result<(), E> {
     let completed=timeout(Duration::from_secs(deadline),async {
   loop {match h.read_page(BlobReadPageRequest{blob:request.clone(),offset:0,max_bytes:1}).await {
    Ok(page)=>{assert_eq!(page.total_len,len);assert_eq!(page.id,published.id);break Ok::<(),E>(());},
-   Err(e) if matches!(e.kind(),ApplicationErrorKind::RequestRejected|ApplicationErrorKind::UnauthorizedOrRevoked|ApplicationErrorKind::PolicyUnsettled)=>{},
+   Err(e) if retryable_probe_error(e.kind())=>{},
    Err(e)=>break Err(Box::new(e) as E),
   }
   if last.elapsed()>=Duration::from_secs(10){let s=r.selected_events().status().await?;println!("BENCH_PROGRESS {{\"elapsed_ns\":{},\"authenticated_contacts\":{},\"failed_contacts\":{}}}",transfer.elapsed().as_nanos(),s.authenticated_contacts,s.failed_contact_attempts);last=Instant::now();}

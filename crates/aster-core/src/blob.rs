@@ -32,11 +32,15 @@ pub const MAX_BLOB_CHUNK_SIZE: u32 = 64 * 1024;
 /// Canonical chunk size required by the selected Blob application profile.
 pub const SELECTED_BLOB_CHUNK_SIZE: u32 = MAX_BLOB_CHUNK_SIZE;
 /// Maximum exact canonical manifest size, including every per-chunk integrity record.
-pub const MAX_BLOB_MANIFEST_BYTES: u64 = 1024 * 1024;
+///
+/// Four MiB covers more than 2 GiB of selected 64-KiB chunks. Older transfer
+/// profiles retain their smaller admission limits; this is an additive parser
+/// and source-format capacity extension, not a reinterpretation of their bytes.
+pub const MAX_BLOB_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MANIFEST_RECORD_LEN: u64 = 72;
 const MANIFEST_FIXED_LEN: u64 = 141;
 const MAX_ENCODED_METADATA_LEN: u64 = 2 + MAX_MEDIA_TYPE_LEN as u64 + MAX_SCHEMA_ID_LEN as u64;
-/// Maximum selected chunk count that keeps the exact canonical manifest within 1 MiB.
+/// Maximum selected chunk count that keeps the exact canonical manifest within 4 MiB.
 pub const MAX_BLOB_CHUNKS: u64 =
     (MAX_BLOB_MANIFEST_BYTES - MANIFEST_FIXED_LEN - MAX_ENCODED_METADATA_LEN) / MANIFEST_RECORD_LEN;
 const MAX_MEDIA_TYPE_LEN: usize = 255;
@@ -616,6 +620,171 @@ impl BuiltBlobTransferObject {
 pub struct VerifiedBlobTransferObject {
     object: BlobTransferObject,
     expected_record: BlobChunkRecord,
+}
+
+/// Canonical byte layout of a profile-5 Blob stream.
+///
+/// The stream is the separator-free concatenation of complete `ASTRBT01`
+/// carriers in manifest order.  Every retained offset is therefore an
+/// authenticated carrier boundary; partial carriers never become resumable
+/// state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamLayout {
+    boundaries: Vec<u64>,
+}
+
+impl BlobStreamLayout {
+    /// Derives the checked stream layout without reading any ciphertext.
+    pub fn from_plan(plan: &VerifiedBlobTransferPlan) -> Result<Self, BlobError> {
+        let mut boundaries: Vec<u64> = Vec::with_capacity(
+            usize::try_from(plan.manifest.chunk_count)
+                .map_err(|_| BlobError::LengthOverflow)?
+                .checked_add(1)
+                .ok_or(BlobError::LengthOverflow)?,
+        );
+        boundaries.push(0);
+        for index in 0..plan.manifest.chunk_count {
+            let id = plan.carrier_id(index)?;
+            let length = plan.carrier_total_len(&id.wire_bytes())?;
+            let next = boundaries
+                .last()
+                .copied()
+                .ok_or(BlobError::InvalidManifest)?
+                .checked_add(length)
+                .ok_or(BlobError::LengthOverflow)?;
+            boundaries.push(next);
+        }
+        Ok(Self { boundaries })
+    }
+
+    /// Number of complete carriers in the stream.
+    pub fn carrier_count(&self) -> u64 {
+        u64::try_from(self.boundaries.len().saturating_sub(1)).unwrap_or(u64::MAX)
+    }
+
+    /// Total canonical encoded byte length.
+    pub fn total_encoded_len(&self) -> u64 {
+        self.boundaries.last().copied().unwrap_or(0)
+    }
+
+    /// Canonical encoded offset before `carrier_index`.
+    pub fn carrier_offset(&self, carrier_index: u64) -> Option<u64> {
+        usize::try_from(carrier_index)
+            .ok()
+            .and_then(|index| self.boundaries.get(index).copied())
+    }
+
+    /// Returns the carrier index for one exact canonical encoded boundary.
+    pub fn carrier_index_at_offset(&self, encoded_offset: u64) -> Option<u64> {
+        self.boundaries
+            .binary_search(&encoded_offset)
+            .ok()
+            .and_then(|index| u64::try_from(index).ok())
+    }
+
+    /// Returns the greatest canonical carrier boundary not exceeding `offset`.
+    pub fn carrier_boundary_at_or_before(&self, offset: u64) -> (u64, u64) {
+        let index = match self.boundaries.binary_search(&offset) {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        (
+            u64::try_from(index).unwrap_or(u64::MAX),
+            self.boundaries.get(index).copied().unwrap_or(0),
+        )
+    }
+
+    /// Whether the index and offset identify the same canonical boundary.
+    pub fn contains_checkpoint(&self, carrier_index: u64, encoded_offset: u64) -> bool {
+        self.carrier_offset(carrier_index) == Some(encoded_offset)
+    }
+
+    #[cfg(test)]
+    fn from_lengths(lengths: &[u64]) -> Result<Self, BlobError> {
+        let mut boundaries: Vec<u64> = Vec::with_capacity(
+            lengths
+                .len()
+                .checked_add(1)
+                .ok_or(BlobError::LengthOverflow)?,
+        );
+        boundaries.push(0);
+        for length in lengths {
+            boundaries.push(
+                boundaries
+                    .last()
+                    .copied()
+                    .unwrap_or(0_u64)
+                    .checked_add(*length)
+                    .ok_or(BlobError::LengthOverflow)?,
+            );
+        }
+        Ok(Self { boundaries })
+    }
+}
+
+/// Owned, bounded source extent containing only complete canonical carriers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedBlobStreamExtent {
+    first_carrier_index: u64,
+    encoded_offset: u64,
+    carriers: Vec<BuiltBlobTransferObject>,
+    encoded_len: u64,
+}
+
+impl OwnedBlobStreamExtent {
+    pub const fn first_carrier_index(&self) -> u64 {
+        self.first_carrier_index
+    }
+    pub const fn encoded_offset(&self) -> u64 {
+        self.encoded_offset
+    }
+    pub const fn encoded_len(&self) -> u64 {
+        self.encoded_len
+    }
+    pub fn carriers(&self) -> &[BuiltBlobTransferObject] {
+        &self.carriers
+    }
+
+    /// Flattens this bounded extent into its canonical separator-free wire
+    /// representation. The checked extent length remains the allocation bound.
+    pub fn encoded_bytes(&self) -> Vec<u8> {
+        let capacity = usize::try_from(self.encoded_len).unwrap_or(0);
+        let mut encoded = Vec::with_capacity(capacity);
+        for carrier in &self.carriers {
+            encoded.extend_from_slice(carrier.bytes());
+        }
+        debug_assert_eq!(encoded.len() as u64, self.encoded_len);
+        encoded
+    }
+}
+
+/// A bounded extent whose complete carriers were authenticated against one
+/// exact transfer plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobStreamExtent {
+    first_carrier_index: u64,
+    encoded_offset: u64,
+    carriers: Vec<VerifiedBlobTransferObject>,
+    encoded_len: u64,
+}
+
+impl VerifiedBlobStreamExtent {
+    pub const fn first_carrier_index(&self) -> u64 {
+        self.first_carrier_index
+    }
+    pub const fn encoded_offset(&self) -> u64 {
+        self.encoded_offset
+    }
+    pub const fn encoded_len(&self) -> u64 {
+        self.encoded_len
+    }
+    pub fn carriers(&self) -> &[VerifiedBlobTransferObject] {
+        &self.carriers
+    }
+    pub fn next_carrier_index(&self) -> u64 {
+        self.first_carrier_index
+            .saturating_add(self.carriers.len() as u64)
+    }
 }
 
 impl VerifiedBlobTransferObject {
@@ -1612,6 +1781,140 @@ impl VerifiedBlobTransferPlan {
         }
         let end = start.saturating_add(max_bytes).min(carrier.bytes.len());
         Ok((total, carrier.bytes[start..end].to_vec()))
+    }
+
+    /// Reads the largest nonempty sequence of whole carriers fitting
+    /// `max_bytes`, starting at one canonical checkpoint.  A single carrier
+    /// larger than the advertised extent is rejected rather than split.
+    pub fn read_stream_extent<S: BlobStore + ?Sized>(
+        &self,
+        store: &mut S,
+        first_carrier_index: u64,
+        max_bytes: usize,
+    ) -> Result<Option<OwnedBlobStreamExtent>, BlobError> {
+        if max_bytes == 0 {
+            return Err(BlobError::WorkLimitZero);
+        }
+        let layout = BlobStreamLayout::from_plan(self)?;
+        if first_carrier_index >= layout.carrier_count() {
+            return Ok(None);
+        }
+        let encoded_offset = layout
+            .carrier_offset(first_carrier_index)
+            .ok_or(BlobError::InvalidChunkIndex)?;
+        let mut encoded_len = 0_u64;
+        let mut carriers = Vec::new();
+        for index in first_carrier_index..layout.carrier_count() {
+            let id = self.carrier_id(index)?;
+            let length = self.carrier_total_len(&id.wire_bytes())?;
+            let next = encoded_len
+                .checked_add(length)
+                .ok_or(BlobError::LengthOverflow)?;
+            if next > max_bytes as u64 {
+                if carriers.is_empty() {
+                    return Err(BlobError::WorkLimitZero);
+                }
+                break;
+            }
+            carriers.push(self.build_carrier(store, index)?);
+            encoded_len = next;
+        }
+        Ok(Some(OwnedBlobStreamExtent {
+            first_carrier_index,
+            encoded_offset,
+            carriers,
+            encoded_len,
+        }))
+    }
+
+    /// Authenticates one owned whole-carrier extent and its exact canonical
+    /// position.  Verification stops before retaining more than `max_bytes`.
+    pub fn verify_stream_extent(
+        &self,
+        extent: &OwnedBlobStreamExtent,
+        max_bytes: usize,
+    ) -> Result<VerifiedBlobStreamExtent, BlobError> {
+        if extent.carriers.is_empty()
+            || extent.encoded_len == 0
+            || extent.encoded_len > max_bytes as u64
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let layout = BlobStreamLayout::from_plan(self)?;
+        if !layout.contains_checkpoint(extent.first_carrier_index, extent.encoded_offset) {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let mut verified = Vec::with_capacity(extent.carriers.len());
+        let mut encoded_len = 0_u64;
+        for (position, carrier) in extent.carriers.iter().enumerate() {
+            let index = extent
+                .first_carrier_index
+                .checked_add(position as u64)
+                .ok_or(BlobError::LengthOverflow)?;
+            if carrier.object_id() != self.carrier_id(index)? {
+                return Err(BlobError::AuthenticationFailed);
+            }
+            encoded_len = encoded_len
+                .checked_add(carrier.bytes().len() as u64)
+                .ok_or(BlobError::LengthOverflow)?;
+            if encoded_len > max_bytes as u64 {
+                return Err(BlobError::InvalidManifest);
+            }
+            verified.push(self.verify_carrier(&carrier.object_id().wire_bytes(), carrier.bytes())?);
+        }
+        if encoded_len != extent.encoded_len {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        Ok(VerifiedBlobStreamExtent {
+            first_carrier_index: extent.first_carrier_index,
+            encoded_offset: extent.encoded_offset,
+            carriers: verified,
+            encoded_len,
+        })
+    }
+
+    /// Authenticates separator-free stream bytes at one exact carrier
+    /// boundary. Each carrier length comes from the authenticated manifest, so
+    /// a partial trailing carrier or bytes crossing the declared extent fail
+    /// before any durable capability is returned.
+    pub fn verify_stream_bytes(
+        &self,
+        first_carrier_index: u64,
+        encoded_offset: u64,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<VerifiedBlobStreamExtent, BlobError> {
+        if bytes.is_empty() || bytes.len() > max_bytes {
+            return Err(BlobError::InvalidManifest);
+        }
+        let layout = BlobStreamLayout::from_plan(self)?;
+        if !layout.contains_checkpoint(first_carrier_index, encoded_offset) {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let mut carriers = Vec::new();
+        let mut cursor = 0_usize;
+        let mut index = first_carrier_index;
+        while cursor < bytes.len() {
+            if index >= layout.carrier_count() {
+                return Err(BlobError::InvalidManifest);
+            }
+            let id = self.carrier_id(index)?;
+            let length = usize::try_from(self.carrier_total_len(&id.wire_bytes())?)
+                .map_err(|_| BlobError::LengthOverflow)?;
+            let end = cursor
+                .checked_add(length)
+                .ok_or(BlobError::LengthOverflow)?;
+            let carrier = bytes.get(cursor..end).ok_or(BlobError::InvalidManifest)?;
+            carriers.push(self.verify_carrier(&id.wire_bytes(), carrier)?);
+            cursor = end;
+            index = index.checked_add(1).ok_or(BlobError::LengthOverflow)?;
+        }
+        Ok(VerifiedBlobStreamExtent {
+            first_carrier_index,
+            encoded_offset,
+            carriers,
+            encoded_len: u64::try_from(bytes.len()).map_err(|_| BlobError::LengthOverflow)?,
+        })
     }
 
     /// Authenticates one complete carrier against this exact source, canonical
@@ -5644,7 +5947,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_cap_boundary_is_at_most_one_mibibyte() {
+    fn manifest_cap_boundary_covers_two_gibibytes_within_four_mibibytes() {
         let metadata = BlobMetadata::new(
             Some("a".repeat(MAX_MEDIA_TYPE_LEN)),
             vec![9; MAX_SCHEMA_ID_LEN],
@@ -5664,6 +5967,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("manifest length failed: {error}"));
         assert!(encoded <= MAX_BLOB_MANIFEST_BYTES);
         assert!(MAX_BLOB_MANIFEST_BYTES - encoded < MANIFEST_RECORD_LEN);
+        assert!(
+            at_limit.total_len >= 2_u64 * 1024 * 1024 * 1024,
+            "selected manifest capacity must cover the profile-5 2-GiB shape"
+        );
         validate_manifest(&at_limit)
             .unwrap_or_else(|error| panic!("boundary manifest failed: {error}"));
 
@@ -5673,5 +5980,52 @@ mod tests {
             ..at_limit
         };
         assert!(validate_manifest(&above_limit).is_err());
+    }
+
+    #[test]
+    fn blob_stream_layout_tracks_exact_boundaries_and_checked_large_shapes() {
+        let empty = BlobStreamLayout::from_lengths(&[]).expect("empty layout");
+        assert_eq!(empty.carrier_count(), 0);
+        assert_eq!(empty.total_encoded_len(), 0);
+        assert!(empty.contains_checkpoint(0, 0));
+
+        let layout = BlobStreamLayout::from_lengths(&[7, 11, 13]).expect("layout");
+        assert_eq!(layout.carrier_count(), 3);
+        assert_eq!(layout.total_encoded_len(), 31);
+        assert_eq!(layout.carrier_offset(0), Some(0));
+        assert_eq!(layout.carrier_offset(1), Some(7));
+        assert_eq!(layout.carrier_offset(2), Some(18));
+        assert_eq!(layout.carrier_offset(3), Some(31));
+        assert_eq!(layout.carrier_index_at_offset(18), Some(2));
+        assert_eq!(layout.carrier_index_at_offset(17), None);
+        assert_eq!(layout.carrier_boundary_at_or_before(0), (0, 0));
+        assert_eq!(layout.carrier_boundary_at_or_before(17), (1, 7));
+        assert_eq!(layout.carrier_boundary_at_or_before(18), (2, 18));
+        assert_eq!(layout.carrier_boundary_at_or_before(u64::MAX), (3, 31));
+        assert!(!layout.contains_checkpoint(2, 17));
+
+        for total in [64_u64 << 20, 1_u64 << 30, 2_u64 << 30] {
+            let shape = BlobStreamLayout::from_lengths(&[total / 2, total / 2])
+                .expect("large checked shape");
+            assert_eq!(shape.total_encoded_len(), total);
+        }
+        assert!(BlobStreamLayout::from_lengths(&[u64::MAX, 1]).is_err());
+
+        let extent = OwnedBlobStreamExtent {
+            first_carrier_index: 0,
+            encoded_offset: 0,
+            carriers: vec![
+                BuiltBlobTransferObject {
+                    object_id: BlobCarrierId(ObjectId::for_blob_chunk_digest([1; 32])),
+                    bytes: vec![1, 2],
+                },
+                BuiltBlobTransferObject {
+                    object_id: BlobCarrierId(ObjectId::for_blob_chunk_digest([2; 32])),
+                    bytes: vec![3, 4, 5],
+                },
+            ],
+            encoded_len: 5,
+        };
+        assert_eq!(extent.encoded_bytes(), vec![1, 2, 3, 4, 5]);
     }
 }

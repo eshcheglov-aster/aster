@@ -2,7 +2,7 @@
 //!
 //! The stopped facade preserves caller-owned streaming readers and writers.
 //! The live facade accepts only an already-open regular [`fs::File`] and
-//! returns at most one zeroize-on-drop 64 KiB page. Encrypted chunks remain in
+//! returns at most one zeroize-on-drop 1 MiB read window. Encrypted chunks remain in
 //! the mission-bound depot; source-envelope bytes, manifest records, keys,
 //! nonces, and depot mechanics are never returned to applications. Both
 //! facades also expose a durable at-least-once metadata-notification queue.
@@ -19,13 +19,16 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use aster_mesh::{
-    BlobContentVerification, BlobError, BlobId as CoreBlobId, BlobMetadata as CoreBlobMetadata,
-    ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_MEDIA_TYPE_BYTES,
+    BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification, BlobError, BlobId as CoreBlobId,
+    BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobStreamDecryptor,
+    BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen, ContentVerifiedBlobEnvelope,
+    CustodyAge, CustodySample, EncryptedBlobStreamSegment, MAX_BLOB_MEDIA_TYPE_BYTES,
     MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
-    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, prepare_blob,
+    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen, prepare_blob,
 };
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
@@ -33,19 +36,27 @@ use aster_redb_store::{
     BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
     BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
     BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
-    BlobStoreError, BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
-    BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
-    BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
-    ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
+    BlobStoreError, BlobStreamPackSession, BlobStreamPublication, BlobStreamReadSession,
+    BlobStreamReservationRequest, BlobStreamSource, BlobSubscriptionId as StoreBlobSubscriptionId,
+    BlobSubscriptionKey, BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome,
+    BlobSubscriptionSpec, BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot,
+    BlobVariantId, ControlPolicySnapshot, ControlTransferId,
+    DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_OPERATION_KEY_BYTES,
     MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
-    MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
+    MAX_NETWORK_BLOB_CHUNKS, MAX_SELECTED_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
 pub use aster_redb_store::{
     BlobDepotLimits, BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobRetirementReason,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
+use super::blob_stream::{
+    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, BlobReadStreamMetadata,
+    OpenedBlobPublishStream, OpenedBlobReadStream, SelectedBlobPublishStream,
+    SelectedBlobReadStream,
+};
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
     application_error, store_error_kind,
@@ -252,14 +263,30 @@ impl Seek for AdmittedFile<'_> {
     }
 }
 
-/// Maximum plaintext accepted by one live Blob publication.
+/// Legacy profile-4 live-publication byte ceiling.
+///
+/// Profile-5-capable local publication derives its checked ceiling from the
+/// configured physical depot limits without adding a transport option here.
 pub const MAX_SELECTED_LIVE_BLOB_BYTES: u64 = MAX_NETWORK_BLOB_BYTES;
 
-/// Maximum canonical 64 KiB chunks accepted by one live Blob publication.
+/// Legacy profile-4 live-publication chunk ceiling.
 pub const MAX_SELECTED_LIVE_BLOB_CHUNKS: u64 = MAX_NETWORK_BLOB_CHUNKS;
 
+fn configured_live_blob_limits(store: &Store) -> (u64, u64) {
+    let depot = store.blob_depot_limits();
+    (
+        depot.max_bytes(),
+        depot.max_chunks().min(MAX_SELECTED_BLOB_CHUNKS),
+    )
+}
+
 /// Maximum plaintext returned by one live Blob page read.
-pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = SELECTED_BLOB_CHUNK_SIZE as usize;
+///
+/// The one-MiB window amortizes authenticated projection and depot setup while
+/// retaining bounded memory and reauthorization between successive windows.
+pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 1024 * 1024;
+const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
+    MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
@@ -624,6 +651,40 @@ pub enum BlobTransferPhase {
     ReadyToFinalize,
 }
 
+/// Bounded phase of one active semantic-v9/profile-5 stream attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobStreamTransferPhase {
+    Negotiating,
+    Receiving,
+    Finalizing,
+    Settling,
+    Complete,
+    Terminal,
+}
+
+/// Sanitized terminal category. Peer errors, transport details, paths, and
+/// authenticated identifiers are intentionally not exposed here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobStreamTerminalCategory {
+    Protocol,
+    Integrity,
+    Lifecycle,
+    Policy,
+    Transport,
+    Cancelled,
+}
+
+/// High-level public progress for one active Blob stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobStreamTransferStatus {
+    pub phase: BlobStreamTransferPhase,
+    pub total_bytes: u64,
+    pub durable_bytes: u64,
+    /// Rolling durable throughput in bytes per second.
+    pub throughput_bytes_per_second: u64,
+    pub terminal: Option<BlobStreamTerminalCategory>,
+}
+
 /// Audited local Blob storage and authenticated pending-transfer snapshot.
 ///
 /// This is not peer convergence or global delivery status. Retained counters
@@ -884,6 +945,7 @@ pub struct SelectedBlobHandle {
     admission: Arc<AtomicBool>,
     identity: NodeId,
     mission_authority: NodeId,
+    max_publish_bytes: u64,
 }
 
 impl SelectedBlobHandle {
@@ -892,12 +954,15 @@ impl SelectedBlobHandle {
         admission: Arc<AtomicBool>,
         identity: NodeId,
         mission_authority: NodeId,
+        max_publish_bytes: u64,
     ) -> Self {
+        debug_assert!(max_publish_bytes > 0);
         Self {
             commands,
             admission,
             identity,
             mission_authority,
+            max_publish_bytes,
         }
     }
 
@@ -909,6 +974,15 @@ impl SelectedBlobHandle {
     /// Stable mission authority bound to the live store and depot.
     pub const fn mission_authority(&self) -> NodeId {
         self.mission_authority
+    }
+
+    /// Maximum plaintext length accepted by one live publication.
+    ///
+    /// This is derived from both configured depot bytes and selected-profile
+    /// chunk capacity, so colocated protocol adapters can reject impossible
+    /// streams before staging their bodies.
+    pub const fn max_publish_bytes(&self) -> u64 {
+        self.max_publish_bytes
     }
 
     /// Durably publishes one already-open regular file through the live worker.
@@ -967,6 +1041,51 @@ impl SelectedBlobHandle {
             "blob publish",
         )
         .await
+    }
+
+    /// Opens or resumes one bounded single-pass Blob publication stream.
+    pub async fn open_publish_stream(
+        &self,
+        request: BlobPublishStreamRequest,
+    ) -> Result<SelectedBlobPublishStream, ApplicationError> {
+        validate_live_publish_request(&request.publication)?;
+        if request.total_len == 0 || request.total_len > self.max_publish_bytes {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
+        }
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::OpenPublishStream {
+                request,
+                commands: self.commands.clone(),
+                response,
+            },
+            received,
+            "blob stream open",
+        )
+        .await
+    }
+
+    /// Opens one authenticated sequential plaintext stream for a completed Blob.
+    pub async fn open_read_stream(
+        &self,
+        request: BlobReadRequest,
+    ) -> Result<SelectedBlobReadStream, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        let opened = self
+            .send(
+                SelectedBlobCommand::OpenReadStream { request, response },
+                received,
+                "blob stream read open",
+            )
+            .await?;
+        Ok(SelectedBlobReadStream::new(
+            self.commands.clone(),
+            opened.token,
+            opened.metadata,
+        ))
     }
 
     /// Reads one authenticated, zeroize-on-drop plaintext page.
@@ -1129,6 +1248,36 @@ pub(crate) enum SelectedBlobCommand {
         source: fs::File,
         response: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
     },
+    OpenPublishStream {
+        request: BlobPublishStreamRequest,
+        commands: mpsc::Sender<SelectedApplicationCommand>,
+        response: oneshot::Sender<Result<SelectedBlobPublishStream, ApplicationError>>,
+    },
+    AppendPublishStream {
+        token: [u8; 32],
+        offset: u64,
+        bytes: Zeroizing<Vec<u8>>,
+        response: oneshot::Sender<Result<BlobPublishProgress, ApplicationError>>,
+    },
+    FinishPublishStream {
+        token: [u8; 32],
+        response: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
+    },
+    ClosePublishStream {
+        token: [u8; 32],
+    },
+    OpenReadStream {
+        request: BlobReadRequest,
+        response: oneshot::Sender<Result<OpenedBlobReadStream, ApplicationError>>,
+    },
+    NextReadStream {
+        token: [u8; 32],
+        max_bytes: usize,
+        response: oneshot::Sender<Result<Option<BlobReadFrame>, ApplicationError>>,
+    },
+    CloseReadStream {
+        token: [u8; 32],
+    },
     ReadPage {
         request: BlobReadPageRequest,
         response: oneshot::Sender<Result<BlobReadPage, ApplicationError>>,
@@ -1165,6 +1314,23 @@ impl SelectedBlobCommand {
             Self::Publish { response, .. } => {
                 _ = response.send(Err(actor_unavailable("blob publish")));
             }
+            Self::OpenPublishStream { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob stream open")));
+            }
+            Self::AppendPublishStream { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob stream write")));
+            }
+            Self::FinishPublishStream { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob stream finish")));
+            }
+            Self::ClosePublishStream { .. } => {}
+            Self::OpenReadStream { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob stream read open")));
+            }
+            Self::NextReadStream { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob stream read")));
+            }
+            Self::CloseReadStream { .. } => {}
             Self::ReadPage { response, .. } => {
                 _ = response.send(Err(actor_unavailable("blob read page")));
             }
@@ -1197,6 +1363,38 @@ impl SelectedBlobCommand {
                     "blob publish",
                 )));
             }
+            Self::OpenPublishStream { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream open",
+                )));
+            }
+            Self::AppendPublishStream { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream write",
+                )));
+            }
+            Self::FinishPublishStream { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream finish",
+                )));
+            }
+            Self::ClosePublishStream { .. } => {}
+            Self::OpenReadStream { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream read open",
+                )));
+            }
+            Self::NextReadStream { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream read",
+                )));
+            }
+            Self::CloseReadStream { .. } => {}
             Self::ReadPage { response, .. } => {
                 _ = response.send(Err(ApplicationError::new(
                     ApplicationErrorKind::ResourceLimit,
@@ -1311,6 +1509,38 @@ impl VerifiedBlobDeliveryMetadata {
 /// This owns the same process-exclusive mission-bound redb writer as Event,
 /// State, Record, and the live runtime. Blob network reconciliation is absent
 /// from this stopped local slice.
+struct LocalBlobPublishStream {
+    open: VerifiedBlobStreamOpen,
+    pack: BlobStreamPackSession,
+    encryptor: BlobStreamEncryptor,
+    request: BlobPublishRequest,
+    options: BlobPublishOptions,
+    total_len: u64,
+    accepted_offset: u64,
+    pending: Zeroizing<Vec<u8>>,
+    segment_count: u64,
+    publisher_counter: u64,
+    last_checkpoint_at: Instant,
+}
+
+struct LocalBlobReadStream {
+    publication: BlobStreamPublication,
+    reader: BlobStreamReadSession,
+    decryptor: Option<BlobStreamDecryptor>,
+    commitment: aster_mesh::VerifiedBlobStreamFinalCommitment,
+    buffered: Zeroizing<Vec<u8>>,
+    buffered_offset: usize,
+    emitted_offset: u64,
+    validated_offset: u64,
+    last_validation_at: Instant,
+    lifetime: Option<CustodyAge>,
+}
+
+struct CompletedLocalBlobPublishStream {
+    result: BlobPublishResult,
+    lifetime: Option<CustodyAge>,
+}
+
 pub struct SelectedBlobNode {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
@@ -1318,6 +1548,10 @@ pub struct SelectedBlobNode {
     verifier_head: Option<(u64, ControlTransferId)>,
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
     custody_clock: NodeCustodyClock,
+    publish_streams: std::collections::BTreeMap<[u8; 32], LocalBlobPublishStream>,
+    completed_publish_streams:
+        std::collections::BTreeMap<[u8; 32], CompletedLocalBlobPublishStream>,
+    read_streams: std::collections::BTreeMap<[u8; 32], LocalBlobReadStream>,
     #[cfg(test)]
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
@@ -1408,6 +1642,9 @@ impl SelectedBlobNode {
             verifier_head,
             source_route_cache,
             custody_clock,
+            publish_streams: std::collections::BTreeMap::new(),
+            completed_publish_streams: std::collections::BTreeMap::new(),
+            read_streams: std::collections::BTreeMap::new(),
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -1454,6 +1691,9 @@ impl SelectedBlobNode {
             verifier_head,
             source_route_cache,
             custody_clock,
+            publish_streams: std::collections::BTreeMap::new(),
+            completed_publish_streams: std::collections::BTreeMap::new(),
+            read_streams: std::collections::BTreeMap::new(),
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -1518,7 +1758,9 @@ impl SelectedBlobNode {
 
     /// Executes one worker-owned live command.
     ///
-    /// Ordinary application failures are sent through the command response.
+    /// Returns whether a new publication committed, independently of whether
+    /// its caller still receives the reply. Reads, retries and failures return
+    /// false. Ordinary application failures are sent through the command response.
     /// An authenticated cache/depot invariant failure, including any failure
     /// after a durable Blob commit, drops that response and escapes as a fatal
     /// [`NodeError`] so the runtime can stop.
@@ -1526,12 +1768,13 @@ impl SelectedBlobNode {
         &mut self,
         command: SelectedBlobCommand,
         admission: &AtomicBool,
-    ) -> Result<(), NodeError> {
+    ) -> Result<bool, NodeError> {
         if !admission.load(Ordering::Acquire) {
             command.reject();
-            return Ok(());
+            return Ok(false);
         }
-        match command {
+        let mut new_publication_inserted = false;
+        let outcome = match command {
             SelectedBlobCommand::Publish {
                 request,
                 options,
@@ -1546,6 +1789,8 @@ impl SelectedBlobNode {
                     Err(error)
                 } else {
                     if admission.load(Ordering::Acquire) {
+                        new_publication_inserted =
+                            result.as_ref().is_ok_and(|result| result.inserted);
                         _ = response.send(result);
                     } else {
                         drop(result);
@@ -1553,6 +1798,69 @@ impl SelectedBlobNode {
                     }
                     Ok(())
                 }
+            }
+            SelectedBlobCommand::OpenPublishStream {
+                request,
+                commands,
+                response,
+            } => {
+                // Ownership must enter the reply itself: a successful oneshot
+                // send does not mean the caller consumed it before cancellation.
+                let result = self.open_publish_stream_inner(request).map(|opened| {
+                    SelectedBlobPublishStream::new(commands, opened.token, opened.progress)
+                });
+                if let Err(Ok(stream)) = response.send(result) {
+                    // Already on the owner actor. Retire directly rather than
+                    // enqueueing cleanup back into a potentially full lane.
+                    let token = stream.into_closed_token();
+                    self.publish_streams.remove(&token);
+                    self.completed_publish_streams.remove(&token);
+                }
+                Ok(())
+            }
+            SelectedBlobCommand::AppendPublishStream {
+                token,
+                offset,
+                bytes,
+                response,
+            } => {
+                let result = self.append_publish_stream_inner(token, offset, bytes);
+                _ = response.send(result);
+                Ok(())
+            }
+            SelectedBlobCommand::FinishPublishStream { token, response } => {
+                let result = self.finish_publish_stream_inner(token);
+                new_publication_inserted = result.as_ref().is_ok_and(|result| result.inserted);
+                // Finish consumes the caller's ownership as soon as it enters
+                // the lane. Retire even a rejected incomplete stream here so
+                // a delayed reply cannot send cleanup for a later owner.
+                self.publish_streams.remove(&token);
+                self.completed_publish_streams.remove(&token);
+                _ = response.send(result);
+                Ok(())
+            }
+            SelectedBlobCommand::ClosePublishStream { token } => {
+                self.publish_streams.remove(&token);
+                self.completed_publish_streams.remove(&token);
+                Ok(())
+            }
+            SelectedBlobCommand::OpenReadStream { request, response } => {
+                let result = self.open_read_stream_inner(request);
+                _ = response.send(result);
+                Ok(())
+            }
+            SelectedBlobCommand::NextReadStream {
+                token,
+                max_bytes,
+                response,
+            } => {
+                let result = self.next_read_stream_inner(token, max_bytes);
+                _ = response.send(result);
+                Ok(())
+            }
+            SelectedBlobCommand::CloseReadStream { token } => {
+                self.read_streams.remove(&token);
+                Ok(())
             }
             SelectedBlobCommand::ReadPage { request, response } => {
                 let mut fatal = None;
@@ -1639,7 +1947,8 @@ impl SelectedBlobNode {
                     "live Blob transfer status failed a durable/network invariant",
                 )
             }
-        }
+        };
+        outcome.map(|()| new_publication_inserted)
     }
 
     /// Authenticated local Blob publisher identity.
@@ -1650,6 +1959,567 @@ impl SelectedBlobNode {
     /// Stable mission authority bound to provisioning, redb, and the depot.
     pub const fn mission_authority(&self) -> NodeId {
         self.mission.mission_authority_id()
+    }
+
+    fn open_publish_stream_inner(
+        &mut self,
+        request: BlobPublishStreamRequest,
+    ) -> Result<OpenedBlobPublishStream, ApplicationError> {
+        validate_live_publish_request(&request.publication)?;
+        let (max_bytes, _) = configured_live_blob_limits(&self.store);
+        if request.total_len == 0 || request.total_len > max_bytes {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
+        }
+        let operation = BlobOperationKey::new(request.publication.operation_key.clone())
+            .map_err(|error| application_error("blob stream open", error.into()))?;
+        let token = derive_local_stream_id(self.identity(), operation.as_bytes());
+        if let Some(existing) = self.publish_streams.get(&token) {
+            if existing.request != request.publication
+                || existing.options != request.options
+                || existing.total_len != request.total_len
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Conflict,
+                    "blob stream open",
+                ));
+            }
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
+        }
+        if !self.publish_streams.is_empty() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
+        }
+        let policy = self.current_policy("blob stream open")?;
+        let epoch = self.active_epoch(&request.publication.scope, "blob stream open")?;
+        self.require_blob_grants(
+            &request.publication.topic,
+            &request.publication.scope,
+            epoch,
+            "blob stream open",
+        )?;
+        if let Some(completed) = self
+            .store
+            .blob_stream_for_operation_with_policy(&policy, &operation)
+            .map_err(|error| application_error("blob stream open", error.into()))?
+        {
+            let result = completed_blob_stream_result(&completed, &request)?;
+            if !self.completed_publish_streams.is_empty() {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream open",
+                ));
+            }
+            let lifetime =
+                completed_pack_lifetime(&self.custody_clock, &completed, "blob stream open")?;
+            self.completed_publish_streams
+                .insert(token, CompletedLocalBlobPublishStream { result, lifetime });
+            return Ok(OpenedBlobPublishStream {
+                token,
+                progress: BlobPublishProgress {
+                    accepted_offset: request.total_len,
+                    durable_offset: request.total_len,
+                },
+            });
+        }
+        if !self.completed_publish_streams.is_empty() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
+        }
+        let initial_sample = self.finite_publish_initial_sample(request.options)?;
+        let causal = self
+            .store
+            .reserve_local_blob_with_policy(
+                &policy,
+                self.identity(),
+                &request.publication.topic,
+                &request.publication.scope,
+                request.options.ttl_ms(),
+                initial_sample,
+            )
+            .map_err(|error| application_error("blob stream open", error.into()))?;
+        let authorization_digest = self
+            .verifier
+            .blob_stream_authorization_digest(&request.publication.scope, epoch)
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::RequestRejected, "blob stream open")
+            })?;
+        let metadata = CoreBlobMetadata::new(
+            request.publication.media_type.clone(),
+            request.publication.schema_id.clone(),
+        )
+        .map_err(|error| blob_core_error("blob stream open", error))?;
+        let policy_revision = policy.head().map_or(1, |(revision, _)| revision);
+        let stream_id = BlobPublicationStreamId::from_bytes(token)
+            .map_err(|error| blob_core_error("blob stream open", error))?;
+        let open = BlobStreamOpen::new(
+            stream_id,
+            self.identity(),
+            operation.as_bytes().to_vec(),
+            self.mission_authority(),
+            causal.counter(),
+            causal.context().clone(),
+            request.publication.topic.clone(),
+            request.publication.scope.clone(),
+            metadata,
+            request.publication.priority,
+            request.options.ttl_ms(),
+            initial_sample,
+            request.total_len,
+            epoch,
+            policy_revision,
+            authorization_digest,
+            derive_local_stream_salt(self.identity(), operation.as_bytes()),
+        )
+        .map_err(|error| blob_core_error("blob stream open", error))?;
+        let signed = self
+            .verifier
+            .seal_blob_stream_open(&open)
+            .map_err(|error| application_error("blob stream open", error.into()))?;
+        let open = self
+            .verifier
+            .verify_blob_stream_open(&signed)
+            .map_err(|error| application_error("blob stream open", error.into()))?;
+        let (reservation, _) = self
+            .store
+            .reserve_blob_stream_with_policy(
+                &policy,
+                BlobStreamReservationRequest {
+                    operation: &operation,
+                    source: BlobStreamSource::LocalApplication,
+                },
+                &open,
+            )
+            .map_err(|error| application_error("blob stream open", error.into()))?;
+        let pack = self
+            .store
+            .open_blob_stream_pack_session(&policy, &reservation, &open)
+            .map_err(|error| application_error("blob stream open", error.into()))?;
+        let durable_offset = pack.progress().durable_plaintext_offset();
+        let segment_count = pack.progress().next_segment_index();
+        let encryptor = if pack.progress().generation() == 0 {
+            self.verifier
+                .begin_blob_stream_encrypt(&open)
+                .map_err(|error| application_error("blob stream open", error.into()))?
+        } else {
+            let resume = pack.crypto_resume();
+            self.verifier
+                .resume_blob_stream_encrypt(&open, durable_offset, resume.ciphertext_checkpoint())
+                .map_err(|error| application_error("blob stream open", error.into()))?
+        };
+        self.publish_streams.insert(
+            token,
+            LocalBlobPublishStream {
+                open,
+                pack,
+                encryptor,
+                request: request.publication,
+                options: request.options,
+                total_len: request.total_len,
+                accepted_offset: durable_offset,
+                pending: Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
+                segment_count,
+                publisher_counter: causal.counter(),
+                last_checkpoint_at: Instant::now(),
+            },
+        );
+        Ok(OpenedBlobPublishStream {
+            token,
+            progress: BlobPublishProgress {
+                accepted_offset: durable_offset,
+                durable_offset,
+            },
+        })
+    }
+
+    fn append_publish_stream_inner(
+        &mut self,
+        token: [u8; 32],
+        offset: u64,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<BlobPublishProgress, ApplicationError> {
+        if self.completed_publish_streams.contains_key(&token) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob stream write",
+            ));
+        }
+        let stream = self.publish_streams.get_mut(&token).ok_or_else(|| {
+            ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream write")
+        })?;
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| {
+            ApplicationError::new(ApplicationErrorKind::InvalidRequest, "blob stream write")
+        })?;
+        let end = offset.checked_add(byte_len).ok_or_else(|| {
+            ApplicationError::new(ApplicationErrorKind::InvalidRequest, "blob stream write")
+        })?;
+        if offset != stream.accepted_offset
+            || bytes.is_empty()
+            || bytes.len() > BLOB_STREAM_SEGMENT_BYTES
+            || end > stream.total_len
+            || stream.pending.len().checked_add(bytes.len()).is_none()
+            || stream.pending.len() + bytes.len() > BLOB_STREAM_SEGMENT_BYTES
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob stream write",
+            ));
+        }
+        stream.pending.extend_from_slice(&bytes);
+        stream.accepted_offset = end;
+        if stream.pending.len() == BLOB_STREAM_SEGMENT_BYTES || end == stream.total_len {
+            let segment_offset = end - stream.pending.len() as u64;
+            let plaintext = stream.pending.to_vec();
+            let pending = std::mem::replace(
+                &mut stream.pending,
+                Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
+            );
+            let segment = stream
+                .encryptor
+                .encrypt_segment(stream.segment_count, segment_offset, pending)
+                .map_err(|error| blob_core_error("blob stream write", error))?;
+            stream
+                .pack
+                .append_segment(&plaintext, &segment)
+                .map_err(|error| application_error("blob stream write", error.into()))?;
+            stream.segment_count += 1;
+        }
+        let durable = stream.pack.progress().durable_plaintext_offset();
+        if end - durable >= 16 * 1024 * 1024
+            || stream.last_checkpoint_at.elapsed() >= DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL
+        {
+            let policy = self
+                .store
+                .control_policy_snapshot()
+                .map_err(|error| application_error("blob stream write", error.into()))?;
+            stream
+                .pack
+                .checkpoint(&self.store, &policy)
+                .map_err(|error| application_error("blob stream write", error.into()))?;
+            stream.last_checkpoint_at = Instant::now();
+        }
+        Ok(BlobPublishProgress {
+            accepted_offset: end,
+            durable_offset: stream.pack.progress().durable_plaintext_offset(),
+        })
+    }
+
+    fn finish_publish_stream_inner(
+        &mut self,
+        token: [u8; 32],
+    ) -> Result<BlobPublishResult, ApplicationError> {
+        if let Some(mut completed) = self.completed_publish_streams.remove(&token) {
+            require_completed_pack_lifetime(
+                &self.custody_clock,
+                completed.result.ttl_ms,
+                &mut completed.lifetime,
+                "blob stream finish",
+            )?;
+            return Ok(completed.result);
+        }
+        let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
+            ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
+        })?;
+        if stream.accepted_offset != stream.total_len || !stream.pending.is_empty() {
+            self.publish_streams.insert(token, stream);
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob stream finish",
+            ));
+        }
+        let policy = self.current_policy("blob stream finish")?;
+        if stream.pack.progress().durable_plaintext_offset() != stream.total_len {
+            stream
+                .pack
+                .checkpoint(&self.store, &policy)
+                .map_err(|error| application_error("blob stream finish", error.into()))?;
+        }
+        let (plaintext_root, ciphertext_root) = stream
+            .pack
+            .final_roots()
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let final_sample = if stream.options.ttl_ms().is_some() {
+            self.custody_clock
+                .sample()
+                .map(Some)
+                .map_err(|error| application_error("blob stream finish", error))?
+        } else {
+            None
+        };
+        let commitment = BlobStreamFinalCommitment::new(
+            &stream.open,
+            plaintext_root,
+            ciphertext_root,
+            stream.segment_count,
+            final_sample,
+        )
+        .map_err(|error| blob_core_error("blob stream finish", error))?;
+        let signed = self
+            .verifier
+            .seal_blob_stream_commitment(&commitment)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let commitment = self
+            .verifier
+            .verify_blob_stream_commitment(&stream.open, &signed)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let promotion = stream
+            .pack
+            .finish_and_promote(&self.store, &policy, &commitment, final_sample)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        Ok(BlobPublishResult {
+            id: BlobId::from_core(promotion.blob_id()),
+            publisher: self.identity(),
+            publisher_counter: stream.publisher_counter,
+            priority: stream.request.priority,
+            ttl_ms: stream.options.ttl_ms(),
+            total_len: stream.total_len,
+            media_type: stream.request.media_type,
+            schema_id: stream.request.schema_id,
+            acceptance_marker: promotion.acceptance_marker(),
+            inserted: !promotion.duplicate(),
+        })
+    }
+
+    fn open_read_stream_inner(
+        &mut self,
+        request: BlobReadRequest,
+    ) -> Result<OpenedBlobReadStream, ApplicationError> {
+        if !self.read_streams.is_empty() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream read open",
+            ));
+        }
+        let policy = self.current_policy("blob stream read open")?;
+        let epoch = self.active_epoch(&request.scope, "blob stream read open")?;
+        self.require_blob_grants(
+            &request.topic,
+            &request.scope,
+            epoch,
+            "blob stream read open",
+        )?;
+        let publication = self
+            .store
+            .blob_stream_for_content_with_policy(
+                &policy,
+                &request.topic,
+                &request.scope,
+                request.id.into_core(),
+            )
+            .map_err(|error| application_error("blob stream read open", error.into()))?
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream read open")
+            })?;
+        let open = self
+            .verifier
+            .verify_blob_stream_open(publication.authenticated_open())
+            .map_err(|error| application_error("blob stream read open", error.into()))?;
+        let commitment = self
+            .verifier
+            .verify_blob_stream_commitment(&open, publication.authenticated_commitment())
+            .map_err(|error| application_error("blob stream read open", error.into()))?;
+        if open.open() != publication.open()
+            || commitment.commitment() != publication.commitment()
+            || commitment.commitment().blob_id() != request.id.into_core()
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob stream read open",
+            ));
+        }
+        let lifetime =
+            completed_pack_lifetime(&self.custody_clock, &publication, "blob stream read open")?;
+        let reader = self
+            .store
+            .open_blob_stream_read_session_with_policy(&policy, &publication, &open, &commitment)
+            .map_err(|error| application_error("blob stream read open", error.into()))?;
+        let decryptor = self
+            .verifier
+            .begin_blob_stream_decrypt(&open)
+            .map_err(|error| application_error("blob stream read open", error.into()))?;
+        let token = *publication.stream_id().as_bytes();
+        let publication_open = publication.open();
+        let metadata = BlobReadStreamMetadata {
+            id: BlobId::from_core(publication.blob_id()),
+            publisher: publication_open.publisher(),
+            publisher_counter: publication_open.publisher_counter(),
+            topic: publication_open.topic().clone(),
+            scope: publication_open.scope().clone(),
+            priority: publication_open.priority(),
+            ttl_ms: publication_open.ttl_ms(),
+            total_len: publication_open.total_len(),
+            media_type: publication_open.metadata().media_type().map(str::to_owned),
+            schema_id: publication_open.metadata().schema_id().to_vec(),
+            acceptance_marker: publication.acceptance_marker(),
+        };
+        self.read_streams.insert(
+            token,
+            LocalBlobReadStream {
+                publication,
+                reader,
+                decryptor: Some(decryptor),
+                commitment,
+                buffered: Zeroizing::new(Vec::new()),
+                buffered_offset: 0,
+                emitted_offset: 0,
+                validated_offset: 0,
+                last_validation_at: Instant::now(),
+                lifetime,
+            },
+        );
+        Ok(OpenedBlobReadStream { token, metadata })
+    }
+
+    fn next_read_stream_inner(
+        &mut self,
+        token: [u8; 32],
+        max_bytes: usize,
+    ) -> Result<Option<BlobReadFrame>, ApplicationError> {
+        if max_bytes == 0 || max_bytes > MAX_SELECTED_BLOB_PAGE_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob stream read",
+            ));
+        }
+        {
+            let stream = self.read_streams.get_mut(&token).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream read")
+            })?;
+            require_completed_pack_lifetime(
+                &self.custody_clock,
+                stream.publication.open().ttl_ms(),
+                &mut stream.lifetime,
+                "blob stream read",
+            )?;
+        }
+        let requires_validation = {
+            let stream = self.read_streams.get(&token).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream read")
+            })?;
+            stream.emitted_offset - stream.validated_offset >= 16 * 1024 * 1024
+                || stream.last_validation_at.elapsed() >= DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL
+        };
+        if requires_validation {
+            self.require_blob_stream_read_current(token)?;
+        }
+
+        let eof = {
+            let stream = self.read_streams.get_mut(&token).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream read")
+            })?;
+            if stream.buffered_offset == stream.buffered.len() {
+                stream.buffered.clear();
+                stream.buffered_offset = 0;
+                match stream
+                    .reader
+                    .next_encrypted_segment()
+                    .map_err(|error| application_error("blob stream read", error.into()))?
+                {
+                    Some(encoded) => {
+                        let segment = EncryptedBlobStreamSegment::decode(&encoded)
+                            .map_err(|error| blob_core_error("blob stream read", error))?;
+                        stream.buffered = stream
+                            .decryptor
+                            .as_mut()
+                            .ok_or_else(|| {
+                                ApplicationError::new(
+                                    ApplicationErrorKind::Integrity,
+                                    "blob stream read",
+                                )
+                            })?
+                            .decrypt_segment(&segment)
+                            .map_err(|error| blob_core_error("blob stream read", error))?;
+                        false
+                    }
+                    None => true,
+                }
+            } else {
+                false
+            }
+        };
+        if eof {
+            self.require_blob_stream_read_current(token)?;
+            let mut stream = self.read_streams.remove(&token).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream read")
+            })?;
+            stream
+                .decryptor
+                .take()
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
+                })?
+                .finish(&stream.commitment)
+                .map_err(|error| blob_core_error("blob stream read", error))?;
+            return Ok(None);
+        }
+        let stream = self
+            .read_streams
+            .get_mut(&token)
+            .expect("read stream exists");
+        // Reading/decrypting a segment may itself cross the finite lifetime.
+        // Check again before copying any plaintext into the response frame.
+        require_completed_pack_lifetime(
+            &self.custody_clock,
+            stream.publication.open().ttl_ms(),
+            &mut stream.lifetime,
+            "blob stream read",
+        )?;
+        let available = stream.buffered.len() - stream.buffered_offset;
+        let length = available.min(max_bytes);
+        let start = stream.buffered_offset;
+        let end = start + length;
+        let frame = BlobReadFrame {
+            offset: stream.emitted_offset,
+            bytes: Zeroizing::new(stream.buffered[start..end].to_vec()),
+        };
+        stream.buffered_offset = end;
+        stream.emitted_offset = stream
+            .emitted_offset
+            .checked_add(length as u64)
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
+            })?;
+        Ok(Some(frame))
+    }
+
+    fn require_blob_stream_read_current(
+        &mut self,
+        token: [u8; 32],
+    ) -> Result<(), ApplicationError> {
+        let expected = self
+            .read_streams
+            .get(&token)
+            .map(|stream| stream.publication.clone())
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream read")
+            })?;
+        let policy = self.current_policy("blob stream read")?;
+        let epoch = self.active_epoch(expected.open().scope(), "blob stream read")?;
+        self.require_blob_grants(
+            expected.open().topic(),
+            expected.open().scope(),
+            epoch,
+            "blob stream read",
+        )?;
+        self.store
+            .require_blob_stream_publication_with_policy(&policy, &expected)
+            .map_err(|error| application_error("blob stream read", error.into()))?;
+        let stream = self
+            .read_streams
+            .get_mut(&token)
+            .expect("read stream exists");
+        stream.validated_offset = stream.emitted_offset;
+        stream.last_validation_at = Instant::now();
+        Ok(())
     }
 
     /// Streams, encrypts, and durably publishes one immutable Blob.
@@ -1770,7 +2640,8 @@ impl SelectedBlobNode {
                 "blob publish",
             ));
         }
-        if metadata.len() > MAX_SELECTED_LIVE_BLOB_BYTES {
+        let (max_live_bytes, _) = configured_live_blob_limits(&self.store);
+        if metadata.len() > max_live_bytes {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
                 "blob publish",
@@ -1789,7 +2660,7 @@ impl SelectedBlobNode {
         let mut source = AdmittedFile {
             file: &mut source,
             admission,
-            max_len: MAX_SELECTED_LIVE_BLOB_BYTES,
+            max_len: max_live_bytes,
             #[cfg(test)]
             pass_two_gate: self.live_publish_pass_two_gate.take(),
             #[cfg(test)]
@@ -1966,9 +2837,9 @@ impl SelectedBlobNode {
             )
             .into());
         }
+        let (max_live_bytes, max_live_chunks) = configured_live_blob_limits(&self.store);
         if live.is_some()
-            && (prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
-                || prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS)
+            && (prepared.total_len() > max_live_bytes || prepared.chunk_count() > max_live_chunks)
         {
             return Err(
                 ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob publish").into(),
@@ -2947,7 +3818,9 @@ impl SelectedBlobNode {
                 ApplicationError::new(ApplicationErrorKind::StateUnavailable, "blob read")
             })?;
             peak_working_buffer_bytes = peak_working_buffer_bytes.max(page.len());
-            verified_chunks = verified_chunks.checked_add(1).ok_or_else(|| {
+            let page_chunks = u64::try_from(page.len().div_ceil(SELECTED_BLOB_CHUNK_SIZE as usize))
+                .map_err(|_| ApplicationError::new(ApplicationErrorKind::Integrity, "blob read"))?;
+            verified_chunks = verified_chunks.checked_add(page_chunks).ok_or_else(|| {
                 ApplicationError::new(ApplicationErrorKind::Integrity, "blob read")
             })?;
             offset = page.next_offset();
@@ -3132,7 +4005,7 @@ impl SelectedBlobNode {
         let range_chunk_count = last_chunk
             .checked_sub(first_chunk)
             .and_then(|span| span.checked_add(1))
-            .filter(|count| (1..=2).contains(count))
+            .filter(|count| (1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(count))
             .ok_or_else(|| {
                 ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
             })?;
@@ -3164,7 +4037,7 @@ impl SelectedBlobNode {
                 .map_err(|error| blob_core_error("blob read page", error))?;
             if stats.plaintext_bytes != page_len as u64
                 || stats.verified_chunks != range_chunk_count
-                || !(1..=2).contains(&stats.verified_chunks)
+                || !(1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(&stats.verified_chunks)
             {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
@@ -3441,8 +4314,9 @@ impl SelectedBlobNode {
             ));
         }
         Self::require_blob_plan_claims_for(plan, &stored, "blob read page")?;
-        if stored.blob.manifest().total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
-            || stored.blob.manifest().chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS
+        let (max_live_bytes, max_live_chunks) = configured_live_blob_limits(&self.store);
+        if stored.blob.manifest().total_len() > max_live_bytes
+            || stored.blob.manifest().chunk_count() > max_live_chunks
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
@@ -3835,9 +4709,10 @@ impl SelectedBlobNode {
             || stored.blob_id != prepared.id()
             || prepared.total_len() == 0
             || prepared.chunk_count() == 0
-            || (live_bounded
-                && (prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS
-                    || prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES))
+            || (live_bounded && {
+                let (max_live_bytes, max_live_chunks) = configured_live_blob_limits(&self.store);
+                prepared.chunk_count() > max_live_chunks || prepared.total_len() > max_live_bytes
+            })
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
@@ -3939,6 +4814,101 @@ impl SelectedBlobNode {
     }
 }
 
+fn completed_pack_lifetime(
+    clock: &NodeCustodyClock,
+    publication: &BlobStreamPublication,
+    operation: &'static str,
+) -> Result<Option<CustodyAge>, ApplicationError> {
+    let mut lifetime = match (
+        publication.open().ttl_ms(),
+        publication.open().initial_custody(),
+        publication.commitment().final_custody(),
+    ) {
+        (None, None, None) => None,
+        (Some(_), Some(initial), Some(final_sample))
+            if initial.clock_id == final_sample.clock_id
+                && initial.tick_ms <= final_sample.tick_ms =>
+        {
+            Some(CustodyAge::new(
+                final_sample.tick_ms - initial.tick_ms,
+                final_sample,
+            ))
+        }
+        _ => {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                operation,
+            ));
+        }
+    };
+    require_completed_pack_lifetime(clock, publication.open().ttl_ms(), &mut lifetime, operation)?;
+    Ok(lifetime)
+}
+
+fn require_completed_pack_lifetime(
+    clock: &NodeCustodyClock,
+    ttl_ms: Option<u64>,
+    lifetime: &mut Option<CustodyAge>,
+    operation: &'static str,
+) -> Result<(), ApplicationError> {
+    let (ttl_ms, lifetime) = match (ttl_ms, lifetime) {
+        (None, None) => return Ok(()),
+        (Some(ttl_ms), Some(lifetime)) => (ttl_ms, lifetime),
+        _ => {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                operation,
+            ));
+        }
+    };
+    // Completed packs currently carry only publisher-signed clock anchors.
+    // They can be read locally while that exact continuity domain is usable;
+    // remote finite custody requires the separate retained custody-v2 path.
+    let current = clock
+        .supports_finite_ttl()
+        .then(|| clock.sample().ok())
+        .flatten();
+    match lifetime.effective_age(current) {
+        Ok(age_ms) if age_ms < ttl_ms => Ok(()),
+        _ => Err(ApplicationError::new(
+            ApplicationErrorKind::ExpiredOrRetired,
+            operation,
+        )),
+    }
+}
+
+fn completed_blob_stream_result(
+    completed: &BlobStreamPublication,
+    request: &BlobPublishStreamRequest,
+) -> Result<BlobPublishResult, ApplicationError> {
+    let open = completed.open();
+    if open.topic() != &request.publication.topic
+        || open.scope() != &request.publication.scope
+        || open.priority() != request.publication.priority
+        || open.ttl_ms() != request.options.ttl_ms()
+        || open.total_len() != request.total_len
+        || open.metadata().media_type() != request.publication.media_type.as_deref()
+        || open.metadata().schema_id() != request.publication.schema_id
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::Conflict,
+            "blob stream open",
+        ));
+    }
+    Ok(BlobPublishResult {
+        id: BlobId::from_core(completed.blob_id()),
+        publisher: open.publisher(),
+        publisher_counter: open.publisher_counter(),
+        priority: open.priority(),
+        ttl_ms: open.ttl_ms(),
+        total_len: open.total_len(),
+        media_type: open.metadata().media_type().map(str::to_owned),
+        schema_id: open.metadata().schema_id().to_vec(),
+        acceptance_marker: completed.acceptance_marker(),
+        inserted: false,
+    })
+}
+
 fn blob_publish_result(blob: &VerifiedStoredBlob, inserted: bool) -> BlobPublishResult {
     let metadata = blob.blob.manifest().metadata();
     BlobPublishResult {
@@ -4011,6 +4981,40 @@ fn validate_live_publish_request(request: &BlobPublishRequest) -> Result<(), App
         ));
     }
     Ok(())
+}
+
+fn derive_local_stream_id(publisher: NodeId, operation: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aster/local-blob-stream/id/v1");
+    digest.update(publisher);
+    digest.update(
+        u64::try_from(operation.len())
+            .expect("bounded Blob operation length")
+            .to_be_bytes(),
+    );
+    digest.update(operation);
+    let mut output: [u8; 32] = digest.finalize().into();
+    if output == [0; 32] {
+        output[31] = 1;
+    }
+    output
+}
+
+fn derive_local_stream_salt(publisher: NodeId, operation: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aster/local-blob-stream/salt/v1");
+    digest.update(publisher);
+    digest.update(
+        u64::try_from(operation.len())
+            .expect("bounded Blob operation length")
+            .to_be_bytes(),
+    );
+    digest.update(operation);
+    let mut output: [u8; 32] = digest.finalize().into();
+    if output == [0; 32] {
+        output[31] = 1;
+    }
+    output
 }
 
 fn live_blob_read_cancelled(
@@ -4416,7 +5420,7 @@ mod tests {
         let root = TestRoot::new("finite-read-page-boundary");
         let mut node = selected_node(&root);
         node.custody_clock = NodeCustodyClock::injected([0xd2; 16], 100, 1);
-        let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 11);
+        let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 11);
         let published = node
             .publish_with_options(
                 request(b"blob/finite-read-page-boundary"),
@@ -4436,7 +5440,7 @@ mod tests {
             )
             .expect_err("later page must not open at the exact TTL boundary");
         assert_eq!(error.kind(), ApplicationErrorKind::ExpiredOrRetired);
-        assert_eq!(output.len(), SELECTED_BLOB_CHUNK_SIZE as usize);
+        assert_eq!(output.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
     }
 
     #[test]
@@ -5023,6 +6027,1062 @@ mod tests {
         (0..length).map(|index| (index % 251) as u8).collect()
     }
 
+    #[test]
+    fn live_blob_worker_reports_only_successful_new_publication_edges() {
+        let root = TestRoot::new("live-blob-publication-edges");
+        let mut node = selected_node(&root);
+        let source_path = root.path().join("source.bin");
+        let bytes = b"bounded publication wake";
+        fs::write(&source_path, bytes).unwrap();
+        let admission = AtomicBool::new(true);
+        let publication = request(b"wake/retained");
+        let mut published = None;
+        for expected_inserted in [true, false] {
+            let (response, received) = oneshot::channel();
+            assert_eq!(
+                node.execute_live(
+                    SelectedBlobCommand::Publish {
+                        request: publication.clone(),
+                        options: BlobPublishOptions::durable(),
+                        source: fs::File::open(&source_path).unwrap(),
+                        response,
+                    },
+                    &admission
+                )
+                .unwrap(),
+                expected_inserted
+            );
+            let result = received.blocking_recv().unwrap().unwrap();
+            assert_eq!(result.inserted, expected_inserted);
+            published = Some(result);
+        }
+        let (response, received) = oneshot::channel();
+        assert!(
+            !node
+                .execute_live(
+                    SelectedBlobCommand::ReadPage {
+                        request: BlobReadPageRequest {
+                            blob: BlobReadRequest {
+                                id: published.unwrap().id,
+                                topic: blob_topic(),
+                                scope: blob_scope()
+                            },
+                            offset: 0,
+                            max_bytes: 1,
+                        },
+                        response,
+                    },
+                    &admission
+                )
+                .unwrap()
+        );
+        received.blocking_recv().unwrap().unwrap();
+        fs::write(&source_path, b"different source bytes").unwrap();
+        let (response, received) = oneshot::channel();
+        assert!(
+            !node
+                .execute_live(
+                    SelectedBlobCommand::Publish {
+                        request: publication,
+                        options: BlobPublishOptions::durable(),
+                        source: fs::File::open(&source_path).unwrap(),
+                        response,
+                    },
+                    &admission
+                )
+                .unwrap()
+        );
+        assert!(received.blocking_recv().unwrap().is_err());
+
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"wake/stream"),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let opened = node
+            .open_publish_stream_inner(stream_request.clone())
+            .unwrap();
+        let (response, received) = oneshot::channel();
+        assert!(
+            !node
+                .execute_live(
+                    SelectedBlobCommand::AppendPublishStream {
+                        token: opened.token,
+                        offset: 0,
+                        bytes: Zeroizing::new(bytes.to_vec()),
+                        response,
+                    },
+                    &admission
+                )
+                .unwrap()
+        );
+        received.blocking_recv().unwrap().unwrap();
+        let (response, received) = oneshot::channel();
+        assert!(
+            node.execute_live(
+                SelectedBlobCommand::FinishPublishStream {
+                    token: opened.token,
+                    response,
+                },
+                &admission
+            )
+            .unwrap()
+        );
+        assert!(received.blocking_recv().unwrap().unwrap().inserted);
+        let replay = node
+            .open_publish_stream_inner(stream_request.clone())
+            .unwrap();
+        let (response, received) = oneshot::channel();
+        assert!(
+            !node
+                .execute_live(
+                    SelectedBlobCommand::FinishPublishStream {
+                        token: replay.token,
+                        response,
+                    },
+                    &admission
+                )
+                .unwrap()
+        );
+        assert!(!received.blocking_recv().unwrap().unwrap().inserted);
+        let mut incomplete_request = stream_request;
+        incomplete_request.publication.operation_key = b"wake/incomplete".to_vec();
+        let incomplete = node.open_publish_stream_inner(incomplete_request).unwrap();
+        let (response, received) = oneshot::channel();
+        assert!(
+            !node
+                .execute_live(
+                    SelectedBlobCommand::FinishPublishStream {
+                        token: incomplete.token,
+                        response,
+                    },
+                    &admission
+                )
+                .unwrap()
+        );
+        assert!(received.blocking_recv().unwrap().is_err());
+        assert!(
+            !node
+                .execute_live(
+                    SelectedBlobCommand::ClosePublishStream {
+                        token: incomplete.token,
+                    },
+                    &admission
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn selected_blob_publish_stream_is_single_pass_and_promotes_at_finish() {
+        let root = TestRoot::new("selected-blob-publish-stream");
+        let mut node = selected_node(&root);
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 7);
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: request(b"blob/stream/single-pass"),
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .expect("open stream");
+        assert_eq!(opened.progress.durable_offset, 0);
+        let first = node
+            .append_publish_stream_inner(
+                opened.token,
+                0,
+                Zeroizing::new(bytes[..BLOB_STREAM_SEGMENT_BYTES].to_vec()),
+            )
+            .expect("first segment");
+        assert_eq!(first.accepted_offset, BLOB_STREAM_SEGMENT_BYTES as u64);
+        assert!(first.durable_offset <= first.accepted_offset);
+        let second = node
+            .append_publish_stream_inner(
+                opened.token,
+                BLOB_STREAM_SEGMENT_BYTES as u64,
+                Zeroizing::new(bytes[BLOB_STREAM_SEGMENT_BYTES..].to_vec()),
+            )
+            .expect("final segment");
+        assert_eq!(second.accepted_offset, bytes.len() as u64);
+        assert!(second.durable_offset >= first.durable_offset);
+        assert!(second.durable_offset <= second.accepted_offset);
+        let result = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish stream");
+        assert_eq!(result.total_len, bytes.len() as u64);
+        assert_eq!(result.publisher, node.identity());
+        assert!(result.inserted);
+        assert_eq!(
+            node.store
+                .blob_stats()
+                .expect("stream publication stats")
+                .publications,
+            1
+        );
+    }
+
+    #[test]
+    fn selected_blob_stream_promotions_advance_the_shared_causal_counter() {
+        let root = TestRoot::new("selected-blob-stream-causal-counter");
+        let mut node = selected_node(&root);
+        let mut counters = Vec::new();
+        for operation in [b"blob/stream/causal-1".as_slice(), b"blob/stream/causal-2"] {
+            let opened = node
+                .open_publish_stream_inner(BlobPublishStreamRequest {
+                    publication: request(operation),
+                    options: BlobPublishOptions::durable(),
+                    total_len: 1,
+                })
+                .expect("open stream");
+            node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x5a]))
+                .expect("append stream");
+            counters.push(
+                node.finish_publish_stream_inner(opened.token)
+                    .expect("finish stream")
+                    .publisher_counter,
+            );
+        }
+        assert_eq!(counters, [1, 2]);
+        assert_eq!(
+            node.store
+                .blob_stats()
+                .expect("stream publication stats")
+                .publications,
+            2
+        );
+    }
+
+    #[test]
+    fn selected_blob_publish_stream_exact_completed_retry_returns_original_result() {
+        let root = TestRoot::new("selected-blob-stream-completed-retry");
+        let mut node = selected_node(&root);
+        let publication = request(b"blob/stream/completed-retry");
+        let stream_request = BlobPublishStreamRequest {
+            publication: publication.clone(),
+            options: BlobPublishOptions::durable(),
+            total_len: 1,
+        };
+        let opened = node
+            .open_publish_stream_inner(stream_request.clone())
+            .expect("open initial stream");
+        node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x6a]))
+            .expect("append initial stream");
+        let first = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish initial stream");
+        assert_ne!(first.acceptance_marker, 0);
+        drop(node);
+
+        let mut node = selected_node(&root);
+
+        let replay = node
+            .open_publish_stream_inner(stream_request)
+            .expect("open completed retry");
+        assert_eq!(replay.progress.accepted_offset, 1);
+        assert_eq!(replay.progress.durable_offset, 1);
+        let replayed = node
+            .finish_publish_stream_inner(replay.token)
+            .expect("finish completed retry");
+
+        assert_eq!(
+            replayed,
+            BlobPublishResult {
+                inserted: false,
+                ..first
+            }
+        );
+        let policy = node.current_policy("completed retry counter").unwrap();
+        assert_eq!(
+            node.store
+                .reserve_local_blob_with_policy(
+                    &policy,
+                    node.identity(),
+                    &publication.topic,
+                    &publication.scope,
+                    None,
+                    None,
+                )
+                .expect("next causal reservation")
+                .counter(),
+            2
+        );
+    }
+
+    #[test]
+    fn selected_blob_publish_stream_checkpoints_at_the_time_bound() {
+        let root = TestRoot::new("selected-blob-publish-stream-time-checkpoint");
+        let mut node = selected_node(&root);
+        let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES as u64;
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: request(b"blob/stream/time-checkpoint"),
+                options: BlobPublishOptions::durable(),
+                total_len,
+            })
+            .expect("open stream");
+        node.publish_streams
+            .get_mut(&opened.token)
+            .expect("active stream")
+            .last_checkpoint_at = Instant::now()
+            .checked_sub(Duration::from_millis(251))
+            .expect("test instant");
+
+        let progress = node
+            .append_publish_stream_inner(
+                opened.token,
+                0,
+                Zeroizing::new(vec![0x51; BLOB_STREAM_SEGMENT_BYTES]),
+            )
+            .expect("append timed segment");
+        assert_eq!(progress.accepted_offset, BLOB_STREAM_SEGMENT_BYTES as u64);
+        assert_eq!(progress.durable_offset, BLOB_STREAM_SEGMENT_BYTES as u64);
+    }
+
+    #[test]
+    fn selected_blob_read_stream_authenticates_pack_and_frames_independently() {
+        let root = TestRoot::new("selected-blob-read-stream");
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 7);
+        let mut node = selected_node(&root);
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: request(b"blob/stream/read"),
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .expect("open publish stream");
+        node.append_publish_stream_inner(
+            opened.token,
+            0,
+            Zeroizing::new(bytes[..BLOB_STREAM_SEGMENT_BYTES].to_vec()),
+        )
+        .expect("append first segment");
+        node.append_publish_stream_inner(
+            opened.token,
+            BLOB_STREAM_SEGMENT_BYTES as u64,
+            Zeroizing::new(bytes[BLOB_STREAM_SEGMENT_BYTES..].to_vec()),
+        )
+        .expect("append tail");
+        let published = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish publish stream");
+        drop(node);
+
+        let mut node = selected_node(&root);
+        let read = node
+            .open_read_stream_inner(BlobReadRequest {
+                id: published.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .expect("open read stream");
+        let mut actual = Vec::new();
+        while let Some(frame) = node
+            .next_read_stream_inner(read.token, 64 * 1024)
+            .expect("read frame")
+        {
+            assert_eq!(frame.offset, actual.len() as u64);
+            assert!(frame.bytes.len() <= 64 * 1024);
+            actual.extend_from_slice(&frame.bytes);
+        }
+        assert_eq!(actual, bytes);
+        assert!(!node.read_streams.contains_key(&read.token));
+    }
+
+    fn finite_completed_pack_fixture(
+        node: &mut SelectedBlobNode,
+    ) -> (BlobPublishStreamRequest, BlobPublishResult, Vec<u8>) {
+        node.custody_clock = NodeCustodyClock::injected([0xec; 16], 1_000, 0);
+        let bytes = payload(17);
+        let request = BlobPublishStreamRequest {
+            publication: request(b"blob/stream/finite-lifetime"),
+            options: BlobPublishOptions::finite_ttl_ms(100).expect("finite lifetime"),
+            total_len: bytes.len() as u64,
+        };
+        let opened = node
+            .open_publish_stream_inner(request.clone())
+            .expect("open finite stream");
+        node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(bytes.clone()))
+            .expect("append finite stream");
+        node.custody_clock.set_injected_tick(1_005).unwrap();
+        let result = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish finite stream");
+        (request, result, bytes)
+    }
+
+    #[test]
+    fn finite_completed_pack_reopen_read_and_retry_enforce_the_exact_expiry_boundary() {
+        let root = TestRoot::new("finite-completed-pack-expiry");
+        let mut node = selected_node(&root);
+        let (request, result, bytes) = finite_completed_pack_fixture(&mut node);
+        drop(node);
+
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xec; 16], 1_050, 0);
+        let read_request = BlobReadRequest {
+            id: result.id,
+            topic: blob_topic(),
+            scope: blob_scope(),
+        };
+        let read = node
+            .open_read_stream_inner(read_request.clone())
+            .expect("same-clock reopened pack remains live");
+        let first = node.next_read_stream_inner(read.token, 8).unwrap().unwrap();
+        assert_eq!(first.offset, 0);
+        assert_eq!(*first.bytes, bytes[..8]);
+        let retry = node.open_publish_stream_inner(request.clone()).unwrap();
+        let replayed = node.finish_publish_stream_inner(retry.token).unwrap();
+        assert!(!replayed.inserted);
+        assert_eq!(replayed.acceptance_marker, result.acceptance_marker);
+
+        node.custody_clock.set_injected_tick(1_099).unwrap();
+        let second = node.next_read_stream_inner(read.token, 8).unwrap().unwrap();
+        assert_eq!(second.offset, 8);
+        assert_eq!(*second.bytes, bytes[8..16]);
+        let retry = node.open_publish_stream_inner(request.clone()).unwrap();
+        node.custody_clock.set_injected_tick(1_100).unwrap();
+        assert_eq!(
+            node.next_read_stream_inner(read.token, 8)
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(node.read_streams[&read.token].emitted_offset, 16);
+        assert_eq!(
+            node.finish_publish_stream_inner(retry.token)
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(
+            node.open_publish_stream_inner(request)
+                .err()
+                .expect("expired retry is rejected")
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        node.read_streams.remove(&read.token);
+        assert_eq!(
+            node.open_read_stream_inner(read_request)
+                .err()
+                .expect("expired read is rejected")
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(
+            node.open_read_stream_inner(BlobReadRequest {
+                id: BlobId::from_bytes([0xee; 32]),
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .err()
+            .expect("unobserved content is missing")
+            .kind(),
+            ApplicationErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn finite_completed_pack_reopen_fails_closed_without_clock_continuity() {
+        let root = TestRoot::new("finite-completed-pack-clock");
+        let mut node = selected_node(&root);
+        let (request, result, _) = finite_completed_pack_fixture(&mut node);
+        let identity = node.identity();
+        drop(node);
+
+        for clock in [
+            NodeCustodyClock::injected([0xed; 16], 1_050, 0),
+            NodeCustodyClock::injected([0xec; 16], 1_004, 0),
+            NodeCustodyClock::open_from_linux_boot_id(identity, None).unwrap(),
+        ] {
+            let mut node = selected_node(&root);
+            node.custody_clock = clock;
+            assert_eq!(
+                node.open_read_stream_inner(BlobReadRequest {
+                    id: result.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                })
+                .err()
+                .expect("unusable continuity cannot expose a finite pack")
+                .kind(),
+                ApplicationErrorKind::ExpiredOrRetired
+            );
+            assert_eq!(
+                node.open_publish_stream_inner(request.clone())
+                    .err()
+                    .expect("unusable continuity cannot replay finite success")
+                    .kind(),
+                ApplicationErrorKind::ExpiredOrRetired
+            );
+        }
+    }
+
+    #[test]
+    fn finite_completed_pack_read_clock_rollback_is_sticky_within_the_handle() {
+        let root = TestRoot::new("finite-completed-pack-read-rollback");
+        let mut node = selected_node(&root);
+        let (request, result, _) = finite_completed_pack_fixture(&mut node);
+        node.custody_clock.set_injected_tick(1_050).unwrap();
+        let read = node
+            .open_read_stream_inner(BlobReadRequest {
+                id: result.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .unwrap();
+        node.custody_clock.set_injected_tick(1_060).unwrap();
+        assert!(
+            node.next_read_stream_inner(read.token, 1)
+                .unwrap()
+                .is_some()
+        );
+        let retry = node.open_publish_stream_inner(request).unwrap();
+        node.custody_clock.set_injected_tick(1_059).unwrap();
+        assert_eq!(
+            node.next_read_stream_inner(read.token, 1)
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(
+            node.finish_publish_stream_inner(retry.token)
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        node.custody_clock.set_injected_tick(1_070).unwrap();
+        assert_eq!(
+            node.next_read_stream_inner(read.token, 1)
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(node.read_streams[&read.token].emitted_offset, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_blob_handle_streams_through_the_joined_worker() {
+        let root = TestRoot::new("live-blob-publish-stream");
+        let mut node = selected_node(&root);
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(2);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("live Blob stream test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute live Blob stream command");
+            }
+        });
+
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 7);
+        let mut stream = handle
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: request(b"blob/live-stream/single-pass"),
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .await
+            .expect("open live Blob stream");
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let end = (offset + 64 * 1024).min(bytes.len());
+            let progress = stream
+                .write(offset as u64, Zeroizing::new(bytes[offset..end].to_vec()))
+                .await
+                .expect("write live frame");
+            assert_eq!(progress.accepted_offset, end as u64);
+            offset = end;
+        }
+        let published = stream.finish().await.expect("finish live Blob stream");
+        assert_eq!(published.total_len, bytes.len() as u64);
+        assert_eq!(published.publisher, identity);
+        assert!(published.inserted);
+
+        let mut reader = handle
+            .open_read_stream(BlobReadRequest {
+                id: published.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .await
+            .expect("open live Blob read stream");
+        let mut read = Vec::new();
+        while let Some(frame) = reader.next(128 * 1024).await.expect("read live frame") {
+            assert_eq!(frame.offset, read.len() as u64);
+            read.extend_from_slice(&frame.bytes);
+        }
+        assert_eq!(read, bytes);
+
+        drop(reader);
+        drop(handle);
+        worker.await.expect("join live Blob stream worker");
+    }
+
+    async fn cancelled_live_publish_stream_open_case(reply_queued: bool) {
+        let root = TestRoot::new(if reply_queued {
+            "live-blob-open-queued-reply-cancelled"
+        } else {
+            "live-blob-open-cancelled-before-reply"
+        });
+        let mut node = selected_node(&root);
+        let admission = Arc::new(AtomicBool::new(true));
+        let (commands, mut received) = mpsc::channel(1);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            Arc::clone(&admission),
+            node.identity(),
+            node.mission_authority(),
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/live-stream/cancelled-open"),
+            options: BlobPublishOptions::durable(),
+            total_len: 1,
+        };
+        let mut opening = Box::pin(handle.open_publish_stream(stream_request.clone()));
+        let command = tokio::select! {
+            result = &mut opening => panic!("open completed before actor reply: {}", result.is_ok()),
+            command = received.recv() => command.expect("queued open command"),
+        };
+        let SelectedApplicationCommand::Blob(command) = command else {
+            panic!("unexpected application class");
+        };
+        // Exercise cleanup with a full application command lane. In particular,
+        // a failed actor reply must retire inline rather than enqueue to itself.
+        assert!(
+            handle
+                .commands
+                .try_send(SelectedApplicationCommand::Blob(
+                    SelectedBlobCommand::CloseReadStream { token: [0x11; 32] },
+                ))
+                .is_ok(),
+            "fill application lane"
+        );
+        if reply_queued {
+            node.execute_live(command, &admission)
+                .expect("queue successful open reply");
+            assert_eq!(node.publish_streams.len(), 1);
+            drop(opening);
+            _ = received.recv().await.expect("lane filler");
+            let close = tokio::time::timeout(Duration::from_secs(1), received.recv())
+                .await
+                .expect("cancelled queued reply must close its stream")
+                .expect("close command");
+            let SelectedApplicationCommand::Blob(close) = close else {
+                panic!("unexpected cleanup class");
+            };
+            assert!(matches!(
+                close,
+                SelectedBlobCommand::ClosePublishStream { .. }
+            ));
+            node.execute_live(close, &admission)
+                .expect("retire queued-reply stream");
+        } else {
+            drop(opening);
+            node.execute_live(command, &admission)
+                .expect("execute cancelled open");
+            assert!(
+                node.publish_streams.is_empty(),
+                "failed reply must retire inline"
+            );
+            _ = received.recv().await.expect("lane filler");
+        }
+        assert!(node.publish_streams.is_empty());
+        assert!(node.completed_publish_streams.is_empty());
+
+        let worker_admission = Arc::clone(&admission);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("unexpected retry command class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute retry command");
+            }
+            assert!(node.publish_streams.is_empty());
+            assert!(node.completed_publish_streams.is_empty());
+        });
+        let mut retried = handle
+            .open_publish_stream(stream_request.clone())
+            .await
+            .expect("cancelled open must release singleton admission");
+        assert_eq!(retried.durable_offset(), 0);
+        retried
+            .write(0, Zeroizing::new(vec![0x61]))
+            .await
+            .expect("write retry");
+        let published = retried.finish().await.expect("finish retry");
+        assert!(published.inserted);
+        let completed = handle
+            .open_publish_stream(stream_request)
+            .await
+            .expect("open completed retry");
+        assert_eq!(completed.durable_offset(), 1);
+        let replayed = completed.finish().await.expect("settle completed retry");
+        assert!(!replayed.inserted);
+        assert_eq!(replayed.id, published.id);
+        assert_eq!(replayed.acceptance_marker, published.acceptance_marker);
+        drop(handle);
+        worker.await.expect("join cancelled-open retry worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_publish_stream_open_before_actor_reply_releases_admission() {
+        cancelled_live_publish_stream_open_case(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_publish_stream_open_with_queued_reply_releases_admission() {
+        cancelled_live_publish_stream_open_case(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_publish_stream_duplicate_open_preserves_the_first_owner() {
+        let root = TestRoot::new("live-blob-completed-stream-exclusive-owner");
+        let mut node = selected_node(&root);
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/live-stream/completed-exclusive-owner"),
+            options: BlobPublishOptions::durable(),
+            total_len: 1,
+        };
+        let opened = node
+            .open_publish_stream_inner(stream_request.clone())
+            .expect("open original publication");
+        node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x61]))
+            .expect("write original publication");
+        let published = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish original publication");
+        assert!(published.inserted);
+
+        let admission = Arc::new(AtomicBool::new(true));
+        let (commands, mut received) = mpsc::channel(1);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            Arc::clone(&admission),
+            node.identity(),
+            node.mission_authority(),
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
+        let (response, first_reply) = oneshot::channel();
+        node.execute_live(
+            SelectedBlobCommand::OpenPublishStream {
+                request: stream_request.clone(),
+                commands: handle.commands.clone(),
+                response,
+            },
+            &admission,
+        )
+        .expect("open the first completed handle");
+        let first = first_reply
+            .await
+            .expect("first reply")
+            .expect("first handle");
+        assert_eq!(first.durable_offset(), 1);
+
+        // Cover a consumed rejection, cancellation before the actor replies,
+        // and cancellation after the reply was queued but before consumption.
+        for cancellation in [None, Some(false), Some(true)] {
+            let (response, duplicate_reply) = oneshot::channel();
+            let mut duplicate_reply = Some(duplicate_reply);
+            if cancellation == Some(false) {
+                drop(duplicate_reply.take());
+            }
+            node.execute_live(
+                SelectedBlobCommand::OpenPublishStream {
+                    request: stream_request.clone(),
+                    commands: handle.commands.clone(),
+                    response,
+                },
+                &admission,
+            )
+            .expect("execute duplicate open");
+            if cancellation.is_none() {
+                let result = duplicate_reply
+                    .take()
+                    .expect("reply receiver")
+                    .await
+                    .expect("duplicate reply");
+                assert!(
+                    matches!(result, Err(error) if error.kind() == ApplicationErrorKind::ResourceLimit)
+                );
+            }
+            drop(duplicate_reply);
+            assert_eq!(node.completed_publish_streams.len(), 1);
+            assert!(node.publish_streams.is_empty());
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        let worker_admission = Arc::clone(&admission);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("unexpected completed stream command class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute completed stream command");
+            }
+            assert!(node.completed_publish_streams.is_empty());
+            assert!(node.publish_streams.is_empty());
+        });
+        let first_result = first.finish().await.expect("first owner remains usable");
+        assert!(!first_result.inserted);
+        assert_eq!(first_result.id, published.id);
+        assert_eq!(first_result.acceptance_marker, published.acceptance_marker);
+        let sequential = handle
+            .open_publish_stream(stream_request)
+            .await
+            .expect("sequential completed retry");
+        let replayed = sequential.finish().await.expect("finish sequential retry");
+        assert!(!replayed.inserted);
+        assert_eq!(replayed.id, published.id);
+        assert_eq!(replayed.acceptance_marker, published.acceptance_marker);
+        drop(handle);
+        worker.await.expect("join completed stream worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_publish_stream_finish_reply_preserves_a_later_owner() {
+        for (name, already_completed, premature) in [
+            ("live-blob-finish-reply-published", false, false),
+            ("live-blob-finish-reply-completed", true, false),
+            ("live-blob-finish-reply-rejected", false, true),
+        ] {
+            let root = TestRoot::new(name);
+            let mut node = selected_node(&root);
+            let stream_request = BlobPublishStreamRequest {
+                publication: request(b"blob/live-stream/cancelled-finish-reply"),
+                options: BlobPublishOptions::durable(),
+                total_len: if premature { 2 } else { 1 },
+            };
+            let mut opened = node
+                .open_publish_stream_inner(stream_request.clone())
+                .expect("open original publication");
+            node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x61]))
+                .expect("write original publication");
+            if already_completed {
+                let published = node
+                    .finish_publish_stream_inner(opened.token)
+                    .expect("finish completed fixture");
+                assert!(published.inserted);
+                opened = node
+                    .open_publish_stream_inner(stream_request.clone())
+                    .expect("open completed fixture");
+            }
+            let admission = Arc::new(AtomicBool::new(true));
+            let (commands, mut received) = mpsc::channel(1);
+            let handle = SelectedBlobHandle::new(
+                commands,
+                Arc::clone(&admission),
+                node.identity(),
+                node.mission_authority(),
+                MAX_SELECTED_LIVE_BLOB_BYTES,
+            );
+            let first = SelectedBlobPublishStream::new(
+                handle.commands.clone(),
+                opened.token,
+                opened.progress,
+            );
+            let mut finishing = Box::pin(first.finish());
+            let command = tokio::select! {
+                result = &mut finishing => panic!("finish completed before actor reply: {result:?}"),
+                command = received.recv() => command.expect("queued finish command"),
+            };
+            let SelectedApplicationCommand::Blob(command) = command else {
+                panic!("unexpected finish command class");
+            };
+            node.execute_live(command, &admission)
+                .expect("queue finish reply");
+            assert!(node.publish_streams.is_empty());
+            assert!(node.completed_publish_streams.is_empty());
+
+            // The old finish reply remains unconsumed while the same operation
+            // gets a new owner. Cancelling it must not enqueue an old-token close.
+            let (response, next_reply) = oneshot::channel();
+            node.execute_live(
+                SelectedBlobCommand::OpenPublishStream {
+                    request: stream_request.clone(),
+                    commands: handle.commands.clone(),
+                    response,
+                },
+                &admission,
+            )
+            .expect("open later owner");
+            let mut next = next_reply
+                .await
+                .expect("later open reply")
+                .expect("later handle");
+            drop(finishing);
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                node.publish_streams.len() + node.completed_publish_streams.len(),
+                1
+            );
+
+            let worker_admission = Arc::clone(&admission);
+            let worker = tokio::task::spawn_blocking(move || {
+                while let Some(command) = received.blocking_recv() {
+                    let SelectedApplicationCommand::Blob(command) = command else {
+                        panic!("unexpected later-owner command class");
+                    };
+                    node.execute_live(command, &worker_admission)
+                        .expect("execute later-owner command");
+                }
+                assert!(node.publish_streams.is_empty());
+                assert!(node.completed_publish_streams.is_empty());
+            });
+            if premature {
+                assert_eq!(next.durable_offset(), 0);
+                next.write(0, Zeroizing::new(vec![0x61, 0x62]))
+                    .await
+                    .expect("write restarted publication");
+            }
+            let published = next.finish().await.expect("later owner remains usable");
+            assert_eq!(published.inserted, premature);
+            let sequential = handle
+                .open_publish_stream(stream_request)
+                .await
+                .expect("open sequential retry");
+            let replayed = sequential.finish().await.expect("finish sequential retry");
+            assert!(!replayed.inserted);
+            assert_eq!(replayed.id, published.id);
+            assert_eq!(replayed.acceptance_marker, published.acceptance_marker);
+            drop(handle);
+            worker.await.expect("join later-owner worker");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_live_publish_stream_reopens_at_its_durable_offset() {
+        let root = TestRoot::new("live-blob-publish-stream-resume-after-drop");
+        let mut node = selected_node(&root);
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(2);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("resume test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute resume command");
+            }
+        });
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/live-stream/resume-after-drop"),
+            options: BlobPublishOptions::durable(),
+            total_len: 2 * BLOB_STREAM_SEGMENT_BYTES as u64,
+        };
+        let mut expected_bytes = vec![0x61; BLOB_STREAM_SEGMENT_BYTES];
+        expected_bytes.extend(vec![0x62; BLOB_STREAM_SEGMENT_BYTES]);
+        let premature = handle
+            .open_publish_stream(stream_request.clone())
+            .await
+            .expect("open premature stream");
+        assert_eq!(
+            premature
+                .finish()
+                .await
+                .expect_err("reject premature finish")
+                .kind(),
+            ApplicationErrorKind::InvalidRequest
+        );
+        let mut interrupted = handle
+            .open_publish_stream(stream_request.clone())
+            .await
+            .expect("open interrupted stream");
+        tokio::time::sleep(DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL + Duration::from_millis(25))
+            .await;
+        interrupted
+            .write(0, Zeroizing::new(vec![0x61; BLOB_STREAM_SEGMENT_BYTES]))
+            .await
+            .expect("write checkpointed segment");
+        assert_eq!(
+            interrupted.durable_offset(),
+            BLOB_STREAM_SEGMENT_BYTES as u64
+        );
+        interrupted
+            .write(
+                BLOB_STREAM_SEGMENT_BYTES as u64,
+                Zeroizing::new(vec![0x62; 64 * 1024]),
+            )
+            .await
+            .expect("write uncheckpointed tail");
+        drop(interrupted);
+
+        let mut resumed = handle
+            .open_publish_stream(stream_request)
+            .await
+            .expect("reopen from durable authority");
+        let durable = resumed.durable_offset();
+        assert_eq!(durable, BLOB_STREAM_SEGMENT_BYTES as u64);
+        resumed
+            .write(
+                durable,
+                Zeroizing::new(vec![0x62; BLOB_STREAM_SEGMENT_BYTES]),
+            )
+            .await
+            .expect("replay tail from durable offset");
+        let published = resumed.finish().await.expect("finish resumed stream");
+        assert_eq!(published.total_len, 2 * BLOB_STREAM_SEGMENT_BYTES as u64);
+        assert_eq!(
+            published.id,
+            BlobId::from_bytes([
+                0x66, 0x76, 0xb9, 0xb5, 0xce, 0x4f, 0x1f, 0x3a, 0xc7, 0xbc, 0xd7, 0x82, 0x31, 0xbe,
+                0x44, 0x4d, 0xd8, 0x07, 0x3d, 0x8a, 0xf9, 0x95, 0x21, 0x82, 0x4e, 0x99, 0xf1, 0x79,
+                0xaa, 0xb6, 0x5b, 0x07,
+            ])
+        );
+
+        let mut reader = handle
+            .open_read_stream(BlobReadRequest {
+                id: published.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .await
+            .expect("open resumed Blob read stream");
+        let mut read_offset = 0_usize;
+        while let Some(frame) = reader.next(1024 * 1024).await.expect("read resumed Blob") {
+            assert_eq!(frame.offset, read_offset as u64);
+            let end = read_offset + frame.bytes.len();
+            assert_eq!(&*frame.bytes, &expected_bytes[read_offset..end]);
+            read_offset = end;
+        }
+        assert_eq!(read_offset, expected_bytes.len());
+
+        drop(reader);
+        drop(handle);
+        worker.await.expect("join resume worker");
+    }
+
     struct CountingCursor {
         inner: Cursor<Vec<u8>>,
         bytes_read: u64,
@@ -5456,7 +7516,13 @@ mod tests {
         let admission = Arc::new(AtomicBool::new(true));
         let worker_admission = Arc::clone(&admission);
         let (commands, mut received) = mpsc::channel(2);
-        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
@@ -5527,7 +7593,7 @@ mod tests {
     async fn live_blob_handle_publishes_and_reads_exact_finite_ttl() {
         let root = TestRoot::new("live-finite-publish");
         let source_path = root.path().join("finite-source.bin");
-        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 9);
+        let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 9);
         fs::write(&source_path, &bytes).expect("write finite live source");
         let mut node = selected_node(&root);
         node.custody_clock = NodeCustodyClock::injected([0xd4; 16], 1_000, 1);
@@ -5536,7 +7602,13 @@ mod tests {
         let admission = Arc::new(AtomicBool::new(true));
         let worker_admission = Arc::clone(&admission);
         let (commands, mut received) = mpsc::channel(2);
-        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
@@ -5658,17 +7730,17 @@ mod tests {
             .read_page(BlobReadPageRequest {
                 blob: blob.clone(),
                 offset,
-                max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+                max_bytes: SELECTED_BLOB_CHUNK_SIZE as usize,
             })
             .expect("read cross-chunk live page");
-        assert_eq!(page.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
+        assert_eq!(page.len(), SELECTED_BLOB_CHUNK_SIZE as usize);
         assert_eq!(
             page.as_bytes(),
             &bytes[offset as usize..page.next_offset() as usize]
         );
         assert_eq!(
             page.next_offset(),
-            offset + MAX_SELECTED_BLOB_PAGE_BYTES as u64
+            offset + u64::from(SELECTED_BLOB_CHUNK_SIZE)
         );
         assert!(!page.complete);
 
@@ -5677,7 +7749,7 @@ mod tests {
             .read_page(BlobReadPageRequest {
                 blob: blob.clone(),
                 offset: final_offset,
-                max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+                max_bytes: SELECTED_BLOB_CHUNK_SIZE as usize,
             })
             .expect("read final live page");
         assert_eq!(final_page.as_bytes(), &bytes[bytes.len() - 17..]);
@@ -5857,6 +7929,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             identity,
             mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
         );
 
         let mut oversized_operation = request(b"blob/handle-operation");
@@ -6692,8 +8765,9 @@ mod tests {
 
     #[test]
     fn blob_unrecoverable_depot_capacity_returns_without_retrying_source() {
-        // Break caught: eligible but unsatisfiable depot pressure must stop
-        // after one targeted attempt without an admission retry.
+        // Live file metadata rejects an impossible size before source I/O.
+        // Stopped publication discovers depot pressure while encrypting and
+        // must stop after one targeted recovery attempt without a retry.
         for live in [false, true] {
             let root = TestRoot::new(if live {
                 "live-capacity-gc-unsatisfied"
@@ -6721,9 +8795,8 @@ mod tests {
                     )
                     .expect_err("live tiny depot remains exhausted");
                 assert_eq!(
-                    node.last_live_publish_source_bytes_read,
-                    2 * u64::try_from(plaintext.len()).expect("source length"),
-                    "one failed attempt performs exactly prepare/encrypt",
+                    node.last_live_publish_source_bytes_read, 0,
+                    "metadata rejection must not read the live source",
                 );
                 error
             } else {
@@ -6742,9 +8815,22 @@ mod tests {
                 error
             };
             assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-            assert_eq!(node.capacity_gc_attempts, 1);
-            assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
-            assert_eq!(node.publish_attempts, 1);
+            if live {
+                assert_eq!(node.capacity_gc_attempts, 0);
+                assert!(node.capacity_gc_targets.is_empty());
+                assert_eq!(node.publish_attempts, 0);
+            } else {
+                assert_eq!(node.capacity_gc_attempts, 1);
+                assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
+                assert_eq!(node.publish_attempts, 1);
+            }
+            assert_eq!(
+                node.store
+                    .blob_stats()
+                    .expect("rejected publication stats")
+                    .publications,
+                0
+            );
         }
     }
 
@@ -7150,14 +9236,25 @@ mod tests {
 
     #[test]
     fn live_blob_file_requires_zero_cursor_and_growth_cannot_cross_ceiling() {
+        const LIVE_BYTE_CEILING: u64 = 1024;
         let root = TestRoot::new("live-file-boundary");
+        persist_member_mission(&root);
         let source_path = root.path().join("source.bin");
         fs::write(&source_path, [1u8, 2, 3]).expect("write live source");
         let mut source = fs::File::open(&source_path).expect("open live source");
         source
             .seek(std::io::SeekFrom::Start(1))
             .expect("pre-seek live source");
-        let mut node = selected_node(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(LIVE_BYTE_CEILING, 4, 1)
+                    .expect("bounded live depot limits"),
+            },
+        )
+        .expect("open bounded live Blob node");
+        let before = node.store.blob_stats().expect("pre-rejection stats");
         let error = node
             .publish_live(request(b"blob/live-preseek"), source)
             .expect_err("pre-seeked live file must fail");
@@ -7169,19 +9266,19 @@ mod tests {
             .open(&source_path)
             .expect("open growing source");
         source
-            .set_len(MAX_SELECTED_LIVE_BLOB_BYTES)
+            .set_len(LIVE_BYTE_CEILING)
             .expect("set bounded sparse length");
         let grower = source.try_clone().expect("clone growing source");
         grower
-            .set_len(MAX_SELECTED_LIVE_BLOB_BYTES + 1)
+            .set_len(LIVE_BYTE_CEILING + 1)
             .expect("grow sparse source past live ceiling");
         let admission = AtomicBool::new(true);
         let mut admitted = AdmittedFile {
             file: &mut source,
             admission: &admission,
-            max_len: MAX_SELECTED_LIVE_BLOB_BYTES,
+            max_len: LIVE_BYTE_CEILING,
             pass_two_gate: None,
-            expected_len: MAX_SELECTED_LIVE_BLOB_BYTES,
+            expected_len: LIVE_BYTE_CEILING,
             total_bytes_read: 0,
             fail_retry_rewind: false,
             start_zero_seeks: 0,
@@ -7197,6 +9294,14 @@ mod tests {
             .expect_err("oversized live file must fail with its public category");
         assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
         assert_eq!(error.operation(), "blob publish");
+        assert_eq!(node.last_live_publish_source_bytes_read, 0);
+        assert_eq!(node.publish_attempts, 0);
+        assert_eq!(node.capacity_gc_attempts, 0);
+        assert!(node.capacity_gc_targets.is_empty());
+        assert_eq!(
+            node.store.blob_stats().expect("post-rejection stats"),
+            before
+        );
         let streamed_growth = blob_core_error(
             "blob publish",
             BlobError::Io(std::io::Error::new(
@@ -7407,8 +9512,8 @@ mod tests {
             assert_eq!(read.total_len, bytes.len() as u64);
             assert_eq!(read.verified_chunks, 5);
             assert!(
-                read.peak_working_buffer_bytes <= SELECTED_BLOB_CHUNK_SIZE as usize + 16,
-                "core Blob reader exceeded its chunk-sized buffer bound"
+                read.peak_working_buffer_bytes <= MAX_SELECTED_BLOB_PAGE_BYTES,
+                "core Blob reader exceeded its bounded read-window size"
             );
             assert_eq!(read.media_type, first.media_type);
             assert_eq!(read.schema_id, first.schema_id);

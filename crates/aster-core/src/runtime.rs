@@ -6675,7 +6675,7 @@ mod tests {
                     .receipts
                     .iter()
                     .any(|(_, version, receipt)| {
-                        *version == wire::SEMANTIC_PROTOCOL_V8
+                        *version == wire::SEMANTIC_PROTOCOL_V9
                             && receipt.object_id == object_id
                             && receipt.complete
                     })
@@ -6693,7 +6693,7 @@ mod tests {
                 .receipts
                 .iter()
                 .any(|(_, version, receipt)| {
-                    *version == wire::SEMANTIC_PROTOCOL_V8
+                    *version == wire::SEMANTIC_PROTOCOL_V9
                         && receipt.object_id == object_id
                         && receipt.complete
                 }),

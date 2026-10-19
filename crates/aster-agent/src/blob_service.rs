@@ -7,9 +7,10 @@ use std::{
 
 use aster_mesh::{MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES};
 use aster_node::application::{
-    BlobId, BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest, BlobPublishResult,
-    BlobReadPage, BlobReadPageRequest, BlobReadRequest as NodeBlobReadRequest,
-    MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope, SelectedBlobHandle, Topic,
+    ApplicationErrorKind, BlobId, BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest,
+    BlobPublishResult, BlobPublishStreamRequest, BlobReadPage, BlobReadPageRequest,
+    BlobReadRequest as NodeBlobReadRequest, BlobReadStreamMetadata, MAX_SELECTED_LIVE_BLOB_BYTES,
+    Priority, Scope, SelectedBlobHandle, SelectedBlobReadStream, Topic,
 };
 use aster_redb_store::MAX_BLOB_OPERATION_KEY_BYTES;
 use connectrpc::{ConnectError, ErrorCode, RequestContext, Response, ServiceResult, ServiceStream};
@@ -18,7 +19,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
 use crate::{
-    BLOB_RPC_FRAME_BYTES, api,
+    BLOB_RPC_FRAME_BYTES, BLOB_RPC_READ_FRAME_BYTES, api,
     error::{PublicOperation, connect_blob_application_error, public_error},
 };
 
@@ -27,6 +28,7 @@ const UPLOAD_PERMITS: usize = 1;
 #[derive(Clone)]
 pub(crate) struct BlobConnectService {
     blobs: SelectedBlobHandle,
+    max_publish_bytes: u64,
     staging: Option<Arc<PinnedStagingDirectory>>,
     uploads: Arc<tokio::sync::Semaphore>,
 }
@@ -34,8 +36,10 @@ pub(crate) struct BlobConnectService {
 impl BlobConnectService {
     pub(crate) fn new(blobs: SelectedBlobHandle, state_root: &Path) -> std::io::Result<Self> {
         let staging = open_optional_staging(state_root)?.map(Arc::new);
+        let max_publish_bytes = blobs.max_publish_bytes();
         Ok(Self {
             blobs,
+            max_publish_bytes,
             staging,
             uploads: Arc::new(tokio::sync::Semaphore::new(UPLOAD_PERMITS)),
         })
@@ -45,13 +49,8 @@ impl BlobConnectService {
         &self,
         ctx: RequestContext,
         mut requests: connectrpc::InboundStream<api::PublishBlobRequest>,
-    ) -> ServiceResult<api::PublishBlobResponse> {
+    ) -> ServiceResult<ServiceStream<api::PublishBlobResponse>> {
         let operation = PublicOperation::PublishBlob;
-        let staging = self
-            .staging
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| unsupported_transport(operation))?;
         if ctx.protocol() == Some(connectrpc::Protocol::GrpcWeb) {
             return Err(unsupported_transport(operation));
         }
@@ -61,29 +60,54 @@ impl BlobConnectService {
             .ok_or_else(|| malformed(operation))?
             .map_err(|_| malformed(operation))?
             .to_owned_message();
-        let (parsed, mut grammar) = UploadGrammar::start(first)?;
+        let (parsed, grammar) = UploadGrammar::start(first, self.max_publish_bytes)?;
         let permit = Arc::clone(&self.uploads)
             .try_acquire_owned()
             .map_err(|_| resource_exhausted(operation))?;
-        let mut writer = BlockingUploadWriter::start(staging, grammar.total_len, permit).await?;
-
-        while let Some(frame) = requests.next().await {
-            let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
-            let chunk = Zeroizing::new(grammar.accept(frame)?);
-            writer.write(chunk).await?;
+        if parsed.options.ttl_ms().is_some() {
+            // Finite publications need the retained path's receiver-local custody
+            // authority. Their private staging file is replayed from zero on retry.
+            let staging = self
+                .staging
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| unsupported_transport(operation))?;
+            let writer = BlockingUploadWriter::start(staging, grammar.total_len, permit).await?;
+            let state = FinitePublishStreamState {
+                blobs: self.blobs.clone(),
+                requests,
+                parsed: Some(parsed),
+                writer: Some(writer),
+                grammar: Some(grammar),
+                accepted_pending: true,
+                complete: false,
+            };
+            return Response::stream_ok(futures::stream::try_unfold(
+                state,
+                next_finite_publish_response,
+            ));
         }
-        grammar.finish()?;
-        let (file, permit) = writer.finish().await?;
-        let blobs = self.blobs.clone();
-        let result = await_upload_with_permit(permit, async move {
-            blobs
-                .publish_with_options(parsed.request, parsed.options, file)
-                .await
-        })
-        .await
-        .map_err(|_| state_unavailable(operation))?
-        .map_err(|error| connect_blob_application_error(error, operation))?;
-        Ok(publish_response(result).into())
+        let stream = self
+            .blobs
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: parsed.request,
+                options: parsed.options,
+                total_len: grammar.total_len,
+            })
+            .await
+            .map_err(|error| connect_blob_application_error(error, operation))?;
+        let durable_offset = stream.durable_offset();
+        let grammar = grammar.resume(durable_offset)?;
+        let state = PublishStreamState {
+            requests,
+            stream: Some(stream),
+            grammar: Some(grammar),
+            durable_offset,
+            accepted_pending: true,
+            complete: false,
+            _permit: permit,
+        };
+        Response::stream_ok(futures::stream::try_unfold(state, next_publish_response))
     }
 
     pub(crate) async fn read(
@@ -92,67 +116,67 @@ impl BlobConnectService {
     ) -> ServiceResult<ServiceStream<api::ReadBlobResponse>> {
         let operation = PublicOperation::ReadBlob;
         let (request, topic, scope) = parse_read_request(request)?;
+        let mut stream = match self.blobs.open_read_stream(request.clone()).await {
+            Ok(stream) => stream,
+            Err(error) if error.kind() == ApplicationErrorKind::NotFound => {
+                return legacy_read_stream(self.blobs.clone(), request, topic, scope);
+            }
+            Err(error) => return Err(connect_blob_application_error(error, operation)),
+        };
+        let metadata = ReadMetadata::from_stream(stream.metadata());
+        let pending = stream
+            .next(BLOB_RPC_READ_FRAME_BYTES)
+            .await
+            .map_err(|error| connect_blob_application_error(error, operation))?
+            .ok_or_else(|| internal(operation))?;
+        if pending.offset != 0 || pending.bytes.is_empty() {
+            return Err(internal(operation));
+        }
         let state = ReadStreamState {
-            blobs: self.blobs.clone(),
-            request,
-            topic,
-            scope,
-            offset: 0,
-            metadata: None,
+            stream,
+            pending,
+            metadata,
             complete: false,
         };
         let responses = futures::stream::try_unfold(state, move |mut state| async move {
             if state.complete {
                 return Ok(None);
             }
-            let page = state
-                .blobs
-                .read_page(BlobReadPageRequest {
-                    blob: state.request.clone(),
-                    offset: state.offset,
-                    max_bytes: BLOB_RPC_FRAME_BYTES,
-                })
+            let next = state
+                .stream
+                .next(BLOB_RPC_READ_FRAME_BYTES)
                 .await
                 .map_err(|error| connect_blob_application_error(error, operation))?;
-            if page.offset != state.offset || page.is_empty() {
-                return Err(internal(operation));
-            }
-            let observed = ReadMetadata::from_page(&page, &state.topic, &state.scope);
-            if let Some(expected) = &state.metadata {
-                ensure_stable_read_metadata(expected, &observed)?;
-            } else {
-                state.metadata = Some(observed.clone());
-            }
-            let next_offset = page.next_offset();
-            let complete = page.complete;
-            let page_len = u64::try_from(page.len()).map_err(|_| internal(operation))?;
-            if page.offset.checked_add(page_len) != Some(next_offset)
-                || page.len() > BLOB_RPC_FRAME_BYTES
-                || complete != (next_offset == observed.total_len)
+            let complete = next.is_none();
+            let following_offset = next.as_ref().map(|frame| frame.offset);
+            let frame = std::mem::replace(
+                &mut state.pending,
+                next.unwrap_or_else(|| aster_node::application::BlobReadFrame {
+                    offset: state.metadata.total_len,
+                    bytes: Zeroizing::new(Vec::new()),
+                }),
+            );
+            let end = frame
+                .offset
+                .checked_add(frame.bytes.len() as u64)
+                .ok_or_else(|| internal(operation))?;
+            if frame.bytes.is_empty()
+                || end > state.metadata.total_len
+                || complete != (end == state.metadata.total_len)
+                || following_offset.is_some_and(|offset| offset != end)
             {
                 return Err(internal(operation));
             }
-            let metadata = state.metadata.as_ref().ok_or_else(|| internal(operation))?;
-            let response = read_response(metadata, page.offset, page.as_bytes().to_vec(), complete);
-            if next_offset <= state.offset || next_offset > observed.total_len {
-                return Err(internal(operation));
-            }
-            state.offset = next_offset;
             state.complete = complete;
+            let response = read_response(
+                &state.metadata,
+                frame.offset,
+                frame.bytes.to_vec(),
+                complete,
+            );
             Ok(Some((response, state)))
         });
         Response::stream_ok(responses)
-    }
-
-    #[cfg(all(test, target_os = "linux", feature = "client", feature = "server"))]
-    pub(crate) fn staging_directory_identity(&self) -> std::io::Result<Option<(u64, u64)>> {
-        self.staging
-            .as_ref()
-            .map(|staging| {
-                let stat = rustix::fs::fstat(&staging.descriptor).map_err(std::io::Error::from)?;
-                Ok((stat.st_dev, stat.st_ino))
-            })
-            .transpose()
     }
 }
 
@@ -367,7 +391,10 @@ struct UploadGrammar {
 }
 
 impl UploadGrammar {
-    fn start(first: api::PublishBlobRequest) -> Result<(ParsedPublish, Self), ConnectError> {
+    fn start(
+        first: api::PublishBlobRequest,
+        max_publish_bytes: u64,
+    ) -> Result<(ParsedPublish, Self), ConnectError> {
         let operation = PublicOperation::PublishBlob;
         let api::publish_blob_request::Frame::Metadata(metadata) =
             first.frame.ok_or_else(|| malformed(operation))?
@@ -377,7 +404,7 @@ impl UploadGrammar {
         if metadata.total_len == 0 {
             return Err(malformed(operation));
         }
-        if metadata.total_len > MAX_SELECTED_LIVE_BLOB_BYTES {
+        if metadata.total_len > max_publish_bytes {
             return Err(resource_exhausted(operation));
         }
         if metadata.operation_key.is_empty()
@@ -400,6 +427,9 @@ impl UploadGrammar {
                 BlobPublishOptions::finite_ttl_ms(ttl_ms).map_err(|_| malformed(operation))?
             }
         };
+        if options.ttl_ms().is_some() && metadata.total_len > MAX_SELECTED_LIVE_BLOB_BYTES {
+            return Err(resource_exhausted(operation));
+        }
         let maximum_frames = maximum_chunk_frames_for_len(metadata.total_len)?;
         Ok((
             ParsedPublish {
@@ -422,17 +452,32 @@ impl UploadGrammar {
         ))
     }
 
+    fn resume(mut self, durable_offset: u64) -> Result<Self, ConnectError> {
+        if durable_offset > self.total_len
+            || (durable_offset != self.total_len
+                && !durable_offset.is_multiple_of(BLOB_RPC_FRAME_BYTES as u64))
+        {
+            return Err(internal(PublicOperation::PublishBlob));
+        }
+        self.received = durable_offset;
+        self.frames = chunk_frames_for_len(durable_offset)?;
+        Ok(self)
+    }
+
     fn accept(&mut self, frame: api::PublishBlobRequest) -> Result<Vec<u8>, ConnectError> {
         let operation = PublicOperation::PublishBlob;
-        let api::publish_blob_request::Frame::Chunk(chunk) =
+        let api::publish_blob_request::Frame::Data(chunk) =
             frame.frame.ok_or_else(|| malformed(operation))?
         else {
             return Err(malformed(operation));
         };
-        if chunk.is_empty() || chunk.len() > BLOB_RPC_FRAME_BYTES {
+        if chunk.offset != self.received
+            || chunk.bytes.is_empty()
+            || chunk.bytes.len() > BLOB_RPC_FRAME_BYTES
+        {
             return Err(malformed(operation));
         }
-        let chunk_len = u64::try_from(chunk.len()).map_err(|_| malformed(operation))?;
+        let chunk_len = u64::try_from(chunk.bytes.len()).map_err(|_| malformed(operation))?;
         let remaining = self
             .total_len
             .checked_sub(self.received)
@@ -452,7 +497,7 @@ impl UploadGrammar {
         if self.frames > self.maximum_frames {
             return Err(malformed(operation));
         }
-        Ok(chunk)
+        Ok(chunk.bytes)
     }
 
     fn finish(self) -> Result<(), ConnectError> {
@@ -460,6 +505,149 @@ impl UploadGrammar {
             Ok(())
         } else {
             Err(malformed(PublicOperation::PublishBlob))
+        }
+    }
+}
+
+fn chunk_frames_for_len(len: u64) -> Result<u64, ConnectError> {
+    if len == 0 {
+        return Ok(0);
+    }
+    maximum_chunk_frames_for_len(len)
+}
+
+struct FinitePublishStreamState {
+    blobs: SelectedBlobHandle,
+    requests: connectrpc::InboundStream<api::PublishBlobRequest>,
+    parsed: Option<ParsedPublish>,
+    writer: Option<BlockingUploadWriter>,
+    grammar: Option<UploadGrammar>,
+    accepted_pending: bool,
+    complete: bool,
+}
+
+async fn next_finite_publish_response(
+    mut state: FinitePublishStreamState,
+) -> Result<Option<(api::PublishBlobResponse, FinitePublishStreamState)>, ConnectError> {
+    let operation = PublicOperation::PublishBlob;
+    if state.complete {
+        return Ok(None);
+    }
+    if state.accepted_pending {
+        state.accepted_pending = false;
+        return Ok(Some((publish_accepted(0), state)));
+    }
+    let frame = state
+        .requests
+        .next()
+        .await
+        .ok_or_else(|| malformed(operation))?
+        .map_err(|_| malformed(operation))?
+        .to_owned_message();
+    if matches!(
+        frame.frame,
+        Some(api::publish_blob_request::Frame::Finish(_))
+    ) {
+        state
+            .grammar
+            .take()
+            .ok_or_else(|| internal(operation))?
+            .finish()?;
+        if state.requests.next().await.is_some() {
+            return Err(malformed(operation));
+        }
+        let writer = state.writer.take().ok_or_else(|| internal(operation))?;
+        let (file, permit) = writer.finish().await?;
+        let parsed = state.parsed.take().ok_or_else(|| internal(operation))?;
+        let blobs = state.blobs.clone();
+        let result = await_upload_with_permit(permit, async move {
+            blobs
+                .publish_with_options(parsed.request, parsed.options, file)
+                .await
+        })
+        .await
+        .map_err(|_| state_unavailable(operation))?
+        .map_err(|error| connect_blob_application_error(error, operation))?;
+        state.complete = true;
+        return Ok(Some((publish_complete(result), state)));
+    }
+    let grammar = state.grammar.as_mut().ok_or_else(|| internal(operation))?;
+    let chunk = Zeroizing::new(grammar.accept(frame)?);
+    state
+        .writer
+        .as_mut()
+        .ok_or_else(|| internal(operation))?
+        .write(chunk)
+        .await?;
+    // Staging progress keeps the response stream active without claiming
+    // resumable custody of this private, unlinked file.
+    let progress = aster_node::application::BlobPublishProgress {
+        accepted_offset: grammar.received,
+        durable_offset: 0,
+    };
+    Ok(Some((publish_checkpoint(progress), state)))
+}
+
+struct PublishStreamState {
+    requests: connectrpc::InboundStream<api::PublishBlobRequest>,
+    stream: Option<aster_node::application::SelectedBlobPublishStream>,
+    grammar: Option<UploadGrammar>,
+    durable_offset: u64,
+    accepted_pending: bool,
+    complete: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+async fn next_publish_response(
+    mut state: PublishStreamState,
+) -> Result<Option<(api::PublishBlobResponse, PublishStreamState)>, ConnectError> {
+    let operation = PublicOperation::PublishBlob;
+    if state.complete {
+        return Ok(None);
+    }
+    if state.accepted_pending {
+        state.accepted_pending = false;
+        return Ok(Some((publish_accepted(state.durable_offset), state)));
+    }
+    loop {
+        let Some(frame) = state.requests.next().await else {
+            return Err(malformed(operation));
+        };
+        let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
+        if matches!(
+            frame.frame,
+            Some(api::publish_blob_request::Frame::Finish(_))
+        ) {
+            let grammar = state.grammar.take().ok_or_else(|| internal(operation))?;
+            grammar.finish()?;
+            if state.requests.next().await.is_some() {
+                return Err(malformed(operation));
+            }
+            let stream = state.stream.take().ok_or_else(|| internal(operation))?;
+            let result = stream
+                .finish()
+                .await
+                .map_err(|error| connect_blob_application_error(error, operation))?;
+            state.complete = true;
+            return Ok(Some((publish_complete(result), state)));
+        }
+        let grammar = state.grammar.as_mut().ok_or_else(|| internal(operation))?;
+        let offset = grammar.received;
+        let chunk = Zeroizing::new(grammar.accept(frame)?);
+        let stream = state.stream.as_mut().ok_or_else(|| internal(operation))?;
+        let progress = stream
+            .write(offset, chunk)
+            .await
+            .map_err(|error| connect_blob_application_error(error, operation))?;
+        if progress.accepted_offset != grammar.received
+            || progress.durable_offset < state.durable_offset
+            || progress.durable_offset > progress.accepted_offset
+        {
+            return Err(internal(operation));
+        }
+        if progress.durable_offset > state.durable_offset {
+            state.durable_offset = progress.durable_offset;
+            return Ok(Some((publish_checkpoint(progress), state)));
         }
     }
 }
@@ -505,9 +693,32 @@ impl ReadMetadata {
             acceptance_marker: page.acceptance_marker,
         }
     }
+
+    fn from_stream(metadata: &BlobReadStreamMetadata) -> Self {
+        Self {
+            id: *metadata.id.as_bytes(),
+            publisher: metadata.publisher,
+            publisher_counter: metadata.publisher_counter,
+            topic: metadata.topic.as_str().to_owned(),
+            scope: metadata.scope.as_str().to_owned(),
+            priority: metadata.priority,
+            ttl_ms: metadata.ttl_ms,
+            total_len: metadata.total_len,
+            media_type: metadata.media_type.clone(),
+            schema_id: metadata.schema_id.clone(),
+            acceptance_marker: metadata.acceptance_marker,
+        }
+    }
 }
 
 struct ReadStreamState {
+    stream: SelectedBlobReadStream,
+    pending: aster_node::application::BlobReadFrame,
+    metadata: ReadMetadata,
+    complete: bool,
+}
+
+struct LegacyReadStreamState {
     blobs: SelectedBlobHandle,
     request: NodeBlobReadRequest,
     topic: String,
@@ -515,6 +726,65 @@ struct ReadStreamState {
     offset: u64,
     metadata: Option<ReadMetadata>,
     complete: bool,
+}
+
+fn legacy_read_stream(
+    blobs: SelectedBlobHandle,
+    request: NodeBlobReadRequest,
+    topic: String,
+    scope: String,
+) -> ServiceResult<ServiceStream<api::ReadBlobResponse>> {
+    let operation = PublicOperation::ReadBlob;
+    let state = LegacyReadStreamState {
+        blobs,
+        request,
+        topic,
+        scope,
+        offset: 0,
+        metadata: None,
+        complete: false,
+    };
+    let responses = futures::stream::try_unfold(state, move |mut state| async move {
+        if state.complete {
+            return Ok(None);
+        }
+        let page = state
+            .blobs
+            .read_page(BlobReadPageRequest {
+                blob: state.request.clone(),
+                offset: state.offset,
+                max_bytes: BLOB_RPC_READ_FRAME_BYTES,
+            })
+            .await
+            .map_err(|error| connect_blob_application_error(error, operation))?;
+        if page.offset != state.offset || page.is_empty() {
+            return Err(internal(operation));
+        }
+        let observed = ReadMetadata::from_page(&page, &state.topic, &state.scope);
+        if let Some(expected) = &state.metadata {
+            ensure_stable_read_metadata(expected, &observed)?;
+        } else {
+            state.metadata = Some(observed.clone());
+        }
+        let next_offset = page.next_offset();
+        let complete = page.complete;
+        let page_len = u64::try_from(page.len()).map_err(|_| internal(operation))?;
+        if page.offset.checked_add(page_len) != Some(next_offset)
+            || page.len() > BLOB_RPC_READ_FRAME_BYTES
+            || complete != (next_offset == observed.total_len)
+        {
+            return Err(internal(operation));
+        }
+        let metadata = state.metadata.as_ref().ok_or_else(|| internal(operation))?;
+        let response = read_response(metadata, page.offset, page.as_bytes().to_vec(), complete);
+        if next_offset <= state.offset || next_offset > observed.total_len {
+            return Err(internal(operation));
+        }
+        state.offset = next_offset;
+        state.complete = complete;
+        Ok(Some((response, state)))
+    });
+    Response::stream_ok(responses)
 }
 
 fn ensure_stable_read_metadata(
@@ -552,8 +822,46 @@ fn parse_read_request(
     ))
 }
 
-fn publish_response(result: BlobPublishResult) -> api::PublishBlobResponse {
+fn publish_accepted(offset: u64) -> api::PublishBlobResponse {
     api::PublishBlobResponse {
+        frame: Some(api::publish_blob_response::Frame::Accepted(Box::new(
+            api::PublishBlobAccepted {
+                accepted_offset: offset,
+                durable_offset: offset,
+                canonical_frame_bytes: BLOB_RPC_FRAME_BYTES as u32,
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    }
+}
+
+fn publish_checkpoint(
+    progress: aster_node::application::BlobPublishProgress,
+) -> api::PublishBlobResponse {
+    api::PublishBlobResponse {
+        frame: Some(api::publish_blob_response::Frame::Checkpoint(Box::new(
+            api::PublishBlobCheckpoint {
+                accepted_offset: progress.accepted_offset,
+                durable_offset: progress.durable_offset,
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    }
+}
+
+fn publish_complete(result: BlobPublishResult) -> api::PublishBlobResponse {
+    api::PublishBlobResponse {
+        frame: Some(api::publish_blob_response::Frame::Complete(Box::new(
+            publish_receipt(result),
+        ))),
+        ..Default::default()
+    }
+}
+
+fn publish_receipt(result: BlobPublishResult) -> api::PublishBlobReceipt {
+    api::PublishBlobReceipt {
         id: result.id.as_bytes().to_vec(),
         publisher: result.publisher.to_vec(),
         publisher_counter: result.publisher_counter,
@@ -571,7 +879,7 @@ fn publish_response(result: BlobPublishResult) -> api::PublishBlobResponse {
 fn read_response(
     metadata: &ReadMetadata,
     offset: u64,
-    chunk: Vec<u8>,
+    data: Vec<u8>,
     complete: bool,
 ) -> api::ReadBlobResponse {
     api::ReadBlobResponse {
@@ -587,7 +895,7 @@ fn read_response(
         schema_id: metadata.schema_id.clone(),
         acceptance_marker: metadata.acceptance_marker,
         offset,
-        chunk,
+        chunk: data,
         complete,
         ..Default::default()
     }
@@ -756,8 +1064,6 @@ fn internal(operation: PublicOperation) -> ConnectError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     #[cfg(target_os = "linux")]
     use std::{
         fs,
@@ -832,9 +1138,21 @@ mod tests {
         }
     }
 
-    fn chunk(bytes: Vec<u8>) -> api::PublishBlobRequest {
+    fn start_upload(
+        first: api::PublishBlobRequest,
+    ) -> Result<(ParsedPublish, UploadGrammar), ConnectError> {
+        UploadGrammar::start(first, MAX_SELECTED_LIVE_BLOB_BYTES)
+    }
+
+    fn chunk(offset: u64, bytes: Vec<u8>) -> api::PublishBlobRequest {
         api::PublishBlobRequest {
-            frame: Some(api::publish_blob_request::Frame::Chunk(bytes)),
+            frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                api::PublishBlobData {
+                    offset,
+                    bytes,
+                    ..Default::default()
+                },
+            ))),
             ..Default::default()
         }
     }
@@ -843,32 +1161,32 @@ mod tests {
     fn blob_ttl_wire_presence_round_trips_and_zero_is_rejected() {
         let durable = metadata_frame(1, None);
         let durable = api::PublishBlobRequest::decode_from_slice(&durable.encode_to_vec()).unwrap();
-        let (durable, _) = UploadGrammar::start(durable).unwrap();
+        let (durable, _) = start_upload(durable).unwrap();
         assert_eq!(durable.options.ttl_ms(), None);
 
         let finite = metadata_frame(1, Some(u64::MAX));
         let finite = api::PublishBlobRequest::decode_from_slice(&finite.encode_to_vec()).unwrap();
-        let (finite, _) = UploadGrammar::start(finite).unwrap();
+        let (finite, _) = start_upload(finite).unwrap();
         assert_eq!(finite.options.ttl_ms(), Some(u64::MAX));
 
-        let error = UploadGrammar::start(metadata_frame(1, Some(0))).unwrap_err();
+        let error = start_upload(metadata_frame(1, Some(0))).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
     fn blob_upload_requires_one_metadata_frame_before_chunks() {
         assert_eq!(
-            UploadGrammar::start(api::PublishBlobRequest::default())
+            start_upload(api::PublishBlobRequest::default())
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument
         );
         assert_eq!(
-            UploadGrammar::start(chunk(vec![1])).unwrap_err().code,
+            start_upload(chunk(0, vec![1])).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
 
-        let (_, mut grammar) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
+        let (_, mut grammar) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
             grammar.accept(metadata_frame(1, None)).unwrap_err().code,
             ErrorCode::InvalidArgument
@@ -878,50 +1196,113 @@ mod tests {
     #[test]
     fn blob_upload_rejects_empty_oversized_and_length_mismatched_streams() {
         assert_eq!(
-            UploadGrammar::start(metadata_frame(0, None))
-                .unwrap_err()
-                .code,
+            start_upload(metadata_frame(0, None)).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
         assert_eq!(
-            UploadGrammar::start(metadata_frame(MAX_SELECTED_LIVE_BLOB_BYTES + 1, None))
+            start_upload(metadata_frame(MAX_SELECTED_LIVE_BLOB_BYTES + 1, None))
                 .unwrap_err()
                 .code,
             ErrorCode::ResourceExhausted
         );
 
-        let (_, mut empty_chunk) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
+        let (_, mut empty_chunk) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
-            empty_chunk.accept(chunk(Vec::new())).unwrap_err().code,
+            empty_chunk.accept(chunk(0, Vec::new())).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
 
-        let (_, mut oversized_chunk) = UploadGrammar::start(metadata_frame(
+        let (_, mut oversized_chunk) = start_upload(metadata_frame(
             (MAX_SELECTED_BLOB_PAGE_BYTES + 1) as u64,
             None,
         ))
         .unwrap();
         assert_eq!(
             oversized_chunk
-                .accept(chunk(vec![0; MAX_SELECTED_BLOB_PAGE_BYTES + 1]))
+                .accept(chunk(0, vec![0; MAX_SELECTED_BLOB_PAGE_BYTES + 1]))
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument
         );
 
-        let (_, short) = UploadGrammar::start(metadata_frame(2, None)).unwrap();
+        let (_, short) = start_upload(metadata_frame(2, None)).unwrap();
         assert_eq!(short.finish().unwrap_err().code, ErrorCode::InvalidArgument);
 
-        let (_, mut long) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
+        let (_, mut long) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
-            long.accept(chunk(vec![1, 2])).unwrap_err().code,
+            long.accept(chunk(0, vec![1, 2])).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
     }
 
     #[test]
+    fn blob_upload_resumes_only_from_canonical_durable_offsets() {
+        let total = BLOB_RPC_FRAME_BYTES as u64 * 2 + 1;
+        let (_, grammar) = start_upload(metadata_frame(total, None)).unwrap();
+        let mut grammar = grammar.resume(BLOB_RPC_FRAME_BYTES as u64).unwrap();
+        assert_eq!(grammar.received, BLOB_RPC_FRAME_BYTES as u64);
+        assert_eq!(grammar.frames, 1);
+        assert_eq!(
+            grammar
+                .accept(chunk(0, vec![0; BLOB_RPC_FRAME_BYTES]))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+        grammar
+            .accept(chunk(
+                BLOB_RPC_FRAME_BYTES as u64,
+                vec![0; BLOB_RPC_FRAME_BYTES],
+            ))
+            .unwrap();
+        grammar
+            .accept(chunk(BLOB_RPC_FRAME_BYTES as u64 * 2, vec![0]))
+            .unwrap();
+        grammar.finish().unwrap();
+
+        let (_, grammar) = start_upload(metadata_frame(total, None)).unwrap();
+        assert_eq!(grammar.resume(1).unwrap_err().code, ErrorCode::DataLoss);
+    }
+
+    #[test]
+    fn blob_upload_admission_uses_the_live_profile_capacity() {
+        let configured_max = 2 * 1024 * 1024 * 1024;
+        let declared = 800 * 1024 * 1024;
+
+        UploadGrammar::start(metadata_frame(declared, None), configured_max)
+            .expect("profile-5 upload below the configured live capacity");
+        assert_eq!(
+            UploadGrammar::start(metadata_frame(configured_max + 1, None), configured_max)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn finite_upload_admission_preserves_retained_and_configured_limits() {
+        let configured_max = MAX_SELECTED_LIVE_BLOB_BYTES + 1;
+        UploadGrammar::start(metadata_frame(configured_max, None), configured_max)
+            .expect("durable stream may use the larger configured capacity");
+        assert_eq!(
+            UploadGrammar::start(metadata_frame(configured_max, Some(1_000)), configured_max)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceExhausted,
+        );
+        assert_eq!(
+            UploadGrammar::start(metadata_frame(2, Some(1_000)), 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceExhausted,
+        );
+        UploadGrammar::start(metadata_frame(1, Some(1_000)), 1)
+            .expect("finite upload respects both bounds");
+    }
+
+    #[test]
     fn blob_upload_derives_frame_bound_from_declared_u64_length() {
-        let declared = MAX_SELECTED_BLOB_PAGE_BYTES as u64 * 1_025;
+        let declared = BLOB_RPC_FRAME_BYTES as u64 * 1_025;
         assert_eq!(maximum_chunk_frames_for_len(declared).unwrap(), 1_025);
     }
 
@@ -1144,6 +1525,7 @@ mod tests {
     #[test]
     fn rpc_blob_frame_size_is_a_stable_agent_contract() {
         assert_eq!(crate::BLOB_RPC_FRAME_BYTES, 64 * 1024);
+        assert_eq!(crate::BLOB_RPC_READ_FRAME_BYTES, 1024 * 1024);
     }
 
     #[cfg(target_os = "linux")]
@@ -1208,7 +1590,7 @@ mod tests {
                     media_type: None,
                     schema_id: Vec::new(),
                 },
-                BlobPublishOptions::finite_ttl_ms(1_000).unwrap(),
+                BlobPublishOptions::finite_ttl_ms(10_000).unwrap(),
                 fs::File::open(source_path).unwrap(),
             )
             .await
@@ -1229,7 +1611,7 @@ mod tests {
         assert_eq!(first.chunk.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
         assert!(!first.complete);
 
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10_100)).await;
         let expired = stream.next().await.unwrap().unwrap_err();
         assert_eq!(expired.code, ErrorCode::NotFound);
         assert_eq!(
