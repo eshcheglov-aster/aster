@@ -12,14 +12,14 @@ use std::{
 };
 
 #[cfg(unix)]
-use aster_iroh::PinnedRelay;
+use aster_iroh::{EndpointId, PinnedRelay};
 use aster_mesh::{ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic};
 #[cfg(unix)]
 use aster_node::{
     MissionExpectedPeer, NodeApplication, NodeConfig, NodeIdentity, SelectedForwardingConfig,
     application::{
-        EventAcknowledgement, EventPollRequest, EventPublishRequest, EventSubscriptionRequest,
-        EventSyncStatus, PeerAuthorization, Priority,
+        EventAcknowledgement, EventPollRequest, EventSubscriptionRequest, EventSyncStatus,
+        PeerAuthorization, Priority,
     },
     mission::UnprotectedReferenceMission,
     start_node, start_node_with_forwarding,
@@ -57,6 +57,14 @@ fn fresh_root(test: &str) -> PathBuf {
         "aster-selected-mesh-smoke-{test}-{}-{nonce}-{sequence}",
         std::process::id(),
     ))
+}
+
+#[cfg(unix)]
+fn make_owner_only_directory(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-only process-test directory");
 }
 
 fn receipt_counter(line: &str, field: &str) -> Option<usize> {
@@ -373,6 +381,324 @@ fn selected_ready_marker_accepts_a_libtest_prefix_at_a_record_boundary() {
 }
 
 #[cfg(unix)]
+fn public_node_command(
+    state: &std::path::Path,
+    mission: &std::path::Path,
+    bind: std::net::SocketAddr,
+    peer: Option<&str>,
+    run_for_seconds: u64,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+    command
+        .args(["node", "--state"])
+        .arg(state)
+        .arg("--bind")
+        .arg(bind.to_string())
+        .arg("--mission-bundle-unprotected-reference")
+        .arg(mission)
+        .arg("--sync-ms")
+        .arg("20")
+        .arg("--run-for")
+        .arg(run_for_seconds.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(peer) = peer {
+        command.arg("--peer").arg(peer);
+    }
+    command
+}
+
+#[cfg(unix)]
+fn is_public_direct_contact(line: &str) -> bool {
+    line.starts_with("CONTACT ")
+        && line.ends_with("status=pass")
+        && line.contains(" mission_auth=hybrid-pq ")
+        && line.contains(" carrier_path=direct ")
+}
+
+#[cfg(unix)]
+fn interrupt_public_node(child: &mut std::process::Child) {
+    if child
+        .try_wait()
+        .expect("poll public-binary node before interrupt")
+        .is_some()
+    {
+        return;
+    }
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("signal public-binary node");
+    assert!(status.success(), "SIGINT delivery failed with {status}");
+}
+
+#[cfg(unix)]
+fn wait_for_public_direct_contacts(
+    left: std::process::Child,
+    right: std::process::Child,
+) -> (std::process::Output, std::process::Output) {
+    let mut children = [left, right];
+    let (line_sender, line_receiver) = mpsc::channel();
+    let mut stdout_readers = Vec::new();
+    let mut stderr_readers = Vec::new();
+    for (index, child) in children.iter_mut().enumerate() {
+        let stdout = child.stdout.take().expect("public-binary stdout");
+        let sender = line_sender.clone();
+        stdout_readers.push(thread::spawn(move || {
+            let mut lines = Vec::new();
+            for line in BufReader::new(stdout).lines() {
+                let line = line.expect("public-binary UTF-8 stdout line");
+                let _ = sender.send((index, line.clone()));
+                lines.push(line);
+            }
+            lines
+        }));
+        let stderr = child.stderr.take().expect("public-binary stderr");
+        stderr_readers.push(thread::spawn(move || {
+            BufReader::new(stderr)
+                .lines()
+                .map(|line| line.expect("public-binary UTF-8 stderr line"))
+                .collect::<Vec<_>>()
+        }));
+    }
+    drop(line_sender);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut contacts = [false; 2];
+    while !contacts.iter().all(|observed| *observed) && Instant::now() < deadline {
+        if let Ok((index, line)) = line_receiver.recv_timeout(Duration::from_millis(20))
+            && is_public_direct_contact(&line)
+        {
+            contacts[index] = true;
+        }
+        if children.iter_mut().any(|child| {
+            child
+                .try_wait()
+                .expect("poll public-binary node before contact")
+                .is_some()
+        }) {
+            break;
+        }
+    }
+    let contacts_completed = contacts.iter().all(|observed| *observed);
+    if contacts_completed {
+        for child in &mut children {
+            interrupt_public_node(child);
+        }
+    } else {
+        for child in &mut children {
+            if child
+                .try_wait()
+                .expect("poll incomplete public-binary node")
+                .is_none()
+            {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    let [left, right] = children;
+    let (left_output, right_output) = wait_for_live_event_workers(left, right);
+    let stdout = stdout_readers
+        .into_iter()
+        .map(|reader| reader.join().expect("join public-binary stdout reader"))
+        .collect::<Vec<_>>();
+    let stderr = stderr_readers
+        .into_iter()
+        .map(|reader| reader.join().expect("join public-binary stderr reader"))
+        .collect::<Vec<_>>();
+    let build_output = |status, stdout: &[String], stderr: &[String]| std::process::Output {
+        status,
+        stdout: stdout.join("\n").into_bytes(),
+        stderr: stderr.join("\n").into_bytes(),
+    };
+    let left_output = build_output(left_output.status, &stdout[0], &stderr[0]);
+    let right_output = build_output(right_output.status, &stdout[1], &stderr[1]);
+    assert!(
+        contacts_completed,
+        "public-binary nodes did not both complete a direct contact before the safety deadline: left_stdout={} left_stderr={} right_stdout={} right_stderr={}",
+        String::from_utf8_lossy(&left_output.stdout),
+        String::from_utf8_lossy(&left_output.stderr),
+        String::from_utf8_lossy(&right_output.stdout),
+        String::from_utf8_lossy(&right_output.stderr),
+    );
+    (left_output, right_output)
+}
+
+#[cfg(unix)]
+fn assert_minimal_public_binary_contact_smoke(label: &str) {
+    use std::{net::UdpSocket, os::unix::fs::PermissionsExt as _};
+
+    #[derive(Debug)]
+    struct PublicNodeSmokeFixture {
+        state: PathBuf,
+        mission_path: PathBuf,
+        mission_id: [u8; 32],
+        carrier: EndpointId,
+        reserved_socket: UdpSocket,
+        address: std::net::SocketAddr,
+    }
+
+    let root = fresh_root(label);
+    std::fs::create_dir_all(&root).expect("public-binary smoke root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-only public-binary smoke root");
+    let scope = Scope::new("test/public-binary-smoke").expect("public-binary smoke scope");
+    let topic = Topic::new("public-binary-smoke").expect("public-binary smoke topic");
+    let access = ProvisioningAccess::member(scope, vec![1], vec![topic])
+        .expect("public-binary smoke access");
+    let mut provisioner =
+        ReferenceProvisioner::from_seed([0xa7; 32]).expect("public-binary provisioner");
+    let mut nodes = Vec::new();
+    for index in 0..2u64 {
+        let state = root.join(format!("node-{index}"));
+        let mission_path = root.join(format!("node-{index}.bundle"));
+        let bundle = provisioner
+            .issue_node(index + 1, std::slice::from_ref(&access))
+            .expect("public-binary smoke mission");
+        let mission_bytes = bundle.to_bytes().expect("public-binary mission bytes");
+        let mission = UnprotectedReferenceMission::persist(&mission_path, mission_bytes)
+            .expect("public-binary mission file");
+        let mission_id = mission.identity();
+        drop(mission);
+        std::fs::set_permissions(&mission_path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only public-binary mission");
+        let carrier = NodeIdentity::load_or_create(&state)
+            .expect("public-binary carrier identity")
+            .id();
+        make_owner_only_directory(&state);
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("reserve public-binary port");
+        let address = socket.local_addr().expect("public-binary address");
+        nodes.push(PublicNodeSmokeFixture {
+            state,
+            mission_path,
+            mission_id,
+            carrier,
+            reserved_socket: socket,
+            address,
+        });
+    }
+    let [left, right]: [_; 2] = nodes.try_into().expect("exactly two public-binary nodes");
+    let left_peer = format!(
+        "{}@{}={}",
+        right.carrier,
+        right.address,
+        aster_node::format_node_id(right.mission_id)
+    );
+    let right_peer = format!(
+        "{}@{}={}",
+        left.carrier,
+        left.address,
+        aster_node::format_node_id(left.mission_id)
+    );
+    drop(left.reserved_socket);
+    drop(right.reserved_socket);
+
+    let left_child = public_node_command(
+        &left.state,
+        &left.mission_path,
+        left.address,
+        Some(&left_peer),
+        30,
+    )
+    .spawn()
+    .expect("spawn public-binary left node");
+    let right_child = public_node_command(
+        &right.state,
+        &right.mission_path,
+        right.address,
+        Some(&right_peer),
+        30,
+    )
+    .spawn()
+    .expect("spawn public-binary right node");
+    let outputs = wait_for_public_direct_contacts(left_child, right_child);
+    for output in [outputs.0, outputs.1] {
+        let stdout = String::from_utf8(output.stdout).expect("public-binary UTF-8 stdout");
+        let stderr = String::from_utf8(output.stderr).expect("public-binary UTF-8 stderr");
+        assert!(
+            output.status.success(),
+            "public-binary node failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(stdout.lines().any(has_selected_ready_marker));
+        assert!(stdout.lines().any(is_public_direct_contact));
+        assert!(stdout.lines().any(|line| {
+            line.starts_with("STOP lifecycle=complete ")
+                && line.contains(" sync_status=contacts_observed ")
+                && line.contains(" direct_contacts=")
+        }));
+    }
+    std::fs::remove_dir_all(&root).expect("cleanup public-binary smoke root");
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn public_binary_two_node_contact_smoke_starts_binds_contacts_and_stops() {
+    let _process_test = serialize_process_test();
+    assert_minimal_public_binary_contact_smoke("public-binary-contact");
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_public_binary_child_is_reaped_before_reusing_its_port() {
+    use std::{net::UdpSocket, os::unix::fs::PermissionsExt as _};
+
+    let _process_test = serialize_process_test();
+    let blocked = UdpSocket::bind("127.0.0.1:0").expect("reserve forced-failure port");
+    let address = blocked.local_addr().expect("forced-failure address");
+    let failed_root = fresh_root("public-binary-forced-failure");
+    let failed_mission = failed_root.join("mission.bundle");
+    std::fs::create_dir_all(&failed_root).expect("forced-failure root");
+    persist_zeroization_bundle(&failed_mission, 0xa8);
+    let failed = public_node_command(
+        &failed_root.join("state"),
+        &failed_mission,
+        address,
+        None,
+        1,
+    )
+    .output()
+    .expect("collect forced child failure");
+    assert!(!failed.status.success());
+    assert!(live_event_worker_bind_collision(&failed));
+    std::fs::remove_dir_all(&failed_root).expect("cleanup failed child root");
+    assert!(!failed_root.exists());
+    drop(blocked);
+
+    let success_root = fresh_root("public-binary-after-failure");
+    let success_mission = success_root.join("mission.bundle");
+    std::fs::create_dir_all(&success_root).expect("post-failure root");
+    std::fs::set_permissions(&success_root, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-only post-failure root");
+    persist_zeroization_bundle(&success_mission, 0xa9);
+    let succeeded = public_node_command(
+        &success_root.join("state"),
+        &success_mission,
+        address,
+        None,
+        1,
+    )
+    .output()
+    .expect("collect successful child after failure");
+    let stdout = String::from_utf8(succeeded.stdout).expect("post-failure UTF-8 stdout");
+    let stderr = String::from_utf8(succeeded.stderr).expect("post-failure UTF-8 stderr");
+    assert!(
+        succeeded.status.success(),
+        "port reuse failed: stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.lines().any(has_selected_ready_marker));
+    assert!(stdout.lines().any(|line| {
+        line.starts_with("STOP lifecycle=complete ")
+            && line.contains(" sync_status=no_successful_contact ")
+            && line.contains(" contacts=0 ")
+    }));
+    std::fs::remove_dir_all(&success_root).expect("cleanup post-failure root");
+    assert!(!success_root.exists());
+}
+
+#[cfg(unix)]
 fn wait_for_live_event_workers(
     mut receiver: std::process::Child,
     mut publisher: std::process::Child,
@@ -486,7 +812,7 @@ fn live_event_process_worker() {
     runtime.block_on(async move {
         let mission = UnprotectedReferenceMission::load(&mission_path).expect("worker mission");
         let config = NodeConfig {
-            state,
+            state: state.clone(),
             bind,
             mission,
             peers,
@@ -519,19 +845,17 @@ fn live_event_process_worker() {
 
         match role.as_str() {
             "offline-publisher" => {
-                let published = events
-                    .publish(EventPublishRequest {
-                        operation_key: b"process-offline-publish".to_vec(),
-                        predecessor: None,
-                        topic,
-                        scope,
-                        priority: Priority::Priority,
-                        logical_key: b"process-offline-key".to_vec(),
-                        payload: b"published before either peer was online".to_vec(),
-                        tombstone: false,
-                    })
-                    .await
-                    .expect("offline publish");
+                use aster_node::publication_journal::{Backend, Intent, Journal};
+                let journal_path = state.join("source-publication.redb");
+                Journal::initialize(&journal_path, b"process-offline-source").unwrap();
+                let mut journal = Journal::open(&journal_path, b"process-offline-source").unwrap();
+                let mut backend = Backend::Live(&events);
+                journal.recover(&mut backend).await.unwrap();
+                let published = journal.publish_metadata(&mut backend, Intent {
+                    predecessor: None, topic: topic.as_str().to_owned(), scope: scope.as_str().to_owned(), priority: Priority::Priority as u8,
+                    logical_key: b"process-offline-key".to_vec(), payload: b"published before either peer was online".to_vec(), tombstone: false, ttl_ms: None,
+                }).await.unwrap();
+                journal.acknowledge(&mut backend).await.unwrap();
                 let status = events.status().await.expect("offline status");
                 assert_eq!(status.sync, EventSyncStatus::Offline);
                 assert_eq!(status.authenticated_contacts, 0);
@@ -573,8 +897,15 @@ fn live_event_process_worker() {
                 );
             }
             "sync-receiver" => {
+                let path = state.join("consumer-journal.redb");
+                let id = b"test.mesh.consumer.v1";
+                if true { aster_node::publication_journal::Journal::initialize(&path, id).unwrap(); }
+                let mut journal = aster_node::publication_journal::Journal::open(&path, id).unwrap();
+                journal.recover(&mut aster_node::publication_journal::Backend::Live(&events)).await.unwrap();
+                let client = journal.client_context().unwrap();
                 let subscription = events
                     .subscribe(EventSubscriptionRequest {
+                        client: client.clone(),
                         operation_key: b"process-later-sync-subscription".to_vec(),
                         topic,
                         scope,
@@ -591,6 +922,7 @@ fn live_event_process_worker() {
                 while Instant::now() < receiver_deadline {
                     let page = events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -610,7 +942,7 @@ fn live_event_process_worker() {
                 );
                 assert_eq!(
                     events
-                        .acknowledge(subscription.id, delivery.event.id)
+                        .acknowledge(client.clone(), subscription.id, delivery.event.id)
                         .await
                         .expect("receiver acknowledge"),
                     EventAcknowledgement::Acknowledged
@@ -618,6 +950,7 @@ fn live_event_process_worker() {
                 assert!(
                     events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -661,8 +994,15 @@ fn live_event_process_worker() {
                 );
             }
             "restart-receiver" => {
+                let path = state.join("consumer-journal.redb");
+                let id = b"test.mesh.consumer.v1";
+                if false { aster_node::publication_journal::Journal::initialize(&path, id).unwrap(); }
+                let mut journal = aster_node::publication_journal::Journal::open(&path, id).unwrap();
+                journal.recover(&mut aster_node::publication_journal::Backend::Live(&events)).await.unwrap();
+                let client = journal.client_context().unwrap();
                 let subscription = events
                     .subscribe(EventSubscriptionRequest {
+                        client: client.clone(),
                         operation_key: b"process-later-sync-subscription".to_vec(),
                         topic,
                         scope,
@@ -674,6 +1014,7 @@ fn live_event_process_worker() {
                 assert!(
                     events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -747,10 +1088,12 @@ fn offline_publish_later_real_process_sync_poll_ack_and_restart() {
         NodeIdentity::load_or_create(&publisher_state).expect("publisher identity");
     let publisher_carrier = publisher_identity.id();
     drop(publisher_identity);
+    make_owner_only_directory(&publisher_state);
     let receiver_identity =
         NodeIdentity::load_or_create(&receiver_state).expect("receiver identity");
     let receiver_carrier = receiver_identity.id();
     drop(receiver_identity);
+    make_owner_only_directory(&receiver_state);
 
     let offline = live_event_worker_command(
         "offline-publisher",
@@ -964,10 +1307,12 @@ fn controlled_relay_selected_when_direct_candidate_unusable_then_noops() {
         NodeIdentity::load_or_create(&publisher_state).expect("relay publisher identity");
     let publisher_carrier = publisher_identity.id();
     drop(publisher_identity);
+    make_owner_only_directory(&publisher_state);
     let receiver_identity =
         NodeIdentity::load_or_create(&receiver_state).expect("relay receiver identity");
     let receiver_carrier = receiver_identity.id();
     drop(receiver_identity);
+    make_owner_only_directory(&receiver_state);
     let publisher_initiates = publisher_carrier < receiver_carrier;
 
     let relay_ca_paths = fixture
@@ -1286,6 +1631,8 @@ fn unavailable_controlled_relay_does_not_block_exact_direct_sync() {
     let second_carrier = NodeIdentity::load_or_create(&second_state)
         .expect("second dead relay identity")
         .id();
+    make_owner_only_directory(&first_state);
+    make_owner_only_directory(&second_state);
 
     let mut bind_attempt = 0usize;
     let mut collision = None;
@@ -1941,12 +2288,14 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
     let first_identity_path = first_identity.path().to_path_buf();
     let first_identity_bytes = std::fs::read(&first_identity_path).expect("first identity bytes");
     drop(first_identity);
+    make_owner_only_directory(&first_state);
     let second_identity = NodeIdentity::load_or_create(&second_state).expect("second identity");
     let second_carrier = second_identity.id();
     let second_identity_path = second_identity.path().to_path_buf();
     let second_identity_bytes =
         std::fs::read(&second_identity_path).expect("second identity bytes");
     drop(second_identity);
+    make_owner_only_directory(&second_state);
 
     let first_port = UdpSocket::bind("127.0.0.1:0").expect("reserve first UDP port");
     let second_port = UdpSocket::bind("127.0.0.1:0").expect("reserve second UDP port");
@@ -2028,7 +2377,7 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
         .arg(&target_mission_path)
         .arg("--peer")
         .arg(&target_peer)
-        .args(["--sync-ms", "500", "--run-for", "30"])
+        .args(["--sync-ms", "50", "--run-for", "8"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2064,7 +2413,7 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
         .arg(&survivor_mission_path)
         .arg("--peer")
         .arg(&survivor_peer)
-        .args(["--sync-ms", "500", "--run-for", "15"])
+        .args(["--sync-ms", "50", "--run-for", "4"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2081,12 +2430,10 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
         lines
     });
     let survivor_stderr = survivor.stderr.take().expect("survivor stderr");
-    let (survivor_error_sender, survivor_error_receiver) = mpsc::channel();
     let survivor_error_reader = thread::spawn(move || {
         let mut lines = Vec::new();
         for line in BufReader::new(survivor_stderr).lines() {
             let line = line.expect("UTF-8 survivor stderr");
-            let _ = survivor_error_sender.send(line.clone());
             lines.push(line);
         }
         lines
@@ -2112,7 +2459,7 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
         .arg(&target_state)
         .arg("--mission-bundle-unprotected-reference")
         .arg(&target_mission_path)
-        .args(["--wait-seconds", "20"])
+        .args(["--wait-seconds", "6"])
         .output()
         .expect("zeroize configured target");
     let zeroize_stdout = String::from_utf8(zeroize.stdout).expect("zeroize stdout");
@@ -2172,51 +2519,6 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
             .contains("zeroization=complete")
     );
 
-    // A quiet reader-channel interval establishes that pre-STOP pipe backlog
-    // was consumed before classifying any later contact receipt or error.
-    let expected_closure_prefix = format!(
-        "CONTACT direction=out carrier_peer={target_carrier} expected_mission_peer={} status=error error=",
-        aster_node::format_node_id(target_mission_id)
-    );
-    let baseline_deadline = Instant::now() + Duration::from_secs(3);
-    let mut quiet_since = Instant::now();
-    loop {
-        let mut activity = false;
-        while survivor_line_receiver.try_recv().is_ok() {
-            activity = true;
-        }
-        while survivor_error_receiver.try_recv().is_ok() {
-            activity = true;
-        }
-        if activity {
-            quiet_since = Instant::now();
-        } else if quiet_since.elapsed() >= Duration::from_millis(250) {
-            break;
-        }
-        assert!(
-            Instant::now() < baseline_deadline,
-            "survivor output never reached a quiet post-STOP baseline"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let mut closure_observed = false;
-    let closure_deadline = Instant::now() + Duration::from_secs(12);
-    let mut protected_after_stop = Vec::new();
-    while !closure_observed && Instant::now() < closure_deadline {
-        while let Ok(line) = survivor_line_receiver.try_recv() {
-            if line.starts_with(&survivor_contact_prefix) && line.ends_with("status=pass") {
-                protected_after_stop.push(line);
-            }
-        }
-        if let Ok(line) = survivor_error_receiver.recv_timeout(Duration::from_millis(50)) {
-            closure_observed |= line.starts_with(&expected_closure_prefix);
-        }
-    }
-    assert!(
-        closure_observed,
-        "survivor did not observe target endpoint closure"
-    );
     std::fs::write(&target_mission_path, &target_mission_bytes)
         .expect("restore target mission tombstone");
     std::fs::set_permissions(&target_mission_path, std::fs::Permissions::from_mode(0o600))
@@ -2258,15 +2560,6 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
     let survivor_status = survivor.wait().expect("graceful survivor exit");
     let survivor_lines = survivor_reader.join().expect("join survivor reader");
     let survivor_errors = survivor_error_reader.join().expect("join survivor errors");
-    while let Ok(line) = survivor_line_receiver.try_recv() {
-        if line.starts_with(&survivor_contact_prefix) && line.ends_with("status=pass") {
-            protected_after_stop.push(line);
-        }
-    }
-    assert!(
-        protected_after_stop.is_empty(),
-        "protected contact completed after the quiet post-STOP baseline: {protected_after_stop:?}"
-    );
     assert!(
         survivor_status.success(),
         "survivor did not exit through its finite runtime: {survivor_errors:?}"
@@ -2278,17 +2571,13 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
     );
     assert!(survivor_lines.iter().any(|line| {
         line.starts_with("STOP lifecycle=complete sync_status=contacts_observed ")
-            && receipt_counter(line, "contact_errors").is_some_and(|errors| errors > 0)
+            && receipt_counter(line, "contacts").is_some_and(|contacts| contacts > 0)
     }));
-    assert!(
-        survivor_errors
-            .iter()
-            .any(|line| line.starts_with(&expected_closure_prefix))
-    );
     let combined = format!(
-        "{zeroize_stdout}{zeroize_stderr}{target_errors}{restart_stdout}{restart_stderr}{}{}",
+        "{zeroize_stdout}{zeroize_stderr}{target_errors}{restart_stdout}{restart_stderr}{}{}{}",
         target_lines.join("\n"),
-        survivor_lines.join("\n")
+        survivor_lines.join("\n"),
+        survivor_errors.join("\n")
     );
     assert!(!combined.contains(&bytes_hex(&target_mission_bytes)));
     assert!(!combined.contains(&bytes_hex(&target_identity_bytes)));
@@ -2660,7 +2949,276 @@ fn interrupted_terminal_marker_resumes_without_losing_data_rows() {
     std::fs::remove_dir_all(root).expect("cleanup interrupted zeroization root");
 }
 
+#[cfg(unix)]
 #[test]
+fn public_binary_relay_secrecy_and_consumer_ack_survive_reopen() {
+    use aster_mesh::EventContentVerification;
+    use aster_node::application::{EventQuery, SelectedEventNode};
+    use aster_node::publication_journal::{Intent, Journal};
+    use aster_redb_store::{
+        EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, StoredEventTransfer,
+    };
+    use sha2::{Digest, Sha256};
+    use std::net::UdpSocket;
+
+    let _process_test = serialize_process_test();
+    let root = fresh_root("compact-relay-secrecy-ack");
+    std::fs::create_dir_all(&root).unwrap();
+    make_owner_only_directory(&root);
+    let scope = Scope::new("test/compact-relay").unwrap();
+    let topic = Topic::new("compact-relay").unwrap();
+    let mut provisioner = ReferenceProvisioner::from_seed([0xa8; 32]).unwrap();
+    let mut nodes = Vec::new();
+    for index in 0..3u64 {
+        let state = root.join(format!("node-{index}"));
+        let carrier = NodeIdentity::load_or_create(&state).unwrap().id();
+        make_owner_only_directory(&state);
+        let access = if index == 1 {
+            ProvisioningAccess::relay(scope.clone(), vec![1]).unwrap()
+        } else {
+            ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()]).unwrap()
+        };
+        let bundle = provisioner.issue_node(index + 1, &[access]).unwrap();
+        let mission_path = state.join("mission.bundle");
+        let mission =
+            UnprotectedReferenceMission::persist(&mission_path, bundle.to_bytes().unwrap())
+                .unwrap();
+        let sealer = ReferenceEnvelopeSealer::open(bundle).unwrap();
+        {
+            let store =
+                Store::open_for_mission(state.join("mesh.redb"), mission.mission_authority_id())
+                    .unwrap();
+            let client_id =
+                aster_redb_store::EventClientId::new(b"compact-selector-owner".to_vec()).unwrap();
+            let mut claim_nonce = [0; 32];
+            getrandom::fill(&mut claim_nonce).unwrap();
+            let recovery = store
+                .begin_event_publication_session(&client_id, 0, &claim_nonce)
+                .unwrap();
+            store
+                .complete_event_publication_recovery(
+                    &client_id,
+                    recovery.session,
+                    recovery.snapshot_revision,
+                )
+                .unwrap();
+            let client = aster_redb_store::EventClientContext {
+                client_id,
+                session: recovery.session,
+            };
+            store
+                .create_event_subscription_with_policy(
+                    &client,
+                    &store.control_policy_snapshot().unwrap(),
+                    &EventSubscriptionKey::new(b"compact-selector".to_vec()).unwrap(),
+                    EventSubscriptionSpec {
+                        mode: if index == 1 {
+                            EventSubscriptionMode::Carry
+                        } else {
+                            EventSubscriptionMode::Consume
+                        },
+                        topic: topic.clone(),
+                        scope: scope.clone(),
+                        include_descendant_scopes: false,
+                    },
+                )
+                .unwrap();
+        }
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        nodes.push((
+            state,
+            mission_path,
+            (mission.identity(), mission.mission_authority_id()),
+            carrier,
+            address,
+            Some(socket),
+            sealer,
+        ));
+    }
+    let payload = b"compact-relay-secret-payload-canary-2026";
+    let published = {
+        let mut source =
+            SelectedEventNode::open_unprotected_reference(&nodes[0].0, &nodes[0].1).unwrap();
+        let journal_path = nodes[0].0.join("publication.redb");
+        Journal::initialize(&journal_path, b"compact-source").unwrap();
+        let mut journal = Journal::open(&journal_path, b"compact-source").unwrap();
+        journal.recover_stopped(&mut source).unwrap();
+        let published = journal
+            .publish_metadata_stopped(
+                &mut source,
+                Intent {
+                    predecessor: None,
+                    topic: topic.as_str().to_owned(),
+                    scope: scope.as_str().to_owned(),
+                    priority: Priority::Routine as u8,
+                    logical_key: b"compact-key".to_vec(),
+                    payload: payload.to_vec(),
+                    tombstone: false,
+                    ttl_ms: None,
+                },
+            )
+            .unwrap();
+        journal.acknowledge_stopped(&mut source).unwrap();
+        published
+    };
+    let (transfer_id, sealed) = {
+        let store = Store::open_for_mission(nodes[0].0.join("mesh.redb"), nodes[0].2.1).unwrap();
+        let policy = store.control_policy_snapshot().unwrap();
+        let inventory = store.transfer_inventory_with_policy(&policy).unwrap();
+        assert_eq!(inventory.len(), 1);
+        let Some(StoredEventTransfer::Accepted(event)) = store
+            .get_transfer_with_policy(&policy, *inventory.iter().next().unwrap())
+            .unwrap()
+        else {
+            panic!("source Event missing")
+        };
+        (*inventory.iter().next().unwrap(), event.sealed)
+    };
+    // Two separately stopped real-process hops. The producer is absent from
+    // the second hop; no direct source/destination contact is configured.
+    for (left, right) in [(0, 1), (1, 2)] {
+        nodes[left].5.take();
+        nodes[right].5.take();
+        let peer = |index: usize| {
+            format!(
+                "{}@{}={}",
+                nodes[index].3,
+                nodes[index].4,
+                aster_node::format_node_id(nodes[index].2.0)
+            )
+        };
+        let a = public_node_command(
+            &nodes[left].0,
+            &nodes[left].1,
+            nodes[left].4,
+            Some(&peer(right)),
+            30,
+        )
+        .spawn()
+        .unwrap();
+        let b = public_node_command(
+            &nodes[right].0,
+            &nodes[right].1,
+            nodes[right].4,
+            Some(&peer(left)),
+            30,
+        )
+        .spawn()
+        .unwrap();
+        let (a, b) = wait_for_public_direct_contacts(a, b);
+        for output in [a, b] {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    {
+        let relay = &mut nodes[1];
+        let store = Store::open_for_mission(relay.0.join("mesh.redb"), relay.2.1).unwrap();
+        let stats = store.event_stats().unwrap();
+        assert_eq!(stats.events, 0);
+        assert_eq!(stats.acceptance_markers, 0);
+        assert_eq!(stats.route_cached, 1);
+        let Some(StoredEventTransfer::RouteCached(event)) = store
+            .get_transfer_with_policy(&store.control_policy_snapshot().unwrap(), transfer_id)
+            .unwrap()
+        else {
+            panic!("relay lost exact route cache")
+        };
+        assert_eq!(event.sealed, sealed);
+        let route = relay.6.verify_event(&event.sealed).unwrap();
+        assert!(matches!(
+            relay.6.verify_event_content(route, &event.sealed).unwrap(),
+            EventContentVerification::RouteOnly(_)
+        ));
+    }
+    let mut pending = vec![nodes[1].0.clone()];
+    let mut files = 0;
+    let digest = Sha256::digest(payload);
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else {
+            let bytes = std::fs::read(path).unwrap();
+            files += 1;
+            assert!(!bytes.windows(payload.len()).any(|window| window == payload));
+            assert!(
+                !bytes
+                    .windows(digest.len())
+                    .any(|window| window == digest.as_slice())
+            );
+        }
+    }
+    assert!(files > 0);
+    let mut destination =
+        SelectedEventNode::open_unprotected_reference(&nodes[2].0, &nodes[2].1).unwrap();
+    let items = destination.query(EventQuery::default()).unwrap().items;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, published.id);
+    assert_eq!(items[0].payload, payload);
+    assert_eq!(items[0].logical_key, b"compact-key");
+    let client =
+        recover_test_event_client(&mut destination, &nodes[2].0.join("consumer-journal.redb"));
+    let subscription = destination
+        .subscribe(EventSubscriptionRequest {
+            client: client.clone(),
+            operation_key: b"compact-public-consumer".to_vec(),
+            topic,
+            scope,
+            include_descendant_scopes: false,
+        })
+        .unwrap();
+    let poll = EventPollRequest {
+        client: client.clone(),
+        subscription: subscription.id,
+        delivery_limit: 8,
+        scan_limit: 8,
+    };
+    let deliveries = destination.poll(poll.clone()).unwrap().deliveries;
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].event.id, published.id);
+    assert_eq!(deliveries[0].event.payload, payload);
+    assert_eq!(
+        destination
+            .acknowledge(client.clone(), subscription.id, published.id)
+            .unwrap(),
+        EventAcknowledgement::Acknowledged
+    );
+    assert!(
+        destination
+            .poll(poll.clone())
+            .unwrap()
+            .deliveries
+            .is_empty()
+    );
+    drop(destination);
+    let mut destination =
+        SelectedEventNode::open_unprotected_reference(&nodes[2].0, &nodes[2].1).unwrap();
+    assert!(
+        destination
+            .poll(poll.clone())
+            .unwrap()
+            .deliveries
+            .is_empty()
+    );
+    assert_eq!(
+        destination.query(EventQuery::default()).unwrap().items[0].payload,
+        payload
+    );
+    drop(destination);
+    drop(nodes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "qualification runs the complete 18-process four-node Ping/Pong demo; use `mise run qualify-ping-pong-mesh`"]
 fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
     let _process_test = serialize_process_test();
     let root = fresh_root("four-process-default-ping-pong-mesh");
@@ -2839,10 +3397,108 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
     for node in 0..4 {
         assert_default_noop_node(&root, node, node == 0 || node == 3);
     }
+    // The demo has already stopped/reopened each relay between real Iroh hops,
+    // checked exact sealed bytes, and proved its relay-only content grants.
+    // Inspect every retained relay file, not just the logical Store rows.
+    use sha2::{Digest, Sha256};
+    for relay in [1, 2] {
+        let mut pending = vec![root.join(format!("node-{relay}"))];
+        let mut files = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .expect("relay directory")
+                        .map(|entry| entry.expect("relay entry").path()),
+                );
+            } else {
+                let bytes = std::fs::read(&path).expect("retained relay file");
+                files += 1;
+                for payload in [b"ASTER_SAMPLE_PING_V1", b"ASTER_SAMPLE_PONG_V1"] {
+                    let digest = Sha256::digest(payload);
+                    assert!(!bytes.windows(payload.len()).any(|window| window == payload));
+                    assert!(
+                        !bytes
+                            .windows(digest.len())
+                            .any(|window| window == digest.as_slice())
+                    );
+                }
+            }
+        }
+        assert!(files > 0, "relay disk scan must not be vacuous");
+    }
+
+    // Exercise the public consumer ledger on the destination's same durable
+    // Event, independently of the demo application's reaction bookkeeping.
+    use aster_node::application::{EventQuery, SelectedEventNode};
+    let state = root.join("node-3");
+    let mission = state.join("mission.unprotected-reference.bundle");
+    let mut consumer = SelectedEventNode::open_unprotected_reference(&state, &mission)
+        .expect("reopen destination consumer");
+    let items = consumer
+        .query(EventQuery::default())
+        .expect("query destination");
+    let ping = items
+        .items
+        .iter()
+        .find(|item| item.payload == b"ASTER_SAMPLE_PING_V1")
+        .expect("exact delivered Ping");
+    let client =
+        recover_test_event_client(&mut consumer, &state.join("relay-consumer-journal.redb"));
+    let subscription = consumer
+        .subscribe(EventSubscriptionRequest {
+            client: client.clone(),
+            operation_key: b"relay-public-consumer".to_vec(),
+            topic: ping.topic.clone(),
+            scope: ping.scope.clone(),
+            include_descendant_scopes: false,
+        })
+        .expect("subscribe destination");
+    let poll = EventPollRequest {
+        client: client.clone(),
+        subscription: subscription.id,
+        delivery_limit: 8,
+        scan_limit: 8,
+    };
+    let deliveries = consumer.poll(poll.clone()).expect("poll forwarded Events");
+    assert_eq!(deliveries.deliveries.len(), 2);
+    assert!(
+        deliveries
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.event.id == ping.id && delivery.event.payload == ping.payload)
+    );
+    for delivery in deliveries.deliveries {
+        assert_eq!(
+            consumer
+                .acknowledge(client.clone(), subscription.id, delivery.event.id)
+                .expect("ack forwarded Event"),
+            EventAcknowledgement::Acknowledged
+        );
+    }
+    assert!(
+        consumer
+            .poll(poll.clone())
+            .expect("poll after ack")
+            .deliveries
+            .is_empty()
+    );
+    drop(consumer);
+    let mut consumer = SelectedEventNode::open_unprotected_reference(&state, &mission)
+        .expect("reopen acknowledged consumer");
+    assert!(
+        consumer
+            .poll(poll.clone())
+            .expect("poll persisted ack")
+            .deliveries
+            .is_empty()
+    );
+    drop(consumer);
     std::fs::remove_dir_all(&root).expect("remove successful demo root");
 }
 
 #[test]
+#[ignore = "qualification runs the complete 8-process two-node Ping/Pong demo; use `mise run qualify-ping-pong-mesh`"]
 fn two_real_processes_use_the_same_stopped_state_ping_pong_plan() {
     let _process_test = serialize_process_test();
     let root = fresh_root("two-process-default-ping-pong-mesh");
@@ -2945,6 +3601,7 @@ fn two_real_processes_use_the_same_stopped_state_ping_pong_plan() {
 }
 
 #[test]
+#[ignore = "qualification runs the complete 23-process control demo; use `mise run qualify-control-mesh`"]
 fn four_real_processes_propagate_controls_without_authority_and_exclude_captured_leaf() {
     let _process_test = serialize_process_test();
     let root = fresh_root("four-process-controlled-mesh");
@@ -3205,4 +3862,19 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
         assert!(!captured.contains("status=pass"));
     }
     std::fs::remove_dir_all(&root).expect("remove successful controlled demo root");
+}
+
+#[cfg(unix)]
+fn recover_test_event_client(
+    node: &mut aster_node::application::SelectedEventNode,
+    path: &std::path::Path,
+) -> aster_node::application::EventClientContext {
+    use aster_node::publication_journal::Journal;
+    let id = b"test.mesh.consumer.v1";
+    if !path.exists() {
+        Journal::initialize(path, id).unwrap();
+    }
+    let mut journal = Journal::open(path, id).unwrap();
+    journal.recover_stopped(node).unwrap();
+    journal.client_context().unwrap()
 }

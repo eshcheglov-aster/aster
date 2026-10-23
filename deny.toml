@@ -9,6 +9,10 @@ ignore = [
   # the exact graph, future-compiler warning, removal gate, and prohibition on
   # treating this exception as production admission.
   "RUSTSEC-2026-0173",
+  # The same pilot's compile-time localization configuration parser is also
+  # unmaintained. The scope checker enforces its exact version, registry source,
+  # checksum, and reverse dependency graph; ADR 0018 records migration and exit.
+  "RUSTSEC-2026-0374",
 ]
 
 [licenses]
@@ -33,12 +37,12 @@ allow = [
 [[licenses.exceptions]]
 allow = ["CDLA-Permissive-2.0"]
 name = "webpki-root-certs"
-version = "=1.0.9"
+version = "=1.0.10"
 
 [[licenses.exceptions]]
 allow = ["CDLA-Permissive-2.0"]
 name = "webpki-roots"
-version = "=1.0.9"
+version = "=1.0.10"
 
 [[licenses.exceptions]]
 allow = ["Unlicense"]

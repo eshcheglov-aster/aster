@@ -239,6 +239,25 @@ custody, TTL/expiry/GC, pure-byte identity/deduplication, large-file and resourc
 acceptance, physical/multicarrier execution, mixed implementations, and release
 authorization remain outside this amendment.
 
+## Trust-root security patch review (2026-10-20)
+
+The bounded implementation graph advances `webpki-roots` and
+`webpki-root-certs` from 1.0.9 to exactly 1.0.10 to remove the distrusted emSign
+root covered by RUSTSEC-2026-0381 and RUSTSEC-2026-0383. It also advances
+`rustls-webpki` from 0.103.15 to 0.103.16 for RUSTSEC-2026-0382. Both the root
+workspace and fuzz lockfiles retain these exact versions.
+
+The public crates.io archives for both root-data packages still declare
+`CDLA-Permissive-2.0`. Their license files are byte-identical to the 1.0.9
+files, with SHA-256
+`e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8`.
+`THIRD_PARTY_NOTICES.md` records the new archive checksums, and the license
+checker pins the revised notice text. The two package-scoped exceptions move
+only to `=1.0.10`; no general license permission or advisory suppression is
+added. This maintenance review carries forward the existing license disposition
+for the same two data packages. The original approval above remains historical;
+production admission and the open `DM-8-05` boundary remain unchanged.
+
 ## Controlled Iroh connectivity-relay amendment (2026-08-25)
 
 This amendment advances only the bounded selected carrier route beneath the

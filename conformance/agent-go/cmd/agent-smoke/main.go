@@ -20,6 +20,7 @@ import (
 
 	"connectrpc.com/connect"
 	applicationv1alpha1 "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
+	"github.com/defenseunicorns/aster/conformance/agent-go/internal/numbered"
 )
 
 const (
@@ -53,12 +54,14 @@ type statusInput struct {
 }
 
 type publishInput struct {
-	OperationKeyHex string `json:"operation_key_hex"`
-	Topic           string `json:"topic"`
-	Scope           string `json:"scope"`
-	Priority        string `json:"priority"`
-	LogicalKeyHex   string `json:"logical_key_hex"`
-	PayloadHex      string `json:"payload_hex"`
+	ClientIDHex       string `json:"client_id_hex"`
+	JournalPath       string `json:"journal_path"`
+	OperationSequence uint64 `json:"operation_sequence,omitempty"`
+	Topic             string `json:"topic"`
+	Scope             string `json:"scope"`
+	Priority          string `json:"priority"`
+	LogicalKeyHex     string `json:"logical_key_hex"`
+	PayloadHex        string `json:"payload_hex"`
 }
 
 type expectedEventInput struct {
@@ -80,18 +83,21 @@ type queryInput struct {
 }
 
 type subscribeInput struct {
+	publicationIdentity
 	OperationKeyHex string `json:"operation_key_hex"`
 	Topic           string `json:"topic"`
 	Scope           string `json:"scope"`
 }
 
 type pollInput struct {
+	publicationIdentity
 	SubscriptionIDHex string `json:"subscription_id_hex"`
 	DeliveryLimit     uint32 `json:"delivery_limit"`
 	ScanLimit         uint32 `json:"scan_limit"`
 }
 
 type streamInput struct {
+	publicationIdentity
 	SubscriptionIDHex string              `json:"subscription_id_hex"`
 	DeliveryLimit     uint32              `json:"delivery_limit"`
 	ScanLimit         uint32              `json:"scan_limit"`
@@ -102,6 +108,7 @@ type streamInput struct {
 }
 
 type ackInput struct {
+	publicationIdentity
 	SubscriptionIDHex string `json:"subscription_id_hex"`
 	EventIDHex        string `json:"event_id_hex"`
 }
@@ -184,7 +191,7 @@ func parseOptions(args []string) (options, error) {
 		return options{}, errors.New("invalid arguments")
 	}
 	switch opts.command {
-	case "status", "publish", "query", "subscribe", "poll", "stream", "ack", "recovery-begin", "recovery-resume":
+	case "publication-init", "publication-ack", "status", "publish", "query", "subscribe", "poll", "stream", "ack", "recovery-begin", "recovery-resume":
 		return opts, nil
 	default:
 		return options{}, errors.New("invalid arguments")
@@ -615,45 +622,23 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 			}
 			time.Sleep(time.Millisecond)
 		}
-	case "publish":
-		var value publishInput
+	case "publication-init":
+		var value publicationIdentity
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		operationKey, err := decodeOperationKeyHex(value.OperationKeyHex)
+		id, err := decodeOperationKeyHex(value.ClientIDHex)
 		if err != nil {
 			return err
 		}
-		logicalKey, err := decodeHex(value.LogicalKeyHex)
-		if err != nil {
+		if err = numbered.Initialize(value.JournalPath, id); err != nil {
 			return err
 		}
-		payload, err := decodeHex(value.PayloadHex)
-		if err != nil {
-			return err
-		}
-		priorityValue, err := priority(value.Priority)
-		if err != nil {
-			return err
-		}
-		response, err := client.PublishEvent(ctx, request(&applicationv1alpha1.PublishEventRequest{
-			OperationKey: operationKey,
-			Topic:        value.Topic,
-			Scope:        value.Scope,
-			Priority:     priorityValue,
-			LogicalKey:   logicalKey,
-			Payload:      payload,
-		}, token))
-		if err != nil {
-			return err
-		}
-		message := response.Msg
-		return writeResult(output, result{
-			"status": "ok", "event_id_hex": hex.EncodeToString(message.Id),
-			"publisher_id_hex":  hex.EncodeToString(message.Publisher),
-			"publisher_counter": message.PublisherCounter, "event_sequence": message.EventSequence,
-			"acceptance_marker": message.AcceptanceMarker, "inserted": message.Inserted,
-		})
+		return writeResult(output, result{"status": "ok"})
+	case "publication-ack":
+		return acknowledgePublicationCommand(ctx, client, token, input, output)
+	case "publish":
+		return publishCommand(ctx, client, token, input, output)
 	case "query":
 		var value queryInput
 		if err := decodeInput(input, &value); err != nil {
@@ -680,11 +665,22 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
+		journal, err := openPublication(ctx, client, token, publishInput{JournalPath: value.JournalPath, ClientIDHex: value.ClientIDHex})
+		if err != nil {
+			return err
+		}
+		defer journal.Close()
+		owner, err := journal.ClientContext()
+		if err != nil {
+			return err
+		}
+
 		operationKey, err := decodeOperationKeyHex(value.OperationKeyHex)
 		if err != nil {
 			return err
 		}
 		response, err := client.CreateEventSubscription(ctx, request(&applicationv1alpha1.CreateEventSubscriptionRequest{
+			Client:       owner,
 			OperationKey: operationKey, Topic: value.Topic, Scope: value.Scope,
 		}, token))
 		if err != nil {
@@ -696,11 +692,22 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
+		journal, err := openPublication(ctx, client, token, publishInput{JournalPath: value.JournalPath, ClientIDHex: value.ClientIDHex})
+		if err != nil {
+			return err
+		}
+		defer journal.Close()
+		owner, err := journal.ClientContext()
+		if err != nil {
+			return err
+		}
+
 		subscriptionID, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 		if err != nil {
 			return err
 		}
 		response, err := client.PollEvents(ctx, request(&applicationv1alpha1.PollEventsRequest{
+			Client:         owner,
 			SubscriptionId: subscriptionID, DeliveryLimit: value.DeliveryLimit, ScanLimit: value.ScanLimit,
 		}, token))
 		if err != nil {
@@ -719,11 +726,22 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil || value.Count == 0 || value.Count > maxStreamDeliveries {
 			return errors.New("invalid input")
 		}
+		journal, err := openPublication(ctx, client, token, publishInput{JournalPath: value.JournalPath, ClientIDHex: value.ClientIDHex})
+		if err != nil {
+			return err
+		}
+		defer journal.Close()
+		owner, err := journal.ClientContext()
+		if err != nil {
+			return err
+		}
+
 		subscriptionID, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 		if err != nil {
 			return err
 		}
 		stream, err := client.StreamEvents(ctx, request(&applicationv1alpha1.StreamEventsRequest{
+			Client:         owner,
 			SubscriptionId: subscriptionID, DeliveryLimit: value.DeliveryLimit, ScanLimit: value.ScanLimit, PollBackoffMs: value.PollBackoffMS,
 		}, token))
 		if err != nil {
@@ -763,6 +781,16 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
+		journal, err := openPublication(ctx, client, token, publishInput{JournalPath: value.JournalPath, ClientIDHex: value.ClientIDHex})
+		if err != nil {
+			return err
+		}
+		defer journal.Close()
+		owner, err := journal.ClientContext()
+		if err != nil {
+			return err
+		}
+
 		subscriptionID, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 		if err != nil {
 			return err
@@ -772,6 +800,7 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 			return err
 		}
 		response, err := client.AcknowledgeEvent(ctx, request(&applicationv1alpha1.AcknowledgeEventRequest{
+			Client:         owner,
 			SubscriptionId: subscriptionID, EventId: eventID,
 		}, token))
 		if err != nil {

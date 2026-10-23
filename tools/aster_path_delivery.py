@@ -124,7 +124,10 @@ def _pinned_docker(run: Callable) -> Callable:
 class OwnedDocker:
     """Resources for the fixed delivery run, never authorized by container name."""
 
-    def __init__(self, docker: str, directory: Path, run: Callable):
+    def __init__(self, docker: str, directory: Path, run: Callable, *, image: str = "aster-path-delivery:local"):
+        if not isinstance(image, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}", image) is None:
+            raise ExecutionError("image-reference-invalid")
+        self.image = image
         metadata = directory.lstat()
         if (directory.is_symlink() or not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700):
@@ -216,7 +219,7 @@ class OwnedDocker:
                 "--label", self.label, "--cap-drop", "ALL", "--user", "0:0" if caps else "10001:10001",
                 "--security-opt", "no-new-privileges", "--log-driver", "none",
                 *[part for cap in caps for part in ("--cap-add", cap)],
-                *network, "aster-path-delivery:local", *command,
+                *network, self.image, *command,
             ], 30)
         finally:
             if cidfile.exists() or cidfile.is_symlink():
@@ -510,7 +513,8 @@ def _validate_status(raw: bytes) -> dict[str, object]:
     return document
 
 
-def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], event_id: str | None = None) -> list[str]:
+def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], event_id: str | None = None,
+                *, journal: tuple[str, str] = ("/clab/state/publication.redb", "path-delivery-source")) -> list[str]:
     argv = [
         docker,
         "exec",
@@ -527,11 +531,12 @@ def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], ev
         "--scope",
         "demo/playground",
     ]
+    if action in ("publication-init", "subscribe", "publish"):
+        argv.extend(["--journal", journal[0], "--client-id", journal[1]])
     if action == "subscribe":
         argv.extend(["--operation-key", "path-delivery-subscription"])
     elif action == "publish":
         argv.extend([
-            "--operation-key", str(plan["operation_key"]),
             "--logical-key", str(plan["logical_key"]),
             "--payload", str(plan["payload"]),
             "--id-only",
@@ -633,8 +638,10 @@ def execute_direct(raw: bytes, *, docker: Path, ip: Path, run: Callable = _run_c
             if run([exe, "exec", "--user", "10001:10001", cid,
                     lib + "delivery-agent.py", "verify", role], 5) != b"CAPABILITIES status=pass\n":
                 raise ExecutionError("capability-mismatch")
+        receiver_journal = ("/clab/state/subscription.redb", "path-delivery-receiver")
         stage = "subscribe"
-        run(_event_exec(exe, nodes["node-b"], "subscribe", plan), 30)
+        run(_event_exec(exe, nodes["node-b"], "publication-init", plan, journal=receiver_journal), 30)
+        run(_event_exec(exe, nodes["node-b"], "subscribe", plan, journal=receiver_journal), 30)
         stage = "netem"
         observed = _strict_json(transient("wan-setup", ["--network", "container:" + wan],
                                [lib + "delivery-wan.py", "configure"], "NET_ADMIN"), "netem")
@@ -648,6 +655,7 @@ def execute_direct(raw: bytes, *, docker: Path, ip: Path, run: Callable = _run_c
                 or len({row.get("interface") for row in observed}) != 2):
             raise ExecutionError("netem-readback")
         stage = "publish"
+        run(_event_exec(exe, nodes["node-a"], "publication-init", plan), 30)
         event_id = _canonical_event_id(run(_event_exec(exe, nodes["node-a"], "publish", plan), 30))
         stage = "event-oracle"
         event = _strict_json(run(_event_exec(exe, nodes["node-b"], "wait", plan, event_id), 60), "event")

@@ -26,6 +26,31 @@ Most engineers should read the
 the outcome, workstream handoffs, G1–G6 sequence, current blockers, and
 definition of done. This document remains the exact profile authority.
 
+## Current API and historical qualification boundary
+
+The qualification validator's `PROFILE_DIGEST` binds the exact bytes of this
+canonical document, including the publication API clarifications below.
+
+The accepted v0.1 publication contract below predates the numbered-only
+switchover. Its `PublishEvent` method, caller-chosen operation keys, and
+1,024-key evaluation workload describe that approved contract and its retained
+evidence. Current builds remove `PublishEvent` and `PublishEvents`; they expose
+`PublishNumberedEvent` and `PublishNumberedEvents` with stable client identity,
+a durable journal, fenced recovery, sequence-based exact replay, and explicit
+result acknowledgement. Use the
+[current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication)
+and [Decision 0044's numbered amendment](../decisions/0044-pipeline-durable-event-publication.md#numbered-publication-amendment--2026-10-08)
+for current API behavior.
+
+This profile and its historical receipts do not qualify the current publication
+API. Applying the evaluation claim to a numbered build requires a reviewed
+profile amendment covering the changed API, client/server capacity and recovery
+lifecycle, and qualification evidence bound to the exact build and artifacts.
+The original operation-key limits must not be translated into numbered-client
+or result limits without that review. This notice preserves the accepted
+profile's other constraints and historical evidence boundaries; it grants no
+new approval or requirement credit.
+
 ## Summary
 
 This profile defines the first reusable Aster customer-evaluation profile as a
@@ -333,6 +358,10 @@ development/test tools only. They cannot qualify v0.1.
 
 ## Application boundary and bindings
 
+The method list in this section is the approved v0.1 contract, not the current
+service schema. See the [current API boundary](#current-api-and-historical-qualification-boundary)
+above before using it for a new build.
+
 The normative out-of-process boundary is the repository-owned protobuf schema
 and ConnectRPC service on authenticated loopback TCP. The supported methods are:
 
@@ -381,6 +410,11 @@ attempt.
   acknowledgement is durably accepted.
 
 ## Durable publish-operation containment
+
+These limits apply to the approved v0.1 operation-key model. For current
+numbered publication, the journal, client, and result budgets have separate
+bounds; this section does not specify those budgets or qualify their workload.
+See the [current API boundary](#current-api-and-historical-qualification-boundary).
 
 v0.1 is operationally limited to **1,024 distinct
 `PublishEvent.operation_key` values over the lifetime of one state directory,

@@ -168,6 +168,11 @@ required to bind facts that do not exist yet:
    The candidate supplies the profile digest as the required
    `prerequisites.profile_digest` field; it must equal the digest of the retained
    accepted profile bytes and must never default to the machine-schema digest.
+   The digest binds the exact bytes of the
+   [canonical profile](linux-event-mvp-evaluation-profile-v0.1.md), including
+   its publication API clarifications. Changes to that document require an
+   explicit update to the validator's `PROFILE_DIGEST`; historical receipts
+   retain the digest of their original profile revision.
 2. The G2 key binds the root key plus the G1 exit digest, full source commit,
    dependency lock/toolchain, sanitized strict configuration, and harness
    source/version/configuration digest.

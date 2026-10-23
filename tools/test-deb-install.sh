@@ -100,7 +100,7 @@ PY
 }
 wait_ready
 python3 - <<'PY'
-import json, urllib.request
+import json, urllib.request, subprocess
 from pathlib import Path
 token = Path("/etc/aster/agent-credentials/client-token").read_text().strip()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -112,14 +112,24 @@ def rpc(method, data):
     with opener.open(req, timeout=10) as response:
         return json.load(response)
 rpc("GetStatus", {})
-sub = rpc("CreateEventSubscription", {"operationKey": "ZGViaWFuLXN1YnNjcmlwdGlvbg==",
-    "topic": "chat.events", "scope": "mission/team/alpha"})["subscriptionId"]
-event = rpc("PublishEvent", {"operationKey": "ZGViaWFuLXB1Ymxpc2g=", "topic": "chat.events",
-    "scope": "mission/team/alpha", "priority": "PRIORITY_ROUTINE",
-    "logicalKey": "YXNzZXQtNw==", "payload": "cmVhZHk="})
-page = rpc("PollEvents", {"subscriptionId": sub, "deliveryLimit": 8, "scanLimit": 32})
-assert any(d["event"]["id"] == event["id"] for d in page["deliveries"])
-rpc("AcknowledgeEvent", {"subscriptionId": sub, "eventId": event["id"]})
+journal = ["--journal", "/var/lib/aster-agent/debian-publication.redb", "--client-id", "debian-install-smoke"]
+subprocess.run(["asterctl", "publication-init", *journal], check=True, capture_output=True)
+sub_response = subprocess.run(["asterctl", "--json", "--token-file", "/etc/aster/agent-credentials/client-token",
+    "--host", "127.0.0.1", "--port", "8181", "subscribe", *journal,
+    "--operation-key", "debian-subscription", "--scope", "mission/team/alpha", "chat.events"], check=True, capture_output=True)
+sub = json.loads(sub_response.stdout)["subscriptionId"]
+publication = subprocess.run(["asterctl", "--json", "--token-file", "/etc/aster/agent-credentials/client-token",
+    "--host", "127.0.0.1", "--port", "8181", "publish", *journal, "--topic", "chat.events",
+    "--scope", "mission/team/alpha", "--logical-key", "asset-7", "ready"], check=True, capture_output=True)
+event_id = json.loads(publication.stdout)["result"]["receipt"]["eventId"]
+recovered = subprocess.run(["asterctl", "--json", "--token-file", "/etc/aster/agent-credentials/client-token",
+    "--host", "127.0.0.1", "--port", "8181", "publication-recover", *journal], check=True, capture_output=True)
+client = json.loads(recovered.stdout)["client"]
+page = rpc("PollEvents", {"client": client, "subscriptionId": sub, "deliveryLimit": 8, "scanLimit": 32})
+assert any(d["event"]["id"] == event_id for d in page["deliveries"])
+rpc("AcknowledgeEvent", {"client": client, "subscriptionId": sub, "eventId": event_id})
+subprocess.run(["asterctl", "--token-file", "/etc/aster/agent-credentials/client-token", "--host", "127.0.0.1",
+    "--port", "8181", "publication-ack", *journal, "--sequence", "1"], check=True, capture_output=True)
 print("Protected local Event publish/delivery/ack: OK")
 PY
 systemctl restart aster-agent.service

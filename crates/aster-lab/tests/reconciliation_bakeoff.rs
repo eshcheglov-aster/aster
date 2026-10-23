@@ -531,23 +531,46 @@ fn assert_exact(expected: &Difference, actual: &Measurement, algorithm: &str) ->
     Ok(())
 }
 
-#[test]
-fn candidate_and_real_aster_reducer_match_exact_oracle() -> TestResult<()> {
-    let cases = [
-        (1, 0, Shape::Uniform),
-        (1, 1, Shape::Clustered),
-        (32, 1, Shape::Uniform),
-        (256, 10, Shape::Clustered),
-        (512, 257, Shape::Uniform),
-        (1_000, 10, Shape::Uniform),
-    ];
-    for (items_each, delta_each, shape) in cases {
-        let (left, right) = balanced_fixture(items_each, delta_each, shape)?;
-        let expected = exact_difference(&left, &right);
-        assert_exact(&expected, &measure_aster(&left, &right)?, "Aster")?;
-        assert_exact(&expected, &measure_negentropy(&left, &right)?, "Negentropy")?;
-    }
+fn assert_candidate_matches_oracle(
+    items_each: usize,
+    delta_each: usize,
+    shape: Shape,
+) -> TestResult<()> {
+    let (left, right) = balanced_fixture(items_each, delta_each, shape)?;
+    let expected = exact_difference(&left, &right);
+    assert_exact(&expected, &measure_aster(&left, &right)?, "Aster")?;
+    assert_exact(&expected, &measure_negentropy(&left, &right)?, "Negentropy")?;
     Ok(())
+}
+
+#[test]
+fn exact_oracle_matches_one_uniform_item_without_delta() -> TestResult<()> {
+    assert_candidate_matches_oracle(1, 0, Shape::Uniform)
+}
+
+#[test]
+fn exact_oracle_matches_one_clustered_item_with_full_delta() -> TestResult<()> {
+    assert_candidate_matches_oracle(1, 1, Shape::Clustered)
+}
+
+#[test]
+fn exact_oracle_matches_thirty_two_uniform_items_with_one_delta() -> TestResult<()> {
+    assert_candidate_matches_oracle(32, 1, Shape::Uniform)
+}
+
+#[test]
+fn exact_oracle_matches_two_hundred_fifty_six_clustered_items_with_ten_delta() -> TestResult<()> {
+    assert_candidate_matches_oracle(256, 10, Shape::Clustered)
+}
+
+#[test]
+fn exact_oracle_matches_five_hundred_twelve_uniform_items_with_majority_delta() -> TestResult<()> {
+    assert_candidate_matches_oracle(512, 257, Shape::Uniform)
+}
+
+#[test]
+fn exact_oracle_matches_one_thousand_uniform_items_with_ten_delta() -> TestResult<()> {
+    assert_candidate_matches_oracle(1_000, 10, Shape::Uniform)
 }
 
 #[test]
@@ -670,7 +693,7 @@ impl Algorithm {
     const fn label(self) -> &'static str {
         match self {
             Self::Aster => "aster_merkle",
-            Self::Negentropy => "negentropy_0_5_1",
+            Self::Negentropy => "negentropy_0_5_2",
         }
     }
 

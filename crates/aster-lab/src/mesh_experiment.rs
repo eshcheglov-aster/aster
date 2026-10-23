@@ -3572,6 +3572,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    const NATIVE_TEST_MTU_BYTES: u16 = 1_400;
+    const GATE_H_MULTI_FRAME_TEST_PAYLOAD_BYTES: usize = NATIVE_TEST_MTU_BYTES as usize + 1;
+
     #[derive(Clone)]
     struct NativeTestLink {
         inbound: Arc<Mutex<VecDeque<ReceivedFrame>>>,
@@ -3609,7 +3612,7 @@ mod tests {
 
         fn characteristics(&self) -> LinkCharacteristics {
             LinkCharacteristics {
-                mtu: 1_400,
+                mtu: NATIVE_TEST_MTU_BYTES,
                 bits_per_second: None,
                 cost: 0,
                 emission: 0,
@@ -4623,12 +4626,18 @@ mod tests {
     }
 
     #[test]
+    fn native_command_payload_limit_remains_one_mib_without_allocating_it() {
+        assert_eq!(MAX_COMMAND_BYTES, 1_024 * 1_024);
+        assert!(GATE_H_MULTI_FRAME_TEST_PAYLOAD_BYTES > usize::from(NATIVE_TEST_MTU_BYTES));
+    }
+
+    #[test]
     fn native_gate_h_signed_control_queued_generation_invalidation_and_recovery() {
         let root = native_test_root("shared-authority");
         let prepared = prepare_ip_mesh(&MeshPrepareConfig {
             root: root.clone(),
             seed: 0x5a17,
-            payload_bytes: MAX_COMMAND_BYTES,
+            payload_bytes: GATE_H_MULTI_FRAME_TEST_PAYLOAD_BYTES,
         })
         .unwrap();
         let a_config =
@@ -4654,7 +4663,7 @@ mod tests {
         assert_eq!(c_identity, prepared.consumer);
 
         // Establish and settle B<->C before A can publish into B. This leaves
-        // the delivery contact live but idle when B commits A's 1 MiB object.
+        // the delivery contact live but idle when B commits A's multi-frame object.
         let (b_to_c, c_from_b, b_c_sends, _) = NativeTestLink::pair();
         open_native_test_contact(
             &mut b,

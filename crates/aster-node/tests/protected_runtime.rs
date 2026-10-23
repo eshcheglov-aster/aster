@@ -690,6 +690,29 @@ fn raw_canonical_bundle_never_reaches_protected_provider() {
 }
 
 #[test]
+fn malformed_recovered_plaintext_fails_before_state_creation() {
+    let root = TestRoot::new("malformed-recovered-plaintext");
+    let state = root.path().join("selected-state");
+    let protected = b"protected-envelope-for-malformed-recovery";
+    let mut provider = RecordingUnprotector::succeeding(b"not-a-provisioning-bundle".to_vec());
+
+    let error = bootstrap_error(NodeConfig::from_protected_bytes(
+        &state,
+        protected,
+        valid_options(),
+        &mut provider,
+    ));
+
+    assert_eq!(error.kind(), NodeBootstrapErrorKind::InvalidBundle);
+    assert_eq!(provider.calls, 1);
+    assert_eq!(
+        provider.seen_protected.as_deref(),
+        Some(protected.as_slice())
+    );
+    assert!(!state.exists());
+}
+
+#[test]
 fn protected_rejection_is_sanitized_and_source_free() {
     const PROTECTED_CANARY: &str = "protected-envelope-canary-do-not-log";
     const STATE_CANARY: &str = "state-path-canary-do-not-log";

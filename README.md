@@ -15,7 +15,7 @@ constrained, and disconnected operation.
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
 > production-authorized system. Event, State, Record, and Blob have live Rust
-> APIs; Event also has a local ConnectRPC API. Review the
+> APIs; Event and Blob also have a local agent API. Review the
 > [current implementation boundary](#current-implementation-boundary),
 > [security gates](docs/security.md), [conformance status](docs/validation/conformance.md),
 > and [requirements status](docs/validation/requirements-status.md) before
@@ -94,14 +94,16 @@ decision tree and worked examples.
 
 ## Integrate an application
 
-For new integrations, start with the local ConnectRPC agent. It exposes the
-live Event authority over Connect, gRPC, and gRPC-Web using a checked-in
-Protobuf schema and does not require a hosted Buf Schema Registry.
+For new integrations, start with the local agent. It exposes the live Event
+authority over Connect, gRPC, and gRPC-Web plus bounded Blob publish/read
+streams over native gRPC using a checked-in Protobuf schema and does not
+require a hosted Buf Schema Registry.
 
 | Integration | Start here | Current boundary |
 |---|---|---|
-| **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
+| **Connect, gRPC, or gRPC-Web** | [Local agent](docs/quickstart/connect-agent.md) | Live Event and local status over Connect/gRPC/gRPC-Web; Blob publish/read over native gRPC; authenticated loopback process |
 | **Command line** | [asterctl](crates/asterctl/README.md) | CLI utility for introspecting and controlling Aster nodes |
+| **Human operator** | [Operator guide](docs/operator-guide.md) | Packaged installation, authentication, health, Event use, and Blob file transfer without developer tooling |
 | **Docker Compose deployment** | [Compose container delivery](docs/release/docker-compose.md) | Manual, no-Swarm container profile with a dedicated file-secret provider; no Docker host profile is qualified |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
 | **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live handles and exclusive stopped facades; direct-Iroh reconciliation; State latest-value and Record conflict-preserving delivery |
@@ -138,7 +140,7 @@ provisioning remain open work.
 
 | Surface | Implemented | Still open |
 |---|---|---|
-| **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; semantic-v7 receipt-free ordered pages with full-page receiver validation, receiver-local batched commits for consecutive content-capable durable/finite/mixed entries, and receipt-free route-only and blind ReceiveOnly Event traffic; semantic-v6 compatibility fallback; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once application delivery; experimental crash-safe numbered publication with sparse result compaction | Physical performance/resource validation of v7 pages and receiver batching, coherent numbered ownership for subscriptions/delivery, lost-journal recovery and client retirement, atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
+| **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; semantic-v7 receipt-free ordered pages with full-page receiver validation, receiver-local batched commits for consecutive content-capable durable/finite/mixed entries, and receipt-free route-only and blind ReceiveOnly Event traffic; semantic-v6 compatibility fallback; live Rust and local ConnectRPC APIs; client-owned durable consume/carry selectors and at-least-once delivery fenced by recovered sessions; numbered-only crash-safe publication with durable application journals and sparse result compaction | Physical performance/resource validation of v7 pages and receiver batching, lost-journal recovery and client retirement, atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
 | **State** | Live or stopped publication/query, causal latest-value projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and local delivery-ledger status | Peer/contact/convergence status, synthetic withdrawals, dynamic network interests, selected-node bindings, finite TTL, relay support, expiry, and garbage collection |
 | **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and local delivery-ledger status | Peer/contact/convergence status, selected-node bindings, automatic merge execution, finite TTL, relay support, expiry, and garbage collection |
 | **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, local durable transfer progress, local ConnectRPC and `asterctl` publish/read with durable or finite TTL, semantic-v7/v8 receipt-free Blob range streams with resumable staging, authenticated semantic-v8 finite-TTL custody, bounded pressure recovery of strictly lower-priority Blob work, crash-resumable manifest-authorized reclamation, bounded invalid-work maintenance, and expiry of retained retirement records after 45 days of accumulated conservative lower-bound age | Peer/convergence status, route-only relay/custody, arbitrary-peer recovery, public GC controls, and Blob lifetime fields in the FFI surface |
@@ -225,6 +227,7 @@ conventional database or broker will usually be simpler.
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
 | Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/validation/requirements-status.md), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Deploy the Compose container profile | [Compose operator procedure](docs/release/docker-compose.md) and [schema v2](docs/reference/aster-agent-config-v2.md) |
+| Install and operate a packaged node | [Human operator guide](docs/operator-guide.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |
 
 ## Repository map

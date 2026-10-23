@@ -8,14 +8,17 @@ gRPC-Web on plaintext loopback TCP. On Linux, it additionally serves bounded
 Blob publish/read streams through native gRPC. On non-Linux hosts, `ReadBlob`
 remains available to a capable native-gRPC client, but `PublishBlob` is
 unsupported because secure upload staging is Linux-only; `asterctl blob-read`
-also requires Linux anonymous-file finalization. It does not expose keys,
+also requires Linux atomic no-replace output finalization in an owner-controlled
+directory. It does not expose keys,
 sealed content, carriers, transport choice, reconciliation messages, or
 mission provisioning over RPC.
 
-The customer profile is single-scope, accepts exact manual peers, and permits
-at most one customer-controlled pinned connectivity relay. The agent does not
-include State or Record operations, Blob subscription/status operations,
-automatic discovery, bridges, or multi-scope forwarding.
+The customer profile accepts exact manual peers, permits at most one
+customer-controlled pinned connectivity relay, and can configure exact Blob
+topic/scope selectors, each independently subject to mission authorization. It
+has no wildcard/descendant or generic multi-scope forwarding. The agent does
+not include State or Record operations, Blob subscription/status operations,
+automatic discovery, or bridges.
 
 ## Choose the correct runtime boundary
 
@@ -49,6 +52,65 @@ Exit `0` is silent success. A nonzero result contains only a fixed sanitized
 rule category. Validation reads the configuration, optional relay roots, and
 both credential files, but does not create/open state, bind sockets, or invoke
 a protected provider.
+
+## Configure optional Blob mesh receipt
+
+Blob application access and Blob network receipt are separate. The public agent
+API can publish and read locally authorized Blobs without a mesh receive
+interest. To receive matching Blob work from peers after restart, configure
+`mesh.blob_interests` with unique exact `TOPIC@SCOPE` values and configure all
+three nonzero `storage.blob_depot` limits. The version-one reference contains a
+complete copyable file; these are its relevant valid JSON objects:
+
+```json
+{
+  "mesh": {
+    "bind": "0.0.0.0:8183",
+    "emission_policy": "normal",
+    "sync_interval_ms": 500,
+    "blob_interests": [
+      "imagery.maps@mission/team/alpha"
+    ],
+    "peers": []
+  },
+  "storage": {
+    "max_items": 10000,
+    "max_payload_bytes": 67108864,
+    "blob_depot": {
+      "max_bytes": 67108864,
+      "max_chunks": 4096,
+      "max_variants": 64
+    },
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
+  }
+}
+```
+
+Absent or empty interests mean receive none. At most 256 are accepted;
+malformed selectors, descendant/wildcard intent, a repeated canonical pair, or
+a 257th selector fails validation without echoing its value. A nonempty list
+without explicit depot limits also fails. Depot limits may be configured with
+an empty list to bound local publication; their byte, chunk-row, and
+epoch-specific variant accounting is aggregate across active, unfinished, and
+deletion-owned depot work as described in the
+[configuration reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation).
+
+The selector is receive policy, not authorization. Current mission
+route/content authorization, epoch, and revocation checks remain authoritative.
+The interest travels inside the authenticated contact, but authenticated peers
+can observe the exact configured topic/scope interest metadata under the current
+policy. Review that metadata exposure before enabling an interest.
+
+Changing Blob interests or depot limits requires restart. Older agents reject
+the new fields as unknown, so a binary rollback must also restore a
+configuration without them. Receiving network content still does not create an
+application Blob subscription: public Blob API access, static mesh receive
+interests, and the Rust-only application subscription surface are three
+independent controls.
 
 For the provider-composed artifact, the supported start interface is:
 
@@ -92,14 +154,12 @@ delivery pressure. The approved profile remains unchanged: operation
 delivery workload saturates at 256. A higher configured limit does not approve
 a larger evaluation workload.
 
-In `publish_operation_capacity`, `ledger_mode` identifies the active mutually
-exclusive `LEGACY` or `NUMBERED` ledger. `rows`/`bytes` report that ledger's
-actual use and `row_hard_limit`/`byte_hard_limit` report configured candidate
-limits. In legacy mode, `active_rows`, `retired_rows`, and `reverse_rows`
-expose compact retirement. In numbered mode those legacy counters are zero;
-`numbered_clients`, `numbered_outstanding_results`, and
-`numbered_reverse_rows` provide the exact breakdown, and acknowledging a result
-reduces `rows` and `bytes` while leaving its client record durable.
+In `publish_operation_capacity`, normal status always reports `NUMBERED`,
+including a fresh store. `rows`/`bytes` are the actual client plus sparse-result
+use; the configured candidate limits remain separate from the frozen evaluation
+profile. Legacy active/retired/reverse counters are zero. `numbered_clients`,
+`numbered_outstanding_results`, and `numbered_reverse_rows` give the breakdown.
+Acknowledgement reduces result rows and bytes while retaining the client.
 
 `ordinary_remaining` and `warning_state` use the active ledger's record and
 byte accounting. Numbered headroom conservatively reserves 292 logical bytes
@@ -109,42 +169,24 @@ headroom within the hard limits beyond ordinary admission. The candidate
 ordinary record/byte occupancy, then `EXHAUSTED` when no ordinary record fits.
 Candidate headroom can remain positive after the approved profile is exhausted.
 
-`rolling_accept_rate` is newly committed ledger rows in the last monotonic 60
-seconds divided by 60. New legacy aliases and direct retired fences count; in
-numbered mode, new client and outstanding-result rows count. Exact retries,
-session takeovers, acknowledgements, conflicts, and failed admission do not.
-The window starts empty on restart and expires samples at exactly 60 seconds.
-The estimate in
-`estimated_seconds_to_exhaustion` rounds ordinary headroom/rate up to whole
-seconds, saturates at `u64::MAX`, and is zero without an observed rate or
-headroom. It is planning information; warning state remains occupancy-only
-and does not assume that content expiry frees permanent operation records.
+`rolling_accept_rate` counts first committed numbered publications during the
+last monotonic 60 seconds, divided by 60. Claims, retries, acknowledgement,
+retirement, and failed admission add no work. The window starts empty on
+restart. The exhaustion estimate is conservative headroom divided by this
+rate; it is planning information, not a validated throughput result.
 
-For the legacy ledger, nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`,
-or `FAILED`, with `scanned`/`total` counting ledger and reverse rows in one fixed
-snapshot. Completion includes accounting checks; later commits belong to the
-next pass. Failure closes new legacy Event publication and leaves
-usage/headroom at the last successfully read figures, which must not be trusted
-as current capacity. In numbered mode this field still describes only the
-legacy background audit and does not claim numbered-ledger audit coverage.
-
-In legacy mode, every operation key remains bound to its mission and intent
-after payload retirement. In numbered mode, client records remain durable and
-sequence numbers are never reused, while acknowledgement reclaims the result
-and reverse row. Plan a new mission namespace or a larger prequalified limit
-before mission start when durable capacity is insufficient. Never manually
-delete ledger rows or reuse legacy keys or numbered sequences. See the
-[capacity reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation)
-for configuration details; no larger-capacity qualification is claimed here.
-
-Only `GET` with no body is accepted. Unknown paths return `404`, other methods
-return `405`, and responses contain no node, mission, peer, path, queue, or
-failure detail. Use authenticated `GetStatus` when an application needs its
-bounded synchronization snapshot.
+Normal startup is numbered-only, including a fresh store with zero clients.
+A nonempty old Event operation ledger is refused before schema migration or
+custody maintenance. Keep that state for explicit read-only inspection and
+provision a fresh store; there is no automatic deletion or conversion. The
+legacy audit status field remains historical diagnostic metadata and does not
+claim a background numbered-ledger audit. Numbered clients remain durable,
+while acknowledgement removes committed sparse result rows. Content expiry
+alone does not acknowledge application progress.
 
 ## Publish Events with a finite lifetime
 
-On Linux, `PublishEventRequest.ttl_ms` optionally selects a positive lifetime
+On Linux, `PublishNumberedEventRequest.ttl_ms` optionally selects a positive lifetime
 in milliseconds. For example, add `"ttlMs": "30000"` to a Connect JSON
 publication to retain the Event for 30 seconds of tracked custody age. Omit
 `ttl_ms` for the existing durable behavior. Zero and finite tombstones return
@@ -157,12 +199,12 @@ across nodes; forwarding never resets it. Unknown clock continuity withholds
 finite Events rather than assuming they are fresh. See the
 [custody clock and forwarding contract](selected-custody-api.md#understand-age-and-expiry).
 
-Publication results and Events in query, poll, and stream responses include
-`ttl_ms`, the original duration, not remaining lifetime. TTL participates in
-operation-key intent: changing it under the same key returns the existing
-operation-conflict error. An exact retry before expiry returns the original
-result; after retirement it returns nonretryable `NotFound`. Use a new operation
-key only for intentional new work.
+Events in query, poll, and stream responses include the original `ttl_ms`.
+A numbered publication returns an immutable receipt and current content
+availability. TTL participates in the journaled intent: changing it under the
+same client and sequence conflicts. Exact replay can still return the original
+receipt after content retirement, until the application acknowledges it;
+acknowledged sequences cannot be published again.
 
 At expiry, query, poll, stream, and forwarding withhold the Event. Existing
 bounded maintenance runs during publication, reads, and periodic runtime work;
@@ -173,25 +215,23 @@ enrollment, or manual deletion call is required. Expiry does not prove that any
 consumer processed the Event. Database files need not shrink when rows are
 removed.
 
-This is an additive implementation extension beyond the approved Linux Event
-MVP v0.1 profile, which still excludes finite TTL. It does not enlarge the
-approved workload or add retained qualification evidence. The operation ledger
-still has its configured lifetime limit (default 1,000,000 records) and keeps
-compact permanent retry fences. Custody retirement fences and causal history
-have separate retention boundaries; content reuse is not indefinite bounded
-operation. Global deletion propagation remains separate. The experimental
-numbered publication profile below supplies bounded local publication-result
-compaction; it does not change mesh-wide Event ordering or deletion
-propagation.
+Finite TTL remains beyond the approved Linux Event MVP v0.1 profile, which
+excludes finite TTL and predates numbered-only publication. That historical
+profile and its retained evidence do not qualify the current API. Numbered
+client rows and sparse publication results have configured count and byte
+limits; acknowledgement compacts results without allowing sequence reuse.
+Custody retirement fences and causal history have separate retention
+boundaries. Content reuse does not establish indefinitely bounded total state,
+and global deletion propagation remains separate.
 
-Use an upgraded server with regenerated clients for finite publication. Older
-servers can ignore new Protobuf fields; require the returned `ttl_ms` to match
-the request before treating publication as finite. Old clients that omit TTL
-continue to publish durable Events. Mesh wire and storage formats are unchanged.
+Use regenerated clients with the current server. Confirm finite publication
+through query metadata while its content is retained; the minimal publication
+receipt preserves the original identity and causal position, not content TTL.
+Mesh wire and storage formats are unchanged by this application API transition.
 
 ## Use crash-safe numbered publication
 
-Increment 1 of the experimental numbered-publication profile replaces caller
+The completed numbered-publication transition replaces caller
 chosen publication keys with `(client_id, operation_sequence)` between an SDK
 and its local agent. Initialize one journal explicitly, keep both its file and
 configured `client_id` stable, open it exclusively, and call `recover()` before
@@ -220,9 +260,8 @@ a separate one-time operation:
 use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, PublicationJournal, RecoveredState}};
 
 let client_id = b"orders-publisher";
-if !path.exists() {
-    PublicationJournal::initialize(path, client_id)?;
-}
+// Explicit fresh provisioning only; omit this initialization when reopening.
+PublicationJournal::initialize(path, client_id)?;
 let sdk = NumberedEventSdk::open(client, path, client_id)?;
 let report = sdk.recover().await?;
 for operation in report.operations {
@@ -270,10 +309,11 @@ snapshot revision after a lost response.
 This profile requires a fresh store boundary. A store containing the older
 arbitrary-key Event publication ledger is refused without migration or
 deletion, and a numbered store refuses later arbitrary-key publications.
-Increment 1 does not claim session ownership for subscriptions, polling,
-delivery cursors, or delivery acknowledgements; lost-journal reconstruction,
-administrative client retirement, and operator-tunable client limits are also
-later work.
+Persistent Event subscriptions, polling, delivery cursors and acknowledgements
+now require the same stable client owner and recovered session as publication.
+Populated stores with unowned subscription records are also refused without
+modifying the original bytes. Lost-journal reconstruction, administrative client
+retirement and operator-tunable client limits remain later work.
 
 ## Select normal or receive-only operation
 
@@ -287,6 +327,9 @@ Receive-only is a zero-transfer mode for locally held application/control
 objects, not physical radio silence: the carrier may still receive traffic and
 the protocol may emit mandatory acknowledgements or other transport responses.
 Use deployment/network controls when a customer requires actual radio silence.
+Configured Blob selectors remain available for a later normal-mode restart,
+but `receive_only` advertises, requests, stages, promotes, and counts zero Blob
+network work.
 
 ## Exercise the repository development path
 
@@ -308,6 +351,7 @@ cargo run --locked -p aster-agent -- \
   --state "$ASTER_AGENT_ROOT/state" \
   --mesh-bind 127.0.0.1:0 \
   --listen 127.0.0.1:8181 \
+  --blob-interest imagery.maps@mission/team/alpha \
   --mission-bundle-unprotected-reference \
     "$ASTER_AGENT_ROOT/mission.unprotected-reference.bundle" \
   --client-token-file "$ASTER_AGENT_ROOT/client.token"
@@ -316,7 +360,8 @@ cargo run --locked -p aster-agent -- \
 In another terminal, run the repository's small Connect sample:
 
 ```sh
-./examples/connect_agent.sh "$ASTER_AGENT_ROOT/client.token"
+./examples/connect_agent.sh "$ASTER_AGENT_ROOT/client.token" \
+  "$ASTER_AGENT_ROOT/connect-publication.redb" --initialize-publication-journal
 ```
 
 The sample gets status, creates a durable subscription, publishes while no
@@ -324,6 +369,19 @@ peer is configured, polls, and acknowledges the Event. Protobuf JSON encodes
 `bytes` fields as base64. This path is useful for API integration only; it does
 not exercise customer configuration, health, token reload, protected
 provisioning, or the customer supervisor.
+
+On later runs omit the initialization flag and retain the same journal and
+fixed client identity. Recovery reports unresolved work before a new publication;
+use `asterctl publication-retry` or explicit `publication-abandon` to resolve a
+pending sequence. The sample retains publication receipts. After saving your
+application's progress, use `asterctl publication-ack --journal PATH --client-id
+connect-quickstart/v1 --sequence N` with the token option to compact a result.
+Delivery acknowledgement and publication-result acknowledgement are separate.
+
+`--blob-interest` is repeatable and uses the same exact `TOPIC@SCOPE`, duplicate,
+and 256-selector rules, but it belongs only to this legacy development path.
+It is not the customer configuration interface and does not grant application
+API access or create an application subscription.
 
 ## Authenticate application calls
 
@@ -350,56 +408,29 @@ force; see the [configuration reference](../reference/aster-agent-config-v1.md).
 
 ## Publish and retry safely
 
-`PublishEvent` returns only after the local durable authority accepts the
-Event. Its `operation_key` identifies the application effect, not a single RPC
-attempt:
+`PublishNumberedEvent` returns only after local durable acceptance. Use one
+stable configured client identity and a durable publication journal. Recover
+once per process incarnation, finish original pending work, and journal each
+complete intent before transmission. An unknown response must be resolved with
+the same session, sequence, and intent. Apply the result idempotently and save
+application progress before acknowledging it. Missing or corrupt journals fail
+closed; ordinary `PublishEvent` and `PublishEvents` RPCs are removed.
 
-1. Generate and persist one key before sending the application effect.
-2. If the response is known successful, retain its durable receipt.
-3. If disconnect, deadline, process failure, or another transport outcome
-   leaves success unknown, resend the **identical** request with the **same**
-   operation key.
-4. Never create a new key merely because the result was unknown.
+For sustained traffic, `NumberedEventSdk::publish_journaled_pipeline` uses the
+native HTTP/2 `PublishNumberedEvents` stream. It maintains an eight-request
+window, persists each response before admitting another request, and rotates
+healthy streams after eight seconds. Ordered in-band failures preserve failed
+and later intents. A client must repair or explicitly abandon a failed next
+sequence before later work can commit; independent configured clients can
+continue. gRPC-Web request streaming is unsupported. Browser callers use
+ordered unary numbered calls within each client.
 
-The same key and byte-equivalent request returns the original effect; it does
-not publish a duplicate. Durable receipt fields stay the same, while the
-per-call `inserted` flag changes from `true` on first acceptance to `false` on
-retry. Do not compare the complete responses as byte-identical. Reusing the
-key with different content fails closed
-with `Aborted` and `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT`. This resolves
-uncertain outcomes; it does not make two different application effects
-equivalent.
-
-For sustained ordinary telemetry, native Connect and gRPC clients over HTTP/2
-may use the bidirectional `PublishEvents` method. Send one
-`PublishEventsRequest.publication` per independent Event and read one ordered
-`PublishEventsResponse` per input. A response contains either the existing
-durable `published` result or one sanitized application `failure`. A malformed
-or conflicting input does not close the stream or suppress a later valid
-input.
-
-The maintained Rust client helper
-`aster_agent::sdk::PipelinedEventPublisher` rotates bounded stream sessions
-before the server's existing default deadline. On a disconnect it replays each
-sent-but-unanswered request with the original operation key. A response is
-progress only when its `published` or `failure` outcome is present. Persist the
-requests and keys according to the application's recovery needs before
-sending; the ordinary helper is not the crash-safe numbered-publication
-journal.
-
-Pipelining overlaps local durable requests and allows the selected node to
-group compatible commands that are already admitted. It never acknowledges
-volatile memory, waits for remote delivery, or delays an Event to wait for a
-future group member. Each Event keeps independent validation and retry
-semantics and its singleton source representation. This is separate from the
-explicit atomic cryptographic batch API.
-
-`PublishEvents` request streaming is supported only by native HTTP/2 Connect
-and gRPC transports. The agent rejects it over gRPC-Web. Browser clients use a
-bounded application-selected number of concurrent unary `PublishEvent` calls
-and apply the same operation-key rule. The reference SDK's active window and
-session-rotation interval are implementation details, not protocol limits,
-advertised telemetry rates, or target-device validation results.
+The sole node actor groups already-admitted adjacent non-Flash publications,
+splits incompatible custody cohorts, and falls back in order after a failed
+cohort. It does not wait to fill a batch or delay other actor work. Flash Events
+retain singleton urgency. Publication completes at the local durable commit;
+mesh synchronization and application delivery do not gate its response. These
+bounds preserve the pipeline capability without a physical rate claim.
 
 `QueryEvents` returns an acceptance-marker-ordered page. Continue from
 `scanned_through` while `has_more` is true rather than raising the request
@@ -416,14 +447,19 @@ marker. Keep the same upper bound when continuing from `scanned_through`.
 
 `ListEventSubscriptions` takes an empty request and returns `subscriptions`, a
 full list of this node's Consume subscriptions ordered by subscription ID. Each row
-contains `subscription_id`, `topic`, `scope`, `include_descendant_scopes`, and
+contains `subscription_id`, `owner_client_id`, `topic`, `scope`,
+`include_descendant_scopes`, and
 the `operation_key` bytes (including non-UTF-8 keys; Protobuf
 JSON represents bytes as base64).
 
 ## Commit before acknowledging
 
 `CreateEventSubscription` creates or replays an immutable durable selector by
-operation key. `PollEvents` and `StreamEvents` use the same durable ledger and
+the pair of owning client ID and operation key. Create, poll, stream, acknowledgement
+and delete require `client: {clientId, session}` from a recovered durable journal.
+`GetEventClientStatus` reads the current session, caller disposition and bounded
+owned subscription/delivery counts without taking over. Queries, gaps and listing
+remain read-only while fenced. `PollEvents` and `StreamEvents` use the same durable ledger and
 deliver at least once until acknowledgement succeeds:
 
 1. Receive an Event and its delivery attempt.
@@ -438,6 +474,11 @@ attempt count. The attempt count is observability, not a deduplication key;
 deduplicate application work by stable Event identity. An acknowledged Event
 remains complete across restart.
 
+`StreamEvents` revalidates the session before each buffered delivery and each
+new poll. Takeover terminates subsequent delivery with the session-fenced error.
+A delivery already authorized and in flight can arrive after takeover; the
+application must still commit effects idempotently.
+
 `StreamEvents` is sequential bounded polling convenience. It never
 acknowledges implicitly and does not provide exactly-once application effects.
 `DeleteEventSubscription` idempotently removes the selector and its delivery
@@ -446,7 +487,7 @@ ledger; recreating a selector establishes a new subscription contract.
 ### Generated-Go client replacement example
 
 The [two-process Go example](../../conformance/agent-go/cmd/agent-smoke/README.md)
-publishes and retries one fixed operation key, then exits after validating the
+journals, publishes, and retries one fixed client/sequence intent, then exits after validating the
 exact attempt-one delivery without ACK. A new client process attaches to the
 same live agent and durable subscription, validates exact attempt-two
 redelivery, and ACKs. Successful empty, caught-up polls then span at least
@@ -468,14 +509,14 @@ Use the optional `retry_delay_ms` when present; otherwise apply bounded
 jittered application backoff. For query, poll, or gap pages, reduce the valid
 page/scan request. For durable-storage pressure, wait for operator-controlled
 retirement/capacity recovery rather than silently increasing the configured
-limit or changing the operation key.
+limit or assigning a replacement publication sequence.
 
 `ResourceExhausted` with
 `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` is different: the durable
 idempotency map reached its dedicated row or byte hard ceiling. It is
 non-retryable and carries no retry delay. Stop new publication, preserve the
-original operation key, and escalate to the operator; creating another key
-only consumes more capacity and changes the application effect identity.
+original client, sequence, and complete intent. Apply and acknowledge retained
+results to release headroom; a failed pending sequence may then be retried.
 
 `Unavailable` with `PUBLIC_ERROR_REASON_DRAINING` or
 `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` is retryable only after `/readyz`
@@ -497,11 +538,11 @@ request values or internal chains.
 |---|---|---:|---|
 | `PUBLIC_ERROR_REASON_MALFORMED_INPUT` | `InvalidArgument` | no | Correct the request encoding or required identifier. |
 | `PUBLIC_ERROR_REASON_UNSUPPORTED_VALUE` | `InvalidArgument` | no | Correct a bounded value such as stream backoff or page limit. |
-| `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT` | `Aborted` | no | Do not reuse the operation key for different content. |
+| `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT` | `Aborted` | no | Do not change the intent under the same client and sequence. |
 | `PUBLIC_ERROR_REASON_MISSING_DURABLE_OBJECT` | `NotFound` | no | The named subscription/Event is unavailable or retired. |
 | `PUBLIC_ERROR_REASON_FAILED_PRECONDITION` | `PermissionDenied`, `Unavailable`, or `FailedPrecondition` | no | Resolve authorization, policy, or provisioning state before retrying. |
 | `PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION` | `ResourceExhausted` | yes | Back off, reduce a valid page, or wait for capacity recovery. |
-| `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` | `ResourceExhausted` | no | Stop new publication and escalate; do not replace the operation key. |
+| `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` | `ResourceExhausted` | no | Stop new publication and escalate; preserve the original numbered intent. |
 | `PUBLIC_ERROR_REASON_DRAINING` | `Unavailable` | yes | Wait for a Ready process. |
 | `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` | `Unavailable` | yes | Wait for a Ready process. |
 | `PUBLIC_ERROR_REASON_AUTHENTICATION_FAILED` | `Unauthenticated` | no | Refresh credentials; do not repeat the same failed authorization. |

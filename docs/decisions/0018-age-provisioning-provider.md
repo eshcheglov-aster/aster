@@ -1,7 +1,7 @@
 # Decision 0018: Pilot an age X25519 provisioning-artifact provider
 
 - Status: experimental pilot contingent on required batch gates; prohibited as a production default
-- Date: 2026-08-21
+- Date: 2026-08-21; dependency-policy amendment 2026-10-20
 
 ## Context
 
@@ -128,19 +128,33 @@ failure: provider tests and strict Clippy pass. `Cargo.lock` fixes the
 `proc-macro-error2` 2.0.1 archive checksum at
 `11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802`.
 
-The bounded pilot therefore carries a `cargo-deny` ignore for exactly
-`RUSTSEC-2026-0173` and no other advisory. This does not reclassify the package
-as maintained or safe for production. The proc macro executes only while
-building, its exact registry checksum is locked, CI downloads it before running
-offline validation, and the proc-macro crate is not executed in the deployed
-runtime. The scope gate also inspects the separately excluded fuzz lock and
-fails if any `proc-macro-error2` package appears there, preventing this global
-ignore from silently covering that graph. Its generated output is still
-compiled into the dependency, so the build-time supply-chain exposure remains.
-Those controls bound the exception; they do not erase it. Production remains
-prohibited, and a future compiler failure or production-readiness review
-requires an upstream-compatible update, a narrowly maintained patch, provider
-replacement, or removal rather than broader suppression.
+The same compile-time localization chain reaches `i18n-config` 0.4.8 and
+`basic-toml` 0.1.10. RustSec `RUSTSEC-2026-0374` classifies `basic-toml` as
+unmaintained, with no patched release and no reported vulnerability. The
+resolved archive is fixed in `Cargo.lock` at checksum
+`ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a`.
+Upstream `cargo-i18n` merged pull request 176, replacing `basic-toml` with the
+maintained `toml` crate, but has not published that change in the admitted
+`i18n-config` line. Switching Aster to an unreleased upstream revision would
+replace a checksum-locked registry package with a moving source and is not an
+acceptable remediation for this pilot.
+
+The bounded pilot therefore carries `cargo-deny` ignores for exactly
+`RUSTSEC-2026-0173` and `RUSTSEC-2026-0374`, and no other advisories. This does
+not reclassify either package as maintained or safe for production. Both
+packages execute only while building localization proc macros, their exact
+registry sources and checksums are locked, and CI downloads them before running
+offline validation; neither is executed in the deployed runtime. The scope gate
+requires exactly one root-lock occurrence of each ignored package, with the
+reviewed version, crates.io registry source, and archive checksum. It also
+asserts the complete reverse graph of both packages and inspects the separately
+excluded fuzz lock, preventing either workspace-wide ignore from silently
+covering another version, source, archive, or consumer. Generated output is
+still compiled into the dependency, so the build-time supply-chain exposure
+remains. Those controls bound the exceptions; they do not erase them.
+Production remains prohibited, and a compatible published upstream migration,
+a narrowly maintained patch, provider replacement, or provider removal must
+eliminate both exceptions before production-readiness review.
 
 The newer Rust `age` 0.12.1 was reevaluated but is not admitted. The attempted
 workspace lock selected an `ml-kem`/`kem` API combination that failed to compile
@@ -195,7 +209,8 @@ replace this conservative allowance.
 
 This pilot admission expires at the first production-readiness review or any
 change to the exact `age`/`age-core` pins, feature set, or
-`RUSTSEC-2026-0173` disposition; continuation requires a new recorded review.
+`RUSTSEC-2026-0173`/`RUSTSEC-2026-0374` disposition; continuation requires a
+new recorded review.
 Production use remains blocked until the unmaintained build dependency and
 future-incompatibility finding are removed, there is a verified
 vulnerability-reporting route or an explicitly approved maintained fork,
@@ -211,7 +226,7 @@ provider. No age bytes enter Aster mesh messages or the `ASTRPB03` inner format.
 
 ## Public primary sources
 
-Accessed 2026-08-21:
+Accessed 2026-08-21; dependency-policy amendment sources accessed 2026-10-20:
 
 - [age 0.11.5 Rust API and beta warning](https://docs.rs/age/0.11.5/age/)
 - [crates.io sparse index record for `age`](https://index.crates.io/3/a/age)
@@ -226,6 +241,9 @@ Accessed 2026-08-21:
 - [Rust age 0.11.5 utility source](https://raw.githubusercontent.com/str4d/rage/v0.11.4/age/src/util.rs)
 - [Rust age-core 0.11.0 format-parser source](https://raw.githubusercontent.com/str4d/rage/v0.11.4/age-core/src/format.rs)
 - [RustSec RUSTSEC-2026-0173 advisory](https://raw.githubusercontent.com/RustSec/advisory-db/main/crates/proc-macro-error2/RUSTSEC-2026-0173.md)
+- [RustSec RUSTSEC-2026-0374 advisory](https://raw.githubusercontent.com/RustSec/advisory-db/main/crates/basic-toml/RUSTSEC-2026-0374.md)
+- [`basic-toml` upstream archival commit](https://github.com/dtolnay/basic-toml/commit/dd2ea1df197f255a402b8990cb852ade3e37ea34)
+- [`cargo-i18n` pull request 176 replacing `basic-toml`](https://github.com/kellpossible/cargo-i18n/pull/176)
 - [Rust compiler error code E0365](https://doc.rust-lang.org/error_codes/E0365.html)
 - [crates.io sparse index record for `ml-kem`](https://index.crates.io/ml/-k/ml-kem)
 - [crates.io sparse index record for `kem`](https://index.crates.io/3/k/kem)

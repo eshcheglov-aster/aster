@@ -80,6 +80,9 @@ impl fmt::Display for SyncError {
 
 impl std::error::Error for SyncError {}
 
+const DEFAULT_MAX_OFFER_IDS: usize = 256;
+const MAX_OFFER_IDS: usize = 4_096;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncConfig {
     /// Maximum identifiers per OFFER message, not per reconciliation.
@@ -99,7 +102,7 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            max_offer_ids: 256,
+            max_offer_ids: DEFAULT_MAX_OFFER_IDS,
             max_want_items: 128,
             progress_chunk_size: 64 * 1024,
             max_durable_wants: 10_000,
@@ -111,7 +114,7 @@ impl Default for SyncConfig {
 
 impl SyncConfig {
     pub fn validate(&self) -> Result<(), SyncError> {
-        if self.max_offer_ids == 0 || self.max_offer_ids > 4_096 {
+        if self.max_offer_ids == 0 || self.max_offer_ids > MAX_OFFER_IDS {
             return Err(SyncError::InvalidConfig("maximum offer identifiers"));
         }
         if self.max_want_items == 0 || self.max_want_items > 4_096 {
@@ -2320,6 +2323,24 @@ fn snapshot_keys(map: &[(u64, Value)], allowed: &[u64]) -> Result<(), SyncError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_identifier_limits_keep_the_production_default_and_fail_closed() {
+        assert_eq!(SyncConfig::default().max_offer_ids, 256);
+        for max_offer_ids in [0, MAX_OFFER_IDS + 1] {
+            let result = SyncState::new(
+                SyncConfig {
+                    max_offer_ids,
+                    ..SyncConfig::default()
+                },
+                SparseInventory::new(),
+            );
+            assert!(matches!(
+                result,
+                Err(SyncError::InvalidConfig("maximum offer identifiers"))
+            ));
+        }
+    }
 
     fn id(byte: u8) -> ObjectId {
         ObjectId::for_envelope(crate::wire::EnvelopeId::from_bytes([byte; 32]))

@@ -10,7 +10,7 @@ node, topic, or scope are new.
 | Goal | Start at |
 |---|---|
 | Run the selected networked implementation | [Selected direct-Iroh contact](#selected-direct-iroh-contact) |
-| Embed the broader semantic host | [Current semantic host lifecycle](#current-semantic-host-lifecycle) |
+| Inspect the reference components | [Current semantic/reference carrier composition](#current-semanticreference-carrier-composition) |
 | Configure UDP/IP | [Current semantic IP example](#current-semantic-ip-example) |
 | Implement a platform BTLE adapter | [Current semantic BTLE integration seam](#current-semantic-btle-integration-seam) |
 | Add another carrier | [Carrier migration and extension](#carrier-migration-and-extension) |
@@ -215,93 +215,18 @@ or non-Unix platforms. Exact usage and the crash-resumption boundary are in the
 The repository also retains the current semantic application and host surfaces:
 
 - `ApplicationNode` is the offline application surface.
-- `MeshService` composes that application surface with authenticated sync, Blob
-  transfer state, and configured `Link` implementations.
+- `SharedNodeContactSupervisor` and `MeshHost` remain the native laboratory
+  composition used by Gate H. The retired `MeshService` wrapper is removed;
+  shared core and binding batch, bridge, and merge APIs remain available.
 - `IpLink` and `BleLink` implement the same opaque-fragment contract.
 - The maintained [implementation-boundary table](../README.md#current-implementation-boundary)
   records which operations each Rust and language-binding surface exposes.
 
-## Current semantic host lifecycle
-
-The high-level host has a small, nonblocking lifecycle:
-
-1. Open `MeshService`. It is immediately available for offline application
-   operations.
-2. Configure one or more carriers for known peer identities while no contact is
-   active.
-3. Call `begin_sync(peer)` when a contact opportunity exists.
-4. Call `pump()` from the host event loop after carrier readiness, an application
-   command, or the next scheduled wakeup.
-5. Inspect application subscriptions or peer status for useful progress.
-6. Call `pause_sync()` when the contact ends or another peer should be serviced.
-
-The current bounded profile services one authenticated contact at a time. The
-caller chooses the peer for that contact with `begin_sync(peer)`. If several
-carriers are configured for that peer, `MeshService` chooses among them in
-per-peer round-robin order; it does not score reachability,
-bandwidth, cost, or emission characteristics, and a failed contact does not
-automatically fail over to the next carrier. Pausing destroys session keys but
-retains verified objects and partial Blob ranges. A later `begin_sync(peer)`
-selects the next configured carrier for that peer.
-
-`pump()` is nonblocking. Do not drive it in a busy loop. Integrate it with the
-platform's I/O readiness and timer mechanism.
-
-## Current semantic Rust host setup
-
-The transport quickstarts assume two **different** authority-issued node bundles
-with compatible mission, scope, topic, and epoch access. Do not copy one bundle
-to two nodes: that clones the identity and durable publisher counter owner.
-
-Create the service policy once per node:
-
-```rust
-use aster_host::{ServiceOptions, SyncProfile};
-use aster_mesh::{ApplicationNodeOptions, BlobStoreConfig, Priority, Scope, Topic};
-
-let sync = SyncProfile::new(
-    vec![Topic::new("position.current")?],
-    vec![Scope::new("mission/team/alpha")?],
-    Priority::Routine,
-)?;
-
-let options = ServiceOptions {
-    node: ApplicationNodeOptions::default(),
-    blobs: BlobStoreConfig::default(),
-    sync,
-};
-```
-
-`SyncProfile` is the interest used for authenticated contacts. It bounds the
-topics, scopes, and minimum received priority; it is not an application
-subscription and does not grant access beyond provisioning.
-
-Open each node with separate durable database and Blob directories:
-
-```rust
-use aster_host::MeshService;
-
-let mut alice = MeshService::open(
-    "alice.db",
-    "alice-blobs",
-    &alice_provisioning_bundle,
-    alice_options,
-)?;
-
-let mut bob = MeshService::open(
-    "bob.db",
-    "bob-blobs",
-    &bob_provisioning_bundle,
-    bob_options,
-)?;
-```
-
-At this point both nodes can publish, query, and subscribe while offline.
-
 ## Current semantic IP example
 
 `IpLink` uses nonblocking UDP. The simplest integration uses known peer socket
-addresses:
+addresses and distinct provisioned mission identities, `alice_node_id` and
+`bob_node_id`:
 
 ```rust
 use aster_ip::IpLink;
@@ -323,14 +248,8 @@ let bob_link = IpLink::bind(
 
 // Manual peering binds the expected authenticated NodeID to a UDP endpoint.
 // Authentication still happens in Aster; this map does not replace it.
-alice_link.register_peer(bob.identity(), bob_link.local_addr()?)?;
-bob_link.register_peer(alice.identity(), alice_link.local_addr()?)?;
-
-alice.configure_peer_carrier(bob.identity(), alice_link)?;
-bob.configure_peer_carrier(alice.identity(), bob_link)?;
-
-alice.begin_sync(bob.identity())?;
-bob.begin_sync(alice.identity())?;
+alice_link.register_peer(bob_node_id, bob_link.local_addr()?)?;
+bob_link.register_peer(alice_node_id, alice_link.local_addr()?)?;
 ```
 
 `IpLink::bind`'s fourth argument is `discovery_target`. `None` disables the
@@ -346,9 +265,10 @@ bearer value. It is never transmitted: discovery packets carry fresh nonces and
 derived proofs. `IpLink::bind` rejects the all-zero token, including when manual
 peering uses `discovery_target = None`.
 
-Drive both services from their host loops until the desired item appears in a
-subscription or bounded query, then pause the contact. Aster does not make a
-remote-delivery promise from the local publish result.
+These are carrier primitives, not a complete application host. The native
+laboratory composes them through `SharedNodeContactSupervisor` and `MeshHost`;
+see the [native LAN experiment](../lab/README.md#automatic-three-process-lan-mesh-demo).
+A local publish result does not promise remote delivery.
 
 ### Current semantic discovery, rendezvous, and relay
 
@@ -417,14 +337,13 @@ impl BleRadio for PlatformRadio {
 }
 ```
 
-Wrap it and register it exactly like any other carrier:
+Wrap the platform radio as a carrier:
 
 ```rust
 use aster_ble::BleLink;
 
-let link = BleLink::new(PlatformRadio { /* platform handles */ }, alice.identity());
-link.set_peer_mtu(bob.identity(), negotiated_application_mtu)?;
-alice.configure_peer_carrier(bob.identity(), link)?;
+let link = BleLink::new(PlatformRadio { /* platform handles */ }, local_node_id);
+link.set_peer_mtu(peer_node_id, negotiated_application_mtu)?;
 ```
 
 The radio must be nonblocking and must reject outbound packets above its current

@@ -31,14 +31,6 @@ an image. Every `docker run` includes `--pull=never`, and `build` always uses
   added capability. All other scenarios receive no added capability.
 - Every execution creates a new mode-0700 evidence directory. Existing scenario
   directories are never reused.
-- For `self-contained`, `resource`, and `scale`, the controller creates only the
-  isolated writable role directory mounted at `/output`; it deliberately leaves
-  `/output/run` absent so `aster-lab` can atomically claim that scenario root.
-  Standalone simulation commands likewise require `--root` not to exist. They
-  reject any pre-existing path without modifying it, then retain
-  `.aster-lab-invocation` and canonical success or failure metrics in a root they
-  own. Provisioning and live-node commands are different: their `/output` root
-  is intentionally durable and may already exist.
 - The controller receipt area is never mounted into a container. Each role sees
   only its assigned mode-0700 writable directory beneath `outputs/`. Most roles
   mount `outputs/<role>/` at `/output`; each selected live node instead mounts
@@ -128,110 +120,37 @@ offline build path for this Dockerfile; it is not packet-level proof that the
 Docker/BuildKit daemon emitted no traffic. Such a claim requires an independently
 isolated or captured daemon egress boundary.
 
-## Deterministic self-contained scenarios
+## Retired single-contact scenarios
 
-The following 3,000-bit/s/50%-loss run is a virtual deterministic carrier, not a
-live Linux qdisc result:
+The `MeshService` implementation and its exclusive lab commands are removed:
+`transfer`, `route-only-event`, `blob-recovery`, `scale`, `shard-worker`,
+`node-udp`, `node-rendezvous`, `node-discovery`, `node-relay`, and `provision`.
+The Python `self-contained`, `two-node`, `scale`, and `resource` entrypoints
+are also removed. Their historical results remain evidence for their original
+implementation and revision.
 
-```sh
-python3 lab/orchestrate.py self-contained transfer \
-  --bps 3000 --loss-per-mille 500 --mtu 96 --seed 41
+Useful load/resource and impaired-link scenarios are deferred to
+[issue #105](https://github.com/defenseunicorns/aster/issues/105), linked to
+[issue #74](https://github.com/defenseunicorns/aster/issues/74), with resource
+diagnostics coordinated in [issue #73](https://github.com/defenseunicorns/aster/issues/73).
+No workloads were ported in this retirement. The default 101-MiB large-Blob
+workload is retired and is explicitly outside that follow-up.
 
-python3 lab/orchestrate.py self-contained transfer \
-  --bps 3000 --loss-per-mille 500 --mtu 96 --seed 41 --execute
-```
+The historical virtual 3,000-bit/s, 50%-loss transfer experiment did not converge
+within 120 seconds and was terminated. That negative result remains unchanged;
+it is not current Iroh acceptance evidence. The retained 2026-08-21 route-only
+Phase-0 result likewise describes the old deterministic in-memory carrier.
+Its retained provenance is source revision
+`9a8a87e11785c98fd1069cb2338c4076f4c728cb`, source-diff SHA-256
+`796fac56ef87b1b16062ebfb1514bc0a15135fd72b01c51582a29dcbe2256ad8`,
+and binary SHA-256
+`ebb712065ce2006bdf6c112c989977b854ed51dfae445c02cc602d4d35294bad`.
+That A→B→C control covered opaque custody, relay reopen, exact source identity,
+and consumer acknowledgement; it did not establish live IP discovery, NAT,
+or concurrent-contact behavior.
 
-The initial bounded experiment at these exact settings did not converge within
-120 seconds and was terminated. Preserve that negative result: this command is
-for diagnosis, not a passing acceptance recipe. Kernel-shaped live IP is the
-authoritative path for the 3 kbps gate; success still requires the declared
-priority, expiry, convergence, fairness, and wire-accounting assertions.
-
-The Blob default is exactly 105,906,176 bytes (101 MiB). It stages a partial
-transfer from one peer, durably reopens the receiver, completes from another
-peer, and verifies generated plaintext without retaining a second source copy:
-
-```sh
-python3 lab/orchestrate.py self-contained blob-recovery
-python3 lab/orchestrate.py self-contained blob-recovery --execute
-```
-
-For either command the controller requires `metrics.json` with schema
-`aster-lab-metrics/v1` and `converged=true`. Blob recovery additionally requires
-`partial_restart_observed=true`, `durable_progress_preserved=true`, a nonzero
-`partial_durable_blob_bytes`, and the same value in
-`reopened_durable_blob_bytes`. These fields mean the receiver was still unable
-to open the incomplete Blob, had committed encrypted transfer-store progress,
-reopened with the same durable byte/chunk usage, and then completed and verified
-the generated plaintext through the alternate peer. They do not expose Blob
-plaintext or credential material.
-
-## Two real UDP processes
-
-This command creates one internal bridge, provisions two fresh identities from
-OS entropy in an offline container, and runs two unprivileged `node-udp`
-containers on fixed addresses. Both publishers send identity-distinct Events through the actual
-`aster-ip` UDP adapter; each must observe the complete two-publisher set,
-authenticate, and report convergence. The higher NodeID responder starts first
-and receives a bounded settle interval before the initiator starts.
-
-```sh
-python3 lab/orchestrate.py two-node --items 4 --payload-bytes 1024
-python3 lab/orchestrate.py two-node --items 4 --payload-bytes 1024 --execute
-```
-
-The topology is removed automatically after logs and both metrics records are
-captured. Its evidence directory remains.
-
-Each live-node invocation first consumes one append-only
-`live-invocation-NNNN.slot`. That single ordinal binds
-`live-result-NNNN.json` to its aggregate metrics file (`metrics.json` for slot
-0001, then `metrics-NNNN.json`). A failed invocation may have metrics without a
-live result, and a process interruption may leave only part of the pair; the
-slot is never reused, so later artifacts cannot drift onto its suffix. The
-two-node controller uses a fresh role directory, therefore discovers the first
-invocation at `metrics.json`; the entire role tree, including the slot and live
-result, remains in evidence.
-
-The public `--seed` controls only deterministic canary content. It is not used
-for identity or capability material, and credential bytes never appear in a
-command argument, public manifest, controller receipt, or peer mount. This is
-still reference-to-reference simulation evidence; it is not adversarial
-credential-secrecy, cryptographic-strength, or independent-implementation
-interoperability evidence.
-
-## Route-only Event custody control
-
-`route-only-event` is Proposal 0001's Phase-0 prerequisite. It provisions an
-A publisher, a route-only durable B intermediate, and a C consumer. A and C
-never receive a carrier path. B receives the stable source envelope, closes,
-is inspected and reopened from the same durable store, and then forwards the
-unchanged A-authored Event to C. C application-acknowledges it and a second poll
-must be empty.
-
-Each run requires exact provenance for the uncommitted experiment build:
-
-```sh
-target/release/aster-lab route-only-event \
-  --root lab/runs/phase0-route-only-event-01 \
-  --seed 1001 --payload-bytes 1024 --max-pumps 50000 \
-  --source-revision 9a8a87e11785c98fd1069cb2338c4076f4c728cb \
-  --source-diff-sha256 796fac56ef87b1b16062ebfb1514bc0a15135fd72b01c51582a29dcbe2256ad8 \
-  --binary-sha256 ebb712065ce2006bdf6c112c989977b854ed51dfae445c02cc602d4d35294bad
-```
-
-Those exact values identify the retained 2026-08-21 Phase-0 run; a new build
-must supply its own revision, `git diff --binary` digest, and binary digest.
-The command creates `metrics.json`, `receipt.json`, and three independent node
-stores without overwriting an existing root. The receipt separates durable
-custody, application readability, exact ItemID/EnvelopeID continuity, and
-application acknowledgement. A raw-store scan requires payload and payload
-SHA-256 canaries to be absent at B. It separately reports whether the logical
-key is retained as protected mesh forwarding metadata.
-
-This control uses the deterministic in-memory fault carrier. It proves the
-data-plane prerequisite, not IP discovery, NAT traversal, concurrent contacts,
-or an operational mesh.
+Native `mesh-*` commands, independent rendezvous/relay infrastructure, Gate H,
+selected NAT/relay helpers, and reducer/component tests remain available.
 
 ## Automatic three-process LAN mesh demo
 
@@ -265,48 +184,6 @@ relay fallback, or fair large-peer scheduling. The historical Iroh and
 rust-libp2p comparison binaries and exact commands are bound to experiment
 checkpoint `117770259680d89e5fbd1ff1f6c3df9f3e646e6c`; they are not continuing
 production dependencies.
-
-## Cgroup-v2 resource capture
-
-The default workload creates one logical node with a 10,000-item metadata set
-under one CPU, 64 MiB memory, and no swap:
-
-```sh
-python3 lab/orchestrate.py resource
-python3 lab/orchestrate.py resource --execute
-```
-
-While the container is live, the controller samples:
-
-- `memory.current`, `memory.max`, `memory.peak`, `memory.events`, `memory.stat`,
-  `memory.swap.current`, and `memory.swap.max`;
-- mandatory `cpu.stat` and `io.stat`, plus `cpu.pressure` when the runtime
-  exposes Linux Pressure Stall Information in the private cgroup;
-- `pids.current` and `pids.events`;
-- Docker's cgroup statistics;
-- the `aster-lab` process `smaps_rollup` and `status`.
-
-Every mandatory read, including structured `io.stat` device counters, must
-succeed and parse under cgroup v2. Because Pressure Stall Information is a
-kernel/configuration capability rather than a cgroups-v2 invariant, the
-controller records an explicit `cpu.pressure_available` marker and the command
-receipt when it is absent. The controller
-verifies `memory.max`, zero swap allowance, and zero `oom`/`oom_kill` counters;
-missing Docker stats, cgroup counters, the exact `aster-lab` PID, `smaps_rollup`,
-or process status fails the run. Samples are appended to
-`resource-samples.jsonl`. A small `sleep` process keeps the container/cgroup
-alive while the controller runs the workload as one foreground, receipt-bearing
-`docker exec`. After that exact command exits, the controller takes a mandatory
-`phase=terminal-cgroup` snapshot before stopping the container; the workload's
-exit status and uncombined output are retained. The `scale` coordinator forks
-one worker even for a one-node shard, so cgroup memory is authoritative for the
-complete workload while PID-specific RSS covers the coordinator only. This run
-is a constrained ARM64/OrbStack measurement, not representative mobile hardware
-or battery evidence. The sleep supervisor and the controller's short-lived
-`docker exec` readers share the measured cgroup and therefore add conservative
-observer overhead; do not present the samples as observer-free profiling. A
-fresh run with measurement headroom should accompany the hard 64 MiB enforcement
-run when diagnosing a failure.
 
 ## Five-unit NAT topology
 
@@ -392,7 +269,7 @@ The controller first attempts the seeded form and records whether the installed
 token; only that exact unsupported-token response permits a retry without the
 token, after which `nat-runtime.json` records `netem_seed_status=unsupported`
 and `netem_seed=null`. That kernel loss process is stochastic. The separately
-seeded self-contained carrier remains the exact deterministic loss model.
+retired seeded carrier results describe their original deterministic loss model.
 
 `nat-up` resolves interface names by assigned address rather than assuming
 `eth0`/`eth1`, installs namespace-owned nftables rules, records qdisc statistics,
@@ -435,38 +312,12 @@ python3 lab/orchestrate.py cleanup /absolute/path/to/the/nat-run --execute
 The second command refuses any object whose current ownership labels differ
 from that run's immutable controller manifest.
 
-## Scale cohorts
-
-One hundred nodes across four worker processes:
-
-```sh
-python3 lab/orchestrate.py scale --nodes 100 --shards 4
-python3 lab/orchestrate.py scale --nodes 100 --shards 4 --execute
-```
-
-One thousand nodes across ten worker processes, using the current OrbStack
-allocation conservatively:
-
-```sh
-python3 lab/orchestrate.py scale --nodes 1000 --shards 10 \
-  --cpus 15 --memory 32g --timeout 3600
-
-python3 lab/orchestrate.py scale --nodes 1000 --shards 10 \
-  --cpus 15 --memory 32g --timeout 3600 --execute
-```
-
-The current `aster-lab scale` command creates independent, process-sharded
-store-and-forward chains. It is valuable for node-count, bounded-state, process,
-and deterministic-fault stress. It does not yet create cross-shard bridge edges,
-heterogeneous live-IP segments, or the exact authorized-delivery matrix required
-to close the 100-node or 1,000-node bridged acceptance gates.
-
 ## Evidence layout
 
 Every executed operation creates a directory named approximately:
 
 ```text
-lab/runs/20260818T190000Z-two-node-0123456789abcdef/
+lab/runs/<timestamp>-<scenario>-<run-id>/
 ```
 
 It contains:
@@ -479,12 +330,11 @@ It contains:
 - Docker capability and exact image-identity receipts;
 - for builds, the canonical `runtime-package-inventory.tsv` receipt from the
   final immutable image;
-- `scenario-request.json`, followed by parameter-specific host cross-checks of
-  the scenario and live-node metrics;
+- `scenario-request.json`, followed by parameter-specific host cross-checks;
 - isolated `outputs/<role>/` trees containing only that role's scenario state,
-  ownership/invocation slots, metrics, live results, or capture;
-- logs, initial/final qdisc data, final nftables counters, NAT finalization, or
-  parsed resource samples as applicable.
+  receipts, metrics, or capture;
+- logs, initial/final qdisc data, final nftables counters, and NAT finalization
+  as applicable.
 
 Evidence directories are never deleted by cleanup. External archival/signature
 of a receipt root remains a separate gate.

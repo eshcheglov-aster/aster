@@ -288,9 +288,16 @@ fn stalled_agent_is_bounded_by_the_request_deadline() {
         "200 OK",
         "application/proto",
         &[],
-        Duration::from_secs(11),
+        Duration::from_secs(2),
     );
-    let output = cli(&["status", "-t", TOKEN, "-p", &address.port().to_string()]);
+    let output = cli(&[
+        "--timeout=1",
+        "status",
+        "-t",
+        TOKEN,
+        "-p",
+        &address.port().to_string(),
+    ]);
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(

@@ -756,6 +756,30 @@ fn read_u64(bytes: &[u8]) -> Result<u64, ProvisioningSecretStoreError> {
         .map_err(|_| ProvisioningSecretStoreError::Rejected)
 }
 
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_tests {
+    use super::{PROVIDER_REFERENCE_ID_BYTES, SystemdCredentialLoader, provisioning_secret_ref};
+    use aster_mesh::{ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretStoreError};
+
+    #[test]
+    fn platform_compat_systemd_loader_fails_closed() {
+        assert_eq!(
+            SystemdCredentialLoader::from_environment().err(),
+            Some(ProvisioningSecretStoreError::Unavailable)
+        );
+
+        let mut loader = SystemdCredentialLoader;
+        let secret_ref = provisioning_secret_ref(1, [0x5a; PROVIDER_REFERENCE_ID_BYTES])
+            .expect("valid provider reference");
+        assert_eq!(
+            loader
+                .load(ProvisioningLoadId::new([0x2a; 32]), &secret_ref)
+                .err(),
+            Some(ProvisioningSecretStoreError::Unavailable)
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{

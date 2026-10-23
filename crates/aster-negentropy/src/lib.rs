@@ -14,7 +14,7 @@ use std::fmt;
 use aster_profile::{InventorySnapshot, ItemId};
 use negentropy::{Id, Negentropy, NegentropyStorageVector};
 
-/// Smallest frame limit supported by Negentropy 0.5.1.
+/// Smallest frame limit supported by Negentropy 0.5.2.
 pub const MIN_FRAME_SIZE_LIMIT: usize = 4_096;
 /// Largest frame limit accepted by this production wrapper.
 pub const MAX_FRAME_SIZE_LIMIT: usize = 1_048_576;
@@ -142,7 +142,7 @@ pub enum ReconciliationError {
     NotInitiated,
     /// The initiator session was used after it completed.
     AlreadyComplete,
-    /// Negentropy 0.5.1 rejected an otherwise bounded operation.
+    /// Negentropy 0.5.2 rejected an otherwise bounded operation.
     Upstream(negentropy::Error),
 }
 
@@ -391,9 +391,8 @@ fn convert_ids(ids: &[Id]) -> Vec<ItemId> {
 }
 
 // Validate the upstream frame grammar before handing untrusted counts to
-// Negentropy. In particular, Negentropy 0.5.1 reserves an ID-list HashSet from
-// the declared count before reading the IDs; this bounded preflight prevents a
-// short hostile frame from requesting an attacker-selected allocation.
+// Negentropy. Keep Aster's frame/cardinality budgets independent of upstream's
+// own validation, including its 0.5.2 fix for truncated ID-list allocations.
 fn validate_frame(frame: &[u8], limits: ReconciliationLimits) -> Result<(), ReconciliationError> {
     if frame.len() > limits.frame_size {
         return Err(ReconciliationError::FrameLimitExceeded {

@@ -28,8 +28,9 @@ SPEC.loader.exec_module(MODULE)
 
 REPOSITORY = MODULE_PATH.parents[1]
 COMPOSE = REPOSITORY / "docker/compose-agent/compose.yaml"
+REMOTE_MESH = REPOSITORY / "docker/compose-agent/compose.remote-mesh.yaml"
 MISE = REPOSITORY / "mise.toml"
-TOKEN_CANARY = "task6-token-canary-do-not-print"
+TOKEN_CANARY = "task6-token-canary-do-not-print-0000"
 GENERATION = "generation-" + "a" * 64
 AGENT_IMAGE = "registry.example/aster-agent@sha256:" + "b" * 64
 ADMIN_IMAGE = "registry.example/aster-admin@sha256:" + "c" * 64
@@ -56,10 +57,16 @@ def canonical_model():
         {"source": "aster-mission-activation", "target": "/run/secrets/aster-mission-activation"},
         {"source": "aster-provisioning-bundle", "target": "/run/secrets/aster-provisioning-bundle"},
     ]
+    operator_token = {
+        "source": "aster-operator-client-token",
+        "target": "/run/secrets/aster-client-token",
+    }
     config = [{"source": "aster-agent-config", "target": "/etc/aster/agent.json", "mode": 292}]
     config_digest = {"ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"}
     state_bind = [{"type": "bind", "source": "${ASTER_STATE_DIR:?required}",
                    "target": "/var/lib/aster"}]
+    transfer_bind = [{"type": "bind", "source": "${ASTER_TRANSFER_DIR:?required}",
+                      "target": "/transfer"}]
     return {
         "x-aster-metadata": {
             "copyright": "Copyright 2026 Defense Unicorns, Inc.",
@@ -98,18 +105,43 @@ def canonical_model():
                              "target": "/run/aster-generation/manifest.json", "read_only": True}],
                 "depends_on": {"aster-agent": {"condition": "service_healthy"}},
             },
+            "asterctl": {
+                **copy.deepcopy(runtime), "image": "${ASTER_ADMIN_IMAGE_DIGEST:?required}",
+                "pull_policy": "never",
+                "network_mode": "service:aster-agent",
+                "entrypoint": ["/usr/local/bin/asterctl", "--token-file",
+                               "/run/secrets/aster-client-token"],
+                "command": ["status"],
+                "secrets": [copy.deepcopy(operator_token)],
+                "volumes": transfer_bind,
+                "depends_on": {"aster-agent": {"condition": "service_healthy"}},
+            },
         },
         "configs": {"aster-agent-config": {"file": "${ASTER_AGENT_CONFIG_FILE:?required}"}},
         "secrets": {
             "aster-client-token": {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-client-token"},
             "aster-mission-activation": {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-mission-activation"},
             "aster-provisioning-bundle": {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"},
+            "aster-operator-client-token": {"file": "${ASTER_TOKEN_INPUT:?required}"},
         },
     }
 
 
 def canonical_json(model) -> str:
     return json.dumps(model, indent=2) + "\n"
+
+
+def canonical_remote_mesh_model():
+    return {
+        "services": {
+            "aster-agent": {
+                "ports": [
+                    "${ASTER_MESH_BIND_ADDRESS:?required}:"
+                    "${ASTER_MESH_PUBLISHED_PORT:-8183}:8183/udp"
+                ]
+            }
+        }
+    }
 
 
 class Fixture:
@@ -139,6 +171,11 @@ class Fixture:
         self.config_path.write_text(json.dumps({"schema_version": 2}) + "\n")
         self.state = root / "state"
         self.state.mkdir(mode=0o700)
+        self.transfer = root / "transfer"
+        self.transfer.mkdir(mode=0o700)
+        self.token_input = root / "client-token-input"
+        self.token_input.write_text(TOKEN_CANARY)
+        self.token_input.chmod(0o600)
 
     def env(self) -> dict[str, str]:
         return {
@@ -153,6 +190,8 @@ class Fixture:
             "ASTER_ADMIN_IMAGE_DIGEST": ADMIN_IMAGE,
             "ASTER_CREDENTIAL_GENERATION_DIR": str(self.generation),
             "ASTER_STATE_DIR": str(self.state),
+            "ASTER_TRANSFER_DIR": str(self.transfer),
+            "ASTER_TOKEN_INPUT": str(self.token_input),
         }
 
     def rewrite(self, old: str, new: str) -> None:
@@ -170,7 +209,9 @@ class Fixture:
 class DeliveryTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.fixture = Fixture(Path(self.temporary.name))
+        # macOS temporary paths may use /var, an alias of /private/var.
+        # Valid fixtures must satisfy the production canonical-path boundary.
+        self.fixture = Fixture(Path(self.temporary.name).resolve())
 
     def tearDown(self):
         for child in Path(self.temporary.name).glob("generation-*"):
@@ -328,6 +369,29 @@ class GenerationBoundaryTests(DeliveryTestCase):
         self.assert_rejected("generation-directory-immutable", env)
 
 class StaticComposePolicyTests(DeliveryTestCase):
+    def test_remote_mesh_override_is_exact_and_default_stays_closed(self):
+        self.assertNotIn("ports", self.fixture.model["services"]["aster-agent"])
+        self.assertEqual(
+            REMOTE_MESH.read_text(),
+            canonical_json(canonical_remote_mesh_model()),
+        )
+        with self.assertRaises(MODULE.ValidationError) as raised:
+            MODULE.validate_remote_mesh_override(REMOTE_MESH, {})
+        self.assertEqual(raised.exception.code, "mesh-bind-address-required")
+        MODULE.validate_remote_mesh_override(
+            REMOTE_MESH,
+            {"ASTER_MESH_BIND_ADDRESS": "10.244.151.17"},
+        )
+        with self.assertRaises(MODULE.ValidationError) as raised:
+            MODULE.validate_remote_mesh_override(
+                REMOTE_MESH,
+                {
+                    "ASTER_MESH_BIND_ADDRESS": "10.244.151.17",
+                    "ASTER_MESH_PUBLISHED_PORT": "0",
+                },
+            )
+        self.assertEqual(raised.exception.code, "mesh-published-port-invalid")
+
     def test_requires_an_absolute_user_owned_private_state_directory(self):
         # Break caught: accepting a missing, indirect, or broadly accessible
         # state path would reintroduce privileged initialization or expose data.
@@ -357,7 +421,10 @@ class StaticComposePolicyTests(DeliveryTestCase):
         # Break caught: restoring the former initializer would require
         # container root/CAP_CHOWN despite the Docker-only operator contract.
         model = self.fixture.model
-        self.assertEqual(set(model["services"]), {"aster-agent", "preflight", "verify"})
+        self.assertEqual(
+            set(model["services"]),
+            {"aster-agent", "preflight", "verify", "asterctl"},
+        )
         self.assertNotIn("volumes", model)
         for service in model["services"].values():
             self.assertNotEqual(service.get("user"), "0:0")
@@ -380,6 +447,101 @@ class StaticComposePolicyTests(DeliveryTestCase):
 
         plan = self.validate().render()
         self.assertIn('"project_name":"aster-test-a"', plan)
+
+    def test_asterctl_is_one_shot_token_only_and_shares_agent_network(self):
+        service = self.fixture.model["services"]["asterctl"]
+        self.assertEqual(service["image"], "${ASTER_ADMIN_IMAGE_DIGEST:?required}")
+        self.assertEqual(service["network_mode"], "service:aster-agent")
+        self.assertEqual(
+            service["entrypoint"],
+            [
+                "/usr/local/bin/asterctl",
+                "--token-file",
+                "/run/secrets/aster-client-token",
+            ],
+        )
+        self.assertEqual(service["command"], ["status"])
+        self.assertEqual(
+            service["secrets"],
+            [{"source": "aster-operator-client-token",
+              "target": "/run/secrets/aster-client-token"}],
+        )
+        self.assertEqual(
+            self.fixture.model["secrets"]["aster-client-token"],
+            {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-client-token"},
+        )
+        self.assertEqual(
+            self.fixture.model["secrets"]["aster-operator-client-token"],
+            {"file": "${ASTER_TOKEN_INPUT:?required}"},
+        )
+        self.assertEqual(
+            service["volumes"],
+            [{"type": "bind", "source": "${ASTER_TRANSFER_DIR:?required}",
+              "target": "/transfer"}],
+        )
+        self.assertEqual(
+            service["depends_on"],
+            {"aster-agent": {"condition": "service_healthy"}},
+        )
+        self.assertNotIn("configs", service)
+        self.assertEqual(service["restart"], "no")
+
+    def test_requires_an_absolute_user_owned_private_transfer_directory(self):
+        for value, code in (
+            (None, "transfer-directory-required"),
+            ("transfer", "transfer-directory-absolute"),
+            (str(self.fixture.root / "missing-transfer"), "transfer-directory-invalid"),
+        ):
+            with self.subTest(value=value):
+                env = self.fixture.env()
+                if value is None:
+                    env.pop("ASTER_TRANSFER_DIR")
+                else:
+                    env["ASTER_TRANSFER_DIR"] = value
+                self.assert_rejected(code, env)
+
+        self.fixture.transfer.chmod(0o755)
+        self.assert_rejected("transfer-directory-mode-invalid")
+        self.fixture.transfer.chmod(0o700)
+        link = self.fixture.root / "transfer-link"
+        link.symlink_to(self.fixture.transfer, target_is_directory=True)
+        env = self.fixture.env()
+        env["ASTER_TRANSFER_DIR"] = str(link)
+        self.assert_rejected("transfer-directory-invalid", env)
+
+    def test_requires_an_owner_only_valid_plaintext_operator_token_input(self):
+        for value, code in (
+            (None, "operator-token-required"),
+            ("client-token", "operator-token-absolute"),
+            (str(self.fixture.root / "missing-token"), "operator-token-invalid"),
+        ):
+            with self.subTest(value=value):
+                env = self.fixture.env()
+                if value is None:
+                    env.pop("ASTER_TOKEN_INPUT")
+                else:
+                    env["ASTER_TOKEN_INPUT"] = value
+                self.assert_rejected(code, env)
+
+        self.fixture.token_input.chmod(0o644)
+        self.assert_rejected("operator-token-mode-invalid")
+        self.fixture.token_input.chmod(0o600)
+
+        link = self.fixture.root / "client-token-link"
+        link.symlink_to(self.fixture.token_input)
+        env = self.fixture.env()
+        env["ASTER_TOKEN_INPUT"] = str(link)
+        self.assert_rejected("operator-token-invalid", env)
+
+        for value in (
+            b"x" * 31,
+            b"x" * 32 + b"/",
+            b"\xff" * 32,
+            b"x" * 259,
+        ):
+            with self.subTest(size=len(value)):
+                self.fixture.token_input.write_bytes(value)
+                self.assert_rejected("operator-token-contents-invalid")
 
     def test_rejects_mutable_or_missing_image_references(self):
         for key, value in (
@@ -406,7 +568,7 @@ class StaticComposePolicyTests(DeliveryTestCase):
 
     def test_requires_pull_policy_never_on_every_service(self):
         self.validate()
-        for service in ("preflight", "aster-agent", "verify"):
+        for service in ("preflight", "aster-agent", "verify", "asterctl"):
             for value in (None, "missing", "always"):
                 with self.subTest(service=service, value=value):
                     def mutation(model, service=service, value=value):
@@ -567,6 +729,143 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_blob_read_operator_docs_describe_portable_named_staging(self):
+        for path in (
+            REPOSITORY / "crates/asterctl/asterctl-blob-read.1",
+            REPOSITORY / "crates/aster-agent/README.md",
+        ):
+            source = path.read_text()
+            with self.subTest(path=path):
+                self.assertIn("owner-controlled", source)
+                self.assertIn("mode-0600", source)
+                self.assertIn("best-effort", source)
+                self.assertNotIn("O_TMPFILE", source)
+                self.assertNotIn("anonymous temporary", source)
+                self.assertNotIn("No named partial path exists", source)
+
+    def test_cross_device_runbook_keeps_remote_mesh_override_on_cli_commands(self):
+        runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
+        cross_device = runbook.split(
+            "### Step 7: connect this Docker node to a test device", 1
+        )[1].split("### Compose boundaries", 1)[0]
+        self.assertNotIn("Use Step 5 above", cross_device)
+        self.assertGreaterEqual(
+            cross_device.count('-f "$ASTER_REMOTE_MESH_FILE"'),
+            8,
+        )
+        for command in (" publish ", " query ", "blob-publish", "blob-read"):
+            with self.subTest(command=command):
+                self.assertIn(command, cross_device)
+
+        remote_lifecycle = runbook.split(
+            "Remote-mesh lifecycle commands:", 1
+        )[1].split("`down` preserves", 1)[0]
+        self.assertEqual(
+            remote_lifecycle.count('-f "$ASTER_REMOTE_MESH_FILE"'),
+            4,
+        )
+        for command in (
+            "up -d --force-recreate aster-agent",
+            "run --rm verify",
+            "stop -t 40 aster-agent",
+            "down",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, remote_lifecycle)
+
+    def test_operator_runbook_has_artifact_only_compose_cli_examples(self):
+        runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
+        required = (
+            "compose.yaml",
+            "compose.remote-mesh.yaml",
+            "ASTER_TRANSFER_DIR",
+            "aster_compose_delivery.py",
+            "ASTER_ADMIN_IMAGE_DIGEST",
+            'chmod 0500 "$ASTER_CREDENTIAL_GENERATION_DIR"',
+            'docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl',
+            " publish ",
+            " query ",
+            "blob-publish",
+            "blob-read",
+            "--ttl-ms",
+            "sha256sum",
+            "up -d --force-recreate aster-agent",
+        )
+        for value in required:
+            with self.subTest(value=value):
+                self.assertIn(value, runbook)
+        self.assertNotIn(
+            "no supported interactive Event/Blob",
+            runbook,
+        )
+        self.assertNotIn(
+            "The scratch image has no shell, `curl`, or `asterctl`.",
+            runbook,
+        )
+
+    def test_release_artifact_includes_the_daemon_free_validator(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        self.assertIn(
+            "cp tools/aster_compose_delivery.py "
+            "target/compose-release/aster_compose_delivery.py",
+            workflow,
+        )
+        self.assertIn(
+            'validator:{file:"aster_compose_delivery.py",sha256:$validator_sha256}',
+            workflow,
+        )
+        self.assertIn(
+            "target/compose-release/aster_compose_delivery.py",
+            workflow,
+        )
+
+    def test_release_artifact_records_remote_mesh_override_digest(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        self.assertIn(
+            "cp docker/compose-agent/compose.remote-mesh.yaml "
+            "target/compose-release/compose.remote-mesh.yaml",
+            workflow,
+        )
+        self.assertIn(
+            "remote_mesh_digest=$(sha256sum "
+            "docker/compose-agent/compose.remote-mesh.yaml",
+            workflow,
+        )
+        self.assertIn(
+            'remote_mesh_override:{file:"compose.remote-mesh.yaml",'
+            "sha256:$remote_mesh_sha256}",
+            workflow,
+        )
+        self.assertIn(
+            "target/compose-release/compose.remote-mesh.yaml",
+            workflow,
+        )
+
+    def test_admin_artifact_ships_asterctl_with_admin_bound_sbom(self):
+        dockerfile = (REPOSITORY / "docker/compose-agent/Dockerfile.admin").read_text()
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+
+        self.assertIn("-p asterctl", dockerfile)
+        self.assertIn("--bin asterctl", dockerfile)
+        self.assertIn(
+            "/out/rootfs/usr/local/bin/asterctl",
+            dockerfile,
+        )
+        self.assertIn(
+            "cargo cyclonedx --format json --spec-version 1.5 --describe binaries \\\n"
+            "            --manifest-path crates/asterctl/Cargo.toml",
+            workflow,
+        )
+        self.assertIn(
+            "bind_sbom target/compose-release/asterctl_bin.cdx.json "
+            "asterctl \"$admin_digest\"",
+            workflow,
+        )
+        self.assertIn(
+            '"aster-compose-verify_bin.cdx.json","asterctl_bin.cdx.json"',
+            workflow,
+        )
+
     def test_runtime_dockerfiles_copy_one_prepared_rootfs(self):
         agent = (REPOSITORY / "docker/compose-agent/Dockerfile.agent").read_text()
         admin = (REPOSITORY / "docker/compose-agent/Dockerfile.admin").read_text()
@@ -652,12 +951,12 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
         self.assertEqual(workflow.count(matrix), 1)
         self.assertEqual(workflow.count("runs-on: ${{ matrix.runner }}"), 1)
-        self.assertEqual(
-            workflow.count(
-                "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
-            ),
-            1,
+        buildx_actions = tuple(
+            match
+            for match in MODULE.ACTION_USE_RE.finditer(workflow)
+            if match.group("repository") == "docker/setup-buildx-action"
         )
+        self.assertEqual(len(buildx_actions), 1)
         self.assertEqual(workflow.count("driver: docker-container"), 1)
         self.assertEqual(
             workflow.count(
@@ -675,6 +974,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(
             workflow.count("--build-arg SOURCE_DATE_EPOCH=946684800"), 4
         )
+        self.assertEqual(workflow.count("--describe binaries"), 2)
         self.assertEqual(workflow.count("oci-artifact=true"), 2)
         self.assertEqual(workflow.count("--output type=docker"), 2)
         self.assertEqual(workflow.count("docker image load --input"), 2)
@@ -682,6 +982,10 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(workflow.count("--architecture \"${{ matrix.arch }}\""), 4)
         self.assertEqual(workflow.count("--expected-config-digest"), 4)
         self.assertEqual(workflow.count("--result-file"), 2)
+        self.assertEqual(workflow.count("compose.remote-mesh.yaml"), 6)
+        self.assertEqual(workflow.count("remote_mesh_sha256"), 3)
+        self.assertEqual(workflow.count("aster_compose_delivery.py"), 6)
+        self.assertEqual(workflow.count("validator_sha256"), 3)
         self.assertIn("aster-compose-image-release/v2", workflow)
         self.assertIn("docker_image_id", workflow)
         self.assertLess(
@@ -696,13 +1000,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         for old, new in (
             ("retention-days: 14", "retention-days: 0"),
             ("timeout-minutes: 60", "timeout-minutes: 0"),
-            ("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-             "actions/checkout@main"),
             ("docker buildx build", "docker run --rm"),
-            (
-                "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
-                "docker/setup-buildx-action@main",
-            ),
             ("driver: docker-container", "driver: docker"),
             (
                 "image=moby/buildkit:buildx-stable-1@sha256:"
@@ -728,10 +1026,73 @@ class RepositoryPolicyTests(unittest.TestCase):
         ):
             with self.subTest(new=new):
                 mutation = workflow.replace(old, new, 1)
-                digest = hashlib.sha256(mutation.encode()).hexdigest()
+                normalized = MODULE.normalize_workflow_action_pins(mutation)
+                digest = hashlib.sha256(normalized.encode()).hexdigest()
                 with mock.patch.object(MODULE, "COMPOSE_BUILD_WORKFLOW_SHA256", digest):
                     with self.assertRaises(MODULE.ValidationError):
                         MODULE.validate_workflow_policy(mutation, ci)
+
+    def test_release_workflow_accepts_reviewed_action_pin_updates(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text()
+        matches = tuple(MODULE.ACTION_USE_RE.finditer(workflow))
+        self.assertEqual(
+            tuple(match.group("repository") for match in matches),
+            MODULE.APPROVED_WORKFLOW_ACTIONS,
+        )
+
+        updated_workflow = workflow
+        for index, match in enumerate(matches):
+            replacement = (
+                f'{match.group("prefix")}{match.group("repository")}@'
+                f'{chr(ord("a") + index) * 40}{match.group("comment_prefix")}'
+                f'v99.{index}.0{match.group("suffix")}'
+            )
+            with self.subTest(action=match.group("repository")):
+                mutation = workflow.replace(match.group(0), replacement, 1)
+                self.assertNotEqual(mutation, workflow)
+                MODULE.validate_workflow_policy(mutation, ci)
+            updated_workflow = updated_workflow.replace(match.group(0), replacement, 1)
+
+        self.assertNotEqual(updated_workflow, workflow)
+        MODULE.validate_workflow_policy(updated_workflow, ci)
+
+    def test_release_workflow_rejects_unapproved_or_unpinned_actions(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text()
+        checkout = next(
+            match
+            for match in MODULE.ACTION_USE_RE.finditer(workflow)
+            if match.group("repository") == "actions/checkout"
+        )
+        prefix = checkout.group("prefix")
+        version = checkout.group("version")
+        suffix = checkout.group("suffix")
+        checkout_line = checkout.group(0)
+        mutations = (
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@main # {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@abc123 # {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40}  # {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40} #  {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40} # {version} ", 1),
+            workflow.replace(
+                checkout_line,
+                f"{prefix}attacker/checkout@{'a' * 40} # {version}{suffix}",
+                1,
+            ),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40} # latest", 1),
+            workflow.replace(f"      - name: Check out source\n{checkout_line}\n", "", 1),
+            workflow.replace(
+                f"{checkout_line}\n",
+                f"{checkout_line}\n{prefix}actions/cache@{'e' * 40} # v6.1.0\n",
+                1,
+            ),
+        )
+        for index, mutation in enumerate(mutations):
+            self.assertNotEqual(mutation, workflow)
+            with self.subTest(case=index), self.assertRaises(MODULE.ValidationError):
+                MODULE.validate_workflow_policy(mutation, ci)
 
     def test_release_workflow_rejects_structural_and_command_obfuscation(self):
         workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
@@ -757,7 +1118,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(case=index):
-                digest = hashlib.sha256(mutation.encode()).hexdigest()
+                normalized = MODULE.normalize_workflow_action_pins(mutation)
+                digest = hashlib.sha256(normalized.encode()).hexdigest()
                 with mock.patch.object(MODULE, "COMPOSE_BUILD_WORKFLOW_SHA256", digest):
                     with self.assertRaises(MODULE.ValidationError):
                         MODULE.validate_workflow_policy(mutation, ci)

@@ -4762,6 +4762,11 @@ impl<S: RecordStore, E: crate::engine::EnvelopeSealer> RuntimeBackend for Node<S
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "adapter-sdk")]
+    mod batch;
+    #[cfg(feature = "adapter-sdk")]
+    mod record;
+
     use super::*;
     use crate::blob::{BlobMetadata, BlobStoreConfig, MAX_BLOB_CHUNK_SIZE};
     use crate::crypto::{
@@ -4771,6 +4776,7 @@ mod tests {
     use crate::engine::{NodeConfig, PublishRequest};
     use crate::link::{LinkCharacteristics, ReceivedFrame};
     use crate::model::{DataClass, Priority, Scope, Topic};
+    use crate::sync::SyncConfig;
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::io::Cursor;
@@ -6851,183 +6857,207 @@ mod tests {
     }
 
     #[test]
-    fn active_two_way_sync_converges_across_root_offer_boundary() {
-        const UNIQUE_DELTA: usize = 4;
-        for item_count in [255_usize, 256, 257] {
-            let (left_bundle, right_bundle) = bundles();
-            let object = |domain: u8, index: usize| {
-                let mut sealed = vec![domain];
-                sealed.extend_from_slice(
-                    &u64::try_from(index)
-                        .expect("bounded test index")
-                        .to_be_bytes(),
-                );
-                let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
-                (object_id, sealed)
-            };
-            let mut common = BTreeMap::new();
-            for index in 0..item_count - UNIQUE_DELTA {
-                let (object_id, sealed) = object(0x43, index);
-                assert!(common.insert(object_id, sealed).is_none());
-            }
-            let mut left_backend = FakeBackend {
-                available: common.clone(),
-                ..FakeBackend::default()
-            };
-            let mut right_backend = FakeBackend {
-                available: common,
-                ..FakeBackend::default()
-            };
-            let mut left_unique = BTreeSet::new();
-            let mut right_unique = BTreeSet::new();
-            for index in 0..UNIQUE_DELTA {
-                let (left_id, left_sealed) = object(0x4c, index);
-                let (right_id, right_sealed) = object(0x52, index);
-                assert!(
-                    left_backend
-                        .available
-                        .insert(left_id, left_sealed)
-                        .is_none()
-                );
-                assert!(
-                    right_backend
-                        .available
-                        .insert(right_id, right_sealed)
-                        .is_none()
-                );
-                assert!(left_unique.insert(left_id));
-                assert!(right_unique.insert(right_id));
-            }
-            let left_initial = left_backend
-                .available
-                .keys()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            let right_initial = right_backend
-                .available
-                .keys()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            assert_eq!(left_initial.len(), item_count);
-            assert_eq!(right_initial.len(), item_count);
-            assert_eq!(
-                left_initial.difference(&right_initial).count(),
-                UNIQUE_DELTA
-            );
-            assert_eq!(
-                right_initial.difference(&left_initial).count(),
-                UNIQUE_DELTA
-            );
-            let expected = left_initial
-                .union(&right_initial)
-                .copied()
-                .collect::<BTreeSet<_>>();
+    fn active_two_way_sync_converges_below_root_offer_boundary() {
+        assert_two_way_sync_converges(3, 4);
+    }
 
-            let request = StartRequest {
-                exchange_id: 132,
-                topics: vec!["alpha".into()],
-                scopes: vec!["mission/team".into()],
-                min_priority: Priority::Routine as u8,
-            };
-            let mut left_driver = RuntimeDriver::initiator(
-                left_bundle,
-                SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
-                left_backend,
-                request.clone(),
-                None,
-            )
-            .unwrap();
-            let mut right_driver = RuntimeDriver::responder_with_start(
-                right_bundle,
-                SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
-                right_backend,
-                StartRequest {
-                    exchange_id: 9_999,
-                    ..request
-                },
-                None,
-            )
-            .unwrap();
-            assert!(left_driver.sync().inventory().is_empty());
-            assert!(right_driver.sync().inventory().is_empty());
-            let (left, right) = MemoryLink::pair(u16::MAX);
-            let now = Instant::now();
-            let mut converged = false;
+    #[test]
+    fn active_two_way_sync_converges_at_root_offer_boundary() {
+        assert_two_way_sync_converges(4, 4);
+    }
 
-            for step in 0..5_000 {
-                left_driver.pump_at(&left, now).unwrap_or_else(|error| {
-                    panic!("{item_count}-item left pump failed at step {step}: {error}")
-                });
-                right_driver.pump_at(&right, now).unwrap_or_else(|error| {
-                    panic!("{item_count}-item right pump failed at step {step}: {error}")
-                });
+    #[test]
+    fn active_two_way_sync_converges_above_root_offer_boundary() {
+        assert_two_way_sync_converges(5, 4);
+    }
 
-                let left_ids = left_driver
-                    .backend()
-                    .available
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                let right_ids = right_driver
-                    .backend()
-                    .available
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                let data_or_want_pending = |driver: &RuntimeDriver<FakeBackend>| {
-                    driver
-                        .retries
-                        .keys()
-                        .any(|key| matches!(key, RetryKey::Want(..) | RetryKey::Data(..)))
-                        || !driver.deferred_wants.is_empty()
-                };
-                if left_ids == expected
-                    && right_ids == expected
-                    && left_driver.sync().wants().is_empty()
-                    && right_driver.sync().wants().is_empty()
-                    && !data_or_want_pending(&left_driver)
-                    && !data_or_want_pending(&right_driver)
-                    && left.inbound.lock().unwrap().is_empty()
-                    && right.inbound.lock().unwrap().is_empty()
-                {
-                    converged = true;
-                    break;
-                }
-            }
-
-            assert!(
-                converged,
-                "{item_count}-item active two-way exchange did not converge"
+    fn assert_two_way_sync_converges(item_count: usize, max_offer_ids: usize) {
+        let unique_delta = item_count.min(max_offer_ids);
+        let (left_bundle, right_bundle) = bundles();
+        let object = |domain: u8, index: usize| {
+            let mut sealed = vec![domain];
+            sealed.extend_from_slice(
+                &u64::try_from(index)
+                    .expect("bounded test index")
+                    .to_be_bytes(),
             );
-            assert!(left_driver.is_authenticated());
-            assert!(right_driver.is_authenticated());
-            assert_eq!(
-                left_driver
-                    .backend()
-                    .ingested
-                    .iter()
-                    .map(|(object_id, _)| *object_id)
-                    .collect::<BTreeSet<_>>(),
-                right_unique
-            );
-            assert_eq!(
-                right_driver
-                    .backend()
-                    .ingested
-                    .iter()
-                    .map(|(object_id, _)| *object_id)
-                    .collect::<BTreeSet<_>>(),
-                left_unique
-            );
-            assert_eq!(left_driver.backend().ingested.len(), UNIQUE_DELTA);
-            assert_eq!(right_driver.backend().ingested.len(), UNIQUE_DELTA);
-            assert!(
-                (UNIQUE_DELTA..=UNIQUE_DELTA * 2).contains(&left_driver.backend().data_requests)
-            );
-            assert!(
-                (UNIQUE_DELTA..=UNIQUE_DELTA * 2).contains(&right_driver.backend().data_requests)
-            );
+            let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
+            (object_id, sealed)
+        };
+        let mut common = BTreeMap::new();
+        for index in 0..item_count - unique_delta {
+            let (object_id, sealed) = object(0x43, index);
+            assert!(common.insert(object_id, sealed).is_none());
         }
+        let mut left_backend = FakeBackend {
+            available: common.clone(),
+            ..FakeBackend::default()
+        };
+        let mut right_backend = FakeBackend {
+            available: common,
+            ..FakeBackend::default()
+        };
+        let mut left_unique = BTreeSet::new();
+        let mut right_unique = BTreeSet::new();
+        for index in 0..unique_delta {
+            let (left_id, left_sealed) = object(0x4c, index);
+            let (right_id, right_sealed) = object(0x52, index);
+            assert!(
+                left_backend
+                    .available
+                    .insert(left_id, left_sealed)
+                    .is_none()
+            );
+            assert!(
+                right_backend
+                    .available
+                    .insert(right_id, right_sealed)
+                    .is_none()
+            );
+            assert!(left_unique.insert(left_id));
+            assert!(right_unique.insert(right_id));
+        }
+        let left_initial = left_backend
+            .available
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let right_initial = right_backend
+            .available
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(left_initial.len(), item_count);
+        assert_eq!(right_initial.len(), item_count);
+        assert_eq!(
+            left_initial.difference(&right_initial).count(),
+            unique_delta
+        );
+        assert_eq!(
+            right_initial.difference(&left_initial).count(),
+            unique_delta
+        );
+        let expected = left_initial
+            .union(&right_initial)
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let request = StartRequest {
+            exchange_id: 132,
+            topics: vec!["alpha".into()],
+            scopes: vec!["mission/team".into()],
+            min_priority: Priority::Routine as u8,
+        };
+        let mut left_driver = RuntimeDriver::initiator(
+            left_bundle,
+            SyncState::new(
+                SyncConfig {
+                    max_offer_ids,
+                    ..SyncConfig::default()
+                },
+                SparseInventory::new(),
+            )
+            .unwrap(),
+            left_backend,
+            request.clone(),
+            None,
+        )
+        .unwrap();
+        let mut right_driver = RuntimeDriver::responder_with_start(
+            right_bundle,
+            SyncState::new(
+                SyncConfig {
+                    max_offer_ids,
+                    ..SyncConfig::default()
+                },
+                SparseInventory::new(),
+            )
+            .unwrap(),
+            right_backend,
+            StartRequest {
+                exchange_id: 9_999,
+                ..request
+            },
+            None,
+        )
+        .unwrap();
+        assert!(left_driver.sync().inventory().is_empty());
+        assert!(right_driver.sync().inventory().is_empty());
+        let (left, right) = MemoryLink::pair(u16::MAX);
+        let now = Instant::now();
+        let mut converged = false;
+
+        for step in 0..5_000 {
+            left_driver.pump_at(&left, now).unwrap_or_else(|error| {
+                panic!("{item_count}-item left pump failed at step {step}: {error}")
+            });
+            right_driver.pump_at(&right, now).unwrap_or_else(|error| {
+                panic!("{item_count}-item right pump failed at step {step}: {error}")
+            });
+
+            let left_ids = left_driver
+                .backend()
+                .available
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let right_ids = right_driver
+                .backend()
+                .available
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let data_or_want_pending = |driver: &RuntimeDriver<FakeBackend>| {
+                driver
+                    .retries
+                    .keys()
+                    .any(|key| matches!(key, RetryKey::Want(..) | RetryKey::Data(..)))
+                    || !driver.deferred_wants.is_empty()
+            };
+            if left_ids == expected
+                && right_ids == expected
+                && left_driver.sync().wants().is_empty()
+                && right_driver.sync().wants().is_empty()
+                && !data_or_want_pending(&left_driver)
+                && !data_or_want_pending(&right_driver)
+                && left.inbound.lock().unwrap().is_empty()
+                && right.inbound.lock().unwrap().is_empty()
+            {
+                converged = true;
+                break;
+            }
+        }
+
+        assert!(
+            converged,
+            "{item_count}-item active two-way exchange did not converge"
+        );
+        assert!(left_driver.is_authenticated());
+        assert!(right_driver.is_authenticated());
+        assert_eq!(
+            left_driver
+                .backend()
+                .ingested
+                .iter()
+                .map(|(object_id, _)| *object_id)
+                .collect::<BTreeSet<_>>(),
+            right_unique
+        );
+        assert_eq!(
+            right_driver
+                .backend()
+                .ingested
+                .iter()
+                .map(|(object_id, _)| *object_id)
+                .collect::<BTreeSet<_>>(),
+            left_unique
+        );
+        assert_eq!(left_driver.backend().ingested.len(), unique_delta);
+        assert_eq!(right_driver.backend().ingested.len(), unique_delta);
+        assert!((unique_delta..=unique_delta * 2).contains(&left_driver.backend().data_requests));
+        assert!((unique_delta..=unique_delta * 2).contains(&right_driver.backend().data_requests));
+        assert!(left_driver.sync().wants().is_empty());
+        assert!(right_driver.sync().wants().is_empty());
     }
 
     #[test]

@@ -19,6 +19,9 @@ use crate::{
     event_operation::{ACTIVE_OPERATION_BY_EVENT_V1, EVENT_OPERATION_LEDGER_V3},
 };
 
+const APPLICATION_CHECKPOINTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.application-publication-checkpoints.v1");
+
 const CLIENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.numbered-event-clients.v1");
 const RESULTS: TableDefinition<&[u8], &[u8]> =
@@ -27,6 +30,7 @@ const RESULT_BY_EVENT: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.numbered-event-result-by-event.v1");
 
 const MODE: &str = "numbered_event_operation_mode_v1";
+const COMMITTED_COUNT: &str = "numbered_event_operation_committed_total_v1";
 const CLIENT_COUNT: &str = "numbered_event_operation_clients_v1";
 const RESULT_COUNT: &str = "numbered_event_operation_results_v1";
 const REVERSE_COUNT: &str = "numbered_event_operation_reverse_v1";
@@ -81,6 +85,33 @@ impl EventPublicationSession {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// One cooperating application incarnation; local bearer access is a separate authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventClientContext {
+    pub client_id: EventClientId,
+    pub session: EventPublicationSession,
+}
+
+/// Read-only disposition of a caller's client session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventClientDisposition {
+    Unregistered,
+    Current,
+    Fenced,
+    RecoveryRequired,
+}
+
+/// Bounded, local application ownership observation, not an operating-system process identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventClientStatus {
+    pub current_session: Option<EventPublicationSession>,
+    pub disposition: EventClientDisposition,
+    pub subscriptions: u64,
+    pub pending_deliveries: u64,
+    pub acknowledged_deliveries: u64,
+    pub ownership_metadata_bytes: u64,
 }
 
 /// Positive, never-reused application publication sequence.
@@ -167,6 +198,7 @@ pub enum NumberedEventOperationError {
     LegacyStoreRequiresFreshState,
     LegacyOperationDisabled,
     ClientNotFound,
+    SubscriptionOwnerMismatch,
     SessionFenced,
     RecoveryRequired,
     RecoveryRevisionChanged,
@@ -200,6 +232,7 @@ impl fmt::Display for NumberedEventOperationError {
             Self::LegacyOperationDisabled => {
                 "legacy Event operation publication is disabled for this store"
             }
+            Self::SubscriptionOwnerMismatch => "Event subscription belongs to another client",
             Self::ClientNotFound => "publication client was not found",
             Self::SessionFenced => "publication session was fenced by another claimant",
             Self::RecoveryRequired => "publication recovery must complete before mutation",
@@ -250,6 +283,82 @@ pub(crate) enum NumberedOperationResolution {
 }
 
 impl Store {
+    /// Monotonic count of newly committed numbered operations, independent
+    /// of session claims, result acknowledgement, and content retirement.
+    pub fn committed_numbered_event_publication_count(&self) -> Result<u64, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        Ok(read
+            .open_table(METADATA)?
+            .get(COMMITTED_COUNT)?
+            .map_or(0, |value| value.value()))
+    }
+
+    /// Reads bounded application-owned durable publication progress. The store
+    /// never interprets this checkpoint as a publication operation or receipt.
+    pub fn event_publication_checkpoint(
+        &self,
+        client: &EventClientId,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        if !read
+            .list_tables()?
+            .any(|table| table.name() == APPLICATION_CHECKPOINTS.name())
+        {
+            return Ok(None);
+        }
+        Ok(read
+            .open_table(APPLICATION_CHECKPOINTS)?
+            .get(client.as_bytes())?
+            .map(|value| value.value().to_vec()))
+    }
+
+    /// Replaces one bounded application checkpoint with immediate durability.
+    /// A bounded client namespace prevents an application from creating an
+    /// unbounded secondary operation-key ledger.
+    pub fn save_event_publication_checkpoint(
+        &self,
+        client: &EventClientId,
+        checkpoint: &[u8],
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        if checkpoint.is_empty() || checkpoint.len() > 16 * 1024 {
+            return Err(StoreError::InvalidSemanticEvent(
+                "application publication checkpoint exceeds its bound",
+            ));
+        }
+        let write = self.database.begin_write()?;
+        crate::enforce_live_write(&write)?;
+        {
+            let mut table = write.open_table(APPLICATION_CHECKPOINTS)?;
+            if table.get(client.as_bytes())?.is_none() && table.len()? >= MAX_NUMBERED_EVENT_CLIENTS
+            {
+                return Err(StoreError::InvalidSemanticEvent(
+                    "application publication checkpoint namespace is full",
+                ));
+            }
+            table.insert(client.as_bytes(), checkpoint)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Tests registration without creating or claiming a publication client.
+    pub fn has_event_publication_client(&self, client: &EventClientId) -> Result<bool, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        if !read
+            .list_tables()?
+            .any(|table| table.name() == CLIENTS.name())
+        {
+            return Ok(false);
+        }
+        Ok(read.open_table(CLIENTS)?.get(client.as_bytes())?.is_some())
+    }
+
     /// Atomically claims a new publication session or replays the same successful claim.
     pub fn begin_event_publication_session(
         &self,
@@ -748,6 +857,16 @@ pub(crate) fn admit_numbered_result_write(
         )
         .into());
     }
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        let count = metadata
+            .get(COMMITTED_COUNT)?
+            .map_or(0, |value| value.value());
+        let next = count
+            .checked_add(1)
+            .ok_or(StoreError::AcceptanceMarkerExhausted)?;
+        metadata.insert(COMMITTED_COUNT, next)?;
+    }
     stats.outstanding_results += 1;
     stats.reverse_edges += 1;
     write_stats(write, stats)?;
@@ -889,6 +1008,7 @@ pub(crate) fn validate_numbered_cleanup_cursor(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn legacy_operation_allowed_write(
     write: &redb::WriteTransaction,
 ) -> Result<(), StoreError> {
@@ -918,6 +1038,28 @@ pub(crate) fn audit_numbered_tables_write(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if regular.contains(APPLICATION_CHECKPOINTS.name()) {
+        let checkpoints = write.open_table(APPLICATION_CHECKPOINTS)?;
+        if checkpoints.len()? != 0 && crate::read_mission_binding(write)?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "unbound store contains application publication checkpoints",
+            ));
+        }
+        if checkpoints.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+            return Err(StoreError::SemanticInvariant(
+                "application publication checkpoint namespace exceeds its bound",
+            ));
+        }
+        for row in checkpoints.iter()? {
+            let (client, checkpoint) = row?;
+            EventClientId::new(client.value().to_vec())?;
+            if checkpoint.value().is_empty() || checkpoint.value().len() > 16 * 1024 {
+                return Err(StoreError::SemanticInvariant(
+                    "application publication checkpoint exceeds its byte bound",
+                ));
+            }
+        }
+    }
     let present = table_names
         .iter()
         .filter(|name| regular.contains(**name))
@@ -1095,6 +1237,28 @@ pub(crate) fn audit_numbered_tables_read(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if regular.contains(APPLICATION_CHECKPOINTS.name()) {
+        let checkpoints = read.open_table(APPLICATION_CHECKPOINTS)?;
+        if checkpoints.len()? != 0 && crate::read_mission_binding_read(read)?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "unbound store contains application publication checkpoints",
+            ));
+        }
+        if checkpoints.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+            return Err(StoreError::SemanticInvariant(
+                "application publication checkpoint namespace exceeds its bound",
+            ));
+        }
+        for row in checkpoints.iter()? {
+            let (client, checkpoint) = row?;
+            EventClientId::new(client.value().to_vec())?;
+            if checkpoint.value().is_empty() || checkpoint.value().len() > 16 * 1024 {
+                return Err(StoreError::SemanticInvariant(
+                    "application publication checkpoint exceeds its byte bound",
+                ));
+            }
+        }
+    }
     let present = table_names
         .iter()
         .filter(|name| regular.contains(**name))
@@ -1887,6 +2051,145 @@ pub fn recovery_snapshot_proto_len(snapshot: &EventRecoverySnapshot) -> usize {
                 1 + varint_len(length as u64) + length
             })
             .sum::<usize>()
+}
+
+pub(crate) fn require_client_context_write(
+    write: &redb::WriteTransaction,
+    context: &EventClientContext,
+) -> Result<(), StoreError> {
+    require_mutating_session(
+        load_client_write(write, &context.client_id)?,
+        context.session,
+    )
+}
+
+pub(crate) fn require_owner_registered_write(
+    write: &redb::WriteTransaction,
+    owner: &EventClientId,
+) -> Result<(), StoreError> {
+    load_client_write(write, owner).map(|_| ())
+}
+
+pub(crate) fn require_owner_registered_read(
+    read: &redb::ReadTransaction,
+    owner: &EventClientId,
+) -> Result<(), StoreError> {
+    load_client_read(read, owner).map(|_| ())
+}
+
+fn load_client_read(
+    read: &redb::ReadTransaction,
+    client: &EventClientId,
+) -> Result<ClientRecord, StoreError> {
+    read.open_table(CLIENTS)?
+        .get(client.as_bytes())?
+        .map(|value| decode_client(value.value()))
+        .transpose()?
+        .ok_or_else(|| NumberedEventOperationError::ClientNotFound.into())
+}
+
+pub(crate) fn client_disposition_read(
+    read: &redb::ReadTransaction,
+    client: &EventClientId,
+    observed_session: Option<EventPublicationSession>,
+) -> Result<(Option<EventPublicationSession>, EventClientDisposition), StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == CLIENTS.name())
+    {
+        return Ok((None, EventClientDisposition::Unregistered));
+    }
+    let record = read
+        .open_table(CLIENTS)?
+        .get(client.as_bytes())?
+        .map(|value| decode_client(value.value()))
+        .transpose()?;
+    let Some(record) = record else {
+        return Ok((None, EventClientDisposition::Unregistered));
+    };
+    let disposition = if observed_session.is_some_and(|session| record.session != session.get()) {
+        EventClientDisposition::Fenced
+    } else if observed_session.is_none()
+        || record.completed_session != record.session
+        || record.completed_revision != record.snapshot_revision
+    {
+        EventClientDisposition::RecoveryRequired
+    } else {
+        EventClientDisposition::Current
+    };
+    Ok((
+        Some(EventPublicationSession::new(record.session)?),
+        disposition,
+    ))
+}
+
+pub(crate) fn require_client_context_read(
+    read: &redb::ReadTransaction,
+    context: &EventClientContext,
+) -> Result<(), StoreError> {
+    require_mutating_session(load_client_read(read, &context.client_id)?, context.session)
+}
+
+impl Store {
+    /// Read-only validation; mutation callers must still revalidate in their writer transaction.
+    pub fn require_event_client_context(
+        &self,
+        context: &EventClientContext,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        require_client_context_read(&self.database.begin_read()?, context)
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Store {
+    /// Next sequence for recovered test fixtures; production clients must journal assignment.
+    pub fn test_next_event_operation_sequence(
+        &self,
+        context: &EventClientContext,
+    ) -> Result<EventOperationSequence, StoreError> {
+        let read = self.database.begin_read()?;
+        let record = load_client_read(&read, &context.client_id)?;
+        require_mutating_session(record, context.session)?;
+        EventOperationSequence::new(
+            record
+                .allocated_through
+                .checked_add(1)
+                .ok_or(NumberedEventOperationError::InvalidSequence)?,
+        )
+        .map_err(StoreError::from)
+    }
+
+    /// Registers one recovered client for subscription-only regression fixtures.
+    pub fn test_event_client_context(&self) -> Result<EventClientContext, StoreError> {
+        let client_id = EventClientId::new(b"test.subscription-owner".to_vec())?;
+        let read = self.database.begin_read()?;
+        match load_client_read(&read, &client_id) {
+            Ok(record) => {
+                return Ok(EventClientContext {
+                    client_id,
+                    session: EventPublicationSession::new(record.session)?,
+                });
+            }
+            Err(StoreError::NumberedEventOperation(
+                NumberedEventOperationError::ClientNotFound,
+            )) => {}
+            Err(error) => return Err(error),
+        }
+        drop(read);
+        let mut claim = [0; 32];
+        getrandom::fill(&mut claim).expect("test claim randomness");
+        let snapshot = self.begin_event_publication_session(&client_id, 0, &claim)?;
+        self.complete_event_publication_recovery(
+            &client_id,
+            snapshot.session,
+            snapshot.snapshot_revision,
+        )?;
+        Ok(EventClientContext {
+            client_id,
+            session: snapshot.session,
+        })
+    }
 }
 
 #[cfg(test)]

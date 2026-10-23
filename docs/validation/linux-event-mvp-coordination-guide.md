@@ -13,6 +13,14 @@ For exact limits and acceptance language, use the
 ownership and gate status, use the
 [decision and gate register](linux-event-mvp-evaluation-profile-v0.1-register.md).
 
+The publication contract and qualification chain below belong to the approved
+v0.1 evaluation. Current builds use numbered-only publication; the profile's
+ordinary operation-key API and retained receipts do not qualify that surface.
+See the profile's [current API and historical qualification boundary](linux-event-mvp-evaluation-profile-v0.1.md#current-api-and-historical-qualification-boundary)
+and the [current journaled SDK guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication).
+A reviewed profile amendment and exact-build evidence are needed before
+extending the evaluation claim to numbered publication.
+
 ## The outcome we are coordinating
 
 By the 2026-09-13 checkpoint, the team must be able to **issue, refuse, or

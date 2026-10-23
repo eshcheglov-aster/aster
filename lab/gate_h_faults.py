@@ -468,13 +468,7 @@ STATIC_CHECK_NAMES = frozenset(
         "shared_supervisor_owns_all_driver_session_and_pump_controls",
         "factory_is_the_only_public_contact_open_seam",
         "candidate_status_identity_hint_is_untrusted",
-        "formal_gate_h_feature_graph_excludes_legacy_service",
-        "legacy_contact_and_lab_surfaces_are_cfg_gated",
-        "legacy_service_controls_are_confined_to_gated_module",
-        "legacy_lab_controls_are_confined_to_gated_module",
-        "host_nongated_production_has_no_legacy_service_controls",
-        "lab_nongated_production_has_no_legacy_service_controls",
-        "gate_h_binary_has_no_legacy_command_reachability",
+        "formal_gate_h_feature_graph_selects_shared_host",
         "gate_h_docker_build_is_no_default_and_candidate_aliased",
         "formal_graph_has_no_libp2p_or_iroh_dependency",
     }
@@ -1038,7 +1032,7 @@ def formal_feature_graph(
     forbidden = sorted(
         set(
             re.findall(
-                r"(?i)\b(?:legacy-single-contact-service|legacy-lab|libp2p|iroh)[a-z0-9_-]*\b",
+                r"(?i)\b(?:libp2p|iroh)[a-z0-9_-]*\b",
                 # Cargo's package display includes the checkout path. It is not
                 # a dependency/feature token (e.g. a worktree named iroh-in-ci).
                 re.sub(r" \([^\r\n]*\)(?= features=\[)", "", stdout),
@@ -1051,8 +1045,6 @@ def formal_feature_graph(
             "aster_host_gate_h_formal": 1,
         },
         "forbidden_tokens": [
-            "legacy-single-contact-service",
-            "legacy-lab",
             "libp2p*",
             "iroh*",
         ],
@@ -1473,19 +1465,7 @@ def execute_static_checks(
         "crates/aster-ip/src/relay.rs",
     ]
     lab_manifest_path = "crates/aster-lab/Cargo.toml"
-    lab_lib_path = "crates/aster-lab/src/lib.rs"
-    gate_h_main_path = "crates/aster-lab/src/gate_h_main.rs"
     docker_path = "lab/Dockerfile"
-    legacy_host_start_marker = (
-        '#[cfg(feature = "legacy-single-contact-service")]\n'
-        "#[rustfmt::skip]\n"
-        "mod legacy_single_contact_service {"
-    )
-    legacy_lab_start_marker = (
-        '#[cfg(feature = "legacy-lab")]\n'
-        "#[rustfmt::skip]\n"
-        "mod legacy_lab {"
-    )
     provider_precomposition_region = source_region(
         mesh_path,
         "struct NativeContactLink {",
@@ -1525,37 +1505,6 @@ def execute_static_checks(
     shared_supervisor_region = source_region(
         shared_path,
         "pub struct SharedNodeContactSupervisor {",
-        "#[cfg(test)]\nmod tests {",
-        workspace=workspace,
-    )
-    legacy_host_region = source_region(
-        host_lib_path,
-        legacy_host_start_marker,
-        "#[cfg(test)]\nmod tests {",
-        workspace=workspace,
-    )
-    legacy_lab_region = source_region(
-        lab_lib_path,
-        legacy_lab_start_marker,
-        "#[cfg(test)]\nmod tests {",
-        workspace=workspace,
-    )
-    host_nongated_region = source_region(
-        host_lib_path,
-        "//! Process-owned, offline-first composition host for Aster Mesh.",
-        '#[cfg(feature = "legacy-single-contact-service")]\n'
-        "pub use legacy_single_contact_service::{",
-        workspace=workspace,
-    )
-    lab_nongated_region = source_region(
-        lab_lib_path,
-        "//! Deterministic and real-process laboratories for Aster Mesh.",
-        '#[cfg(feature = "legacy-lab")]\npub mod live;',
-        workspace=workspace,
-    )
-    gate_h_binary_region = source_region(
-        gate_h_main_path,
-        "#![forbid(unsafe_code)]",
         "#[cfg(test)]\nmod tests {",
         workspace=workspace,
     )
@@ -1916,7 +1865,7 @@ def execute_static_checks(
             },
         ),
         execute_rg_assertion(
-            name="formal_gate_h_feature_graph_excludes_legacy_service",
+            name="formal_gate_h_feature_graph_selects_shared_host",
             argv=[
                 "rg",
                 "-n",
@@ -1926,21 +1875,11 @@ def execute_static_checks(
                 "-e",
                 'aster-host = { version = "=0.1.0-alpha.1", path = "../aster-host", default-features = false }',
                 "-e",
-                'default = ["legacy-single-contact-service"]',
-                "-e",
-                "legacy-single-contact-service = []",
-                "-e",
                 "gate-h-formal = []",
-                "-e",
-                'default = ["legacy-lab"]',
-                "-e",
-                'legacy-lab = ["aster-host/legacy-single-contact-service"]',
                 "-e",
                 'gate-h = ["aster-host/gate-h-formal"]',
                 "-e",
                 'path = "src/main.rs"',
-                "-e",
-                'required-features = ["legacy-lab"]',
                 "-e",
                 'path = "src/gate_h_main.rs"',
                 "-e",
@@ -1952,198 +1891,17 @@ def execute_static_checks(
             source_paths=[host_manifest_path, lab_manifest_path],
             assertion={
                 "kind": "token_counts",
-                "match_count": 13,
+                "match_count": 8,
                 "counts": {
                     'aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }': 2,
                     'aster-host = { version = "=0.1.0-alpha.1", path = "../aster-host", default-features = false }': 1,
-                    'default = ["legacy-single-contact-service"]': 1,
-                    "legacy-single-contact-service = []": 1,
                     "gate-h-formal = []": 1,
-                    'default = ["legacy-lab"]': 1,
-                    'legacy-lab = ["aster-host/legacy-single-contact-service"]': 1,
                     'gate-h = ["aster-host/gate-h-formal"]': 1,
                     'path = "src/main.rs"': 1,
-                    'required-features = ["legacy-lab"]': 1,
                     'path = "src/gate_h_main.rs"': 1,
                     'required-features = ["gate-h"]': 1,
                 },
             },
-        ),
-        execute_rg_assertion(
-            name="legacy_contact_and_lab_surfaces_are_cfg_gated",
-            argv=[
-                "rg",
-                "-n",
-                "--fixed-strings",
-                "-e",
-                '#[cfg(feature = "legacy-single-contact-service")]',
-                "-e",
-                "pub use legacy_single_contact_service::{",
-                "-e",
-                "mod legacy_single_contact_service {",
-                "-e",
-                '#[cfg(feature = "legacy-lab")]',
-                "-e",
-                "pub mod live;",
-                "-e",
-                "pub use legacy_lab::*;",
-                "-e",
-                "mod legacy_lab {",
-                host_lib_path,
-                lab_lib_path,
-            ],
-            freeze=freeze,
-            source_paths=[host_lib_path, lab_lib_path],
-            assertion={
-                "kind": "token_counts",
-                "match_count": 10,
-                "counts": {
-                    '#[cfg(feature = "legacy-single-contact-service")]': 2,
-                    "pub use legacy_single_contact_service::{": 1,
-                    "mod legacy_single_contact_service {": 1,
-                    '#[cfg(feature = "legacy-lab")]': 3,
-                    "pub mod live;": 1,
-                    "pub use legacy_lab::*;": 1,
-                    "mod legacy_lab {": 1,
-                },
-            },
-        ),
-        execute_rg_assertion(
-            name="legacy_service_controls_are_confined_to_gated_module",
-            argv=[
-                "rg",
-                "-n",
-                "--fixed-strings",
-                "-e",
-                "type ContactDriver = RuntimeDriver<PeerBoundBackend>;",
-                "-e",
-                "struct ConfiguredCarrier {",
-                "-e",
-                "struct PeerBoundBackend {",
-                "-e",
-                "impl RuntimeBackend for PeerBoundBackend {",
-                "-e",
-                "pub fn configure_peer_carrier<",
-                "-e",
-                "pub fn begin_sync(",
-                "-e",
-                "driver.pump(",
-                "-e",
-                "pub fn pause_sync(",
-                "-e",
-                "pub fn next_wakeup(",
-                "-e",
-                "ServiceState::Active",
-                "-",
-            ],
-            freeze=freeze,
-            source_paths=[host_lib_path],
-            region=legacy_host_region,
-            assertion={
-                "kind": "token_counts",
-                "match_count": 21,
-                "counts": {
-                    "type ContactDriver = RuntimeDriver<PeerBoundBackend>;": 1,
-                    "struct ConfiguredCarrier {": 1,
-                    "struct PeerBoundBackend {": 1,
-                    "impl RuntimeBackend for PeerBoundBackend {": 1,
-                    "pub fn configure_peer_carrier<": 1,
-                    "pub fn begin_sync(": 1,
-                    "driver.pump(": 1,
-                    "pub fn pause_sync(": 1,
-                    "pub fn next_wakeup(": 1,
-                    "ServiceState::Active": 12,
-                },
-            },
-        ),
-        execute_rg_assertion(
-            name="legacy_lab_controls_are_confined_to_gated_module",
-            argv=[
-                "rg",
-                "-n",
-                "--fixed-strings",
-                "-e",
-                "use aster_host::{MeshService, ServiceOptions, SyncProfile};",
-                "-e",
-                "MeshService::open(",
-                "-e",
-                ".begin_sync(",
-                "-e",
-                "pub fn run_transfer(",
-                "-e",
-                "pub fn run_route_only_event(",
-                "-e",
-                "pub fn run_blob_recovery(",
-                "-e",
-                "pub fn run_shard(",
-                "-",
-            ],
-            freeze=freeze,
-            source_paths=[lab_lib_path],
-            region=legacy_lab_region,
-            assertion={
-                "kind": "token_counts",
-                "match_count": 33,
-                "counts": {
-                    "use aster_host::{MeshService, ServiceOptions, SyncProfile};": 1,
-                    "MeshService::open(": 12,
-                    ".begin_sync(": 16,
-                    "pub fn run_transfer(": 1,
-                    "pub fn run_route_only_event(": 1,
-                    "pub fn run_blob_recovery(": 1,
-                    "pub fn run_shard(": 1,
-                },
-            },
-        ),
-        execute_rg_assertion(
-            name="host_nongated_production_has_no_legacy_service_controls",
-            argv=[
-                "rg",
-                "-n",
-                "-e",
-                r"\b(?:MeshService|ContactDriver|PeerBoundBackend|ConfiguredCarrier)\b",
-                "-e",
-                r"ServiceState::Active|\bbegin_sync\b|driver\.pump\(",
-                "-e",
-                r"\b(?:configure_peer_carrier|pause_sync|next_wakeup)\b",
-                "-",
-            ],
-            freeze=freeze,
-            source_paths=[host_lib_path],
-            region=host_nongated_region,
-            assertion={"kind": "absent", "count": 0},
-        ),
-        execute_rg_assertion(
-            name="lab_nongated_production_has_no_legacy_service_controls",
-            argv=[
-                "rg",
-                "-n",
-                "-e",
-                r"\b(?:MeshService|ServiceOptions|SyncProfile|begin_sync)\b",
-                "-e",
-                r"\b(?:run_transfer|run_route_only_event|run_blob_recovery|run_shard)\b",
-                "-",
-            ],
-            freeze=freeze,
-            source_paths=[lab_lib_path],
-            region=lab_nongated_region,
-            assertion={"kind": "absent", "count": 0},
-        ),
-        execute_rg_assertion(
-            name="gate_h_binary_has_no_legacy_command_reachability",
-            argv=[
-                "rg",
-                "-n",
-                "-e",
-                r"\b(?:MeshService|PeerBoundBackend|begin_sync|run_live_node|LiveCarrier|legacy_lab)\b",
-                "-e",
-                r'"(?:node-udp|node-rendezvous|node-discovery|node-relay|rendezvous|infra|transfer|route-only-event|blob-recovery|scale|shard-worker)"',
-                "-",
-            ],
-            freeze=freeze,
-            source_paths=[gate_h_main_path],
-            region=gate_h_binary_region,
-            assertion={"kind": "absent", "count": 0},
         ),
         execute_rg_assertion(
             name="gate_h_docker_build_is_no_default_and_candidate_aliased",
@@ -2266,8 +2024,6 @@ def static_check_contract(
                     "aster_host_gate_h_formal": 1,
                 },
                 "forbidden_tokens": [
-                    "legacy-single-contact-service",
-                    "legacy-lab",
                     "libp2p*",
                     "iroh*",
                 ],

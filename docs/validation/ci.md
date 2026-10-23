@@ -18,10 +18,15 @@ produce a host-qualification receipt.
 
 Because the manual packaging workflow intentionally has one fixed shape and
 the repository does not pin a YAML or shell AST dependency for this check, the
-validator also binds its exact reviewed bytes to a checked SHA-256 constant.
-Any workflow edit therefore requires an intentional constant update plus
-renewed policy-test and reviewer scrutiny; semantic checks remain independent
-defense in depth.
+validator binds its reviewed bytes to a checked SHA-256 constant after narrowly
+normalizing the full commit SHA and adjacent version comment for each approved
+Action invocation. Action identities, order, inputs, commands, permissions,
+triggers, jobs, and all other workflow bytes remain hash-bound. Every Action
+must still use a full lowercase 40-character commit SHA, and maintainers must
+review upstream Action changes; a syntactically valid SHA is not proof of
+equivalent behavior. Any non-pin workflow edit requires an intentional constant
+update plus renewed policy-test and reviewer scrutiny; semantic checks remain
+independent defense in depth.
 
 This statement is intentionally scoped to the Compose-provider checks. Other
 repository jobs, including the existing path-lab jobs, use Docker for their own
@@ -56,7 +61,7 @@ mandatory-access-control profile. The manual operator procedure is
 | `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
-| `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
+| `macOS compatibility` | `macos-14` | Compiles and links every all-feature Rust workspace test target, then runs focused macOS/non-Linux custody-clock, finite-TTL, Blob staging/read, and credential-provider contracts. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
@@ -98,6 +103,67 @@ real-process tests cannot overlap each other on the same runner; the nextest
 limit remains two workers per runner. Matrix fail-fast is disabled so a failed
 partition does not cancel the other partition.
 
+The required macOS lane does not repeat the OS-agnostic workspace suite already
+covered by the two Linux partitions. It uses `cargo test --no-run` to retain
+Apple ARM compile and link coverage for every all-feature test target, then
+runs the platform contracts in `tools/test-macos-compatibility.sh`. The runner
+uses the same systemd-workspace and Compose-package target directories for the
+compile and execution phases. Each phase also uses the same Cargo package and
+feature selection, so the focused contracts execute the already-linked test
+binaries instead of compiling the dependency graph again. The complete macOS
+workspace suite remains available in the separate `macOS full suite` workflow,
+which runs weekly and on manual dispatch. That workflow is diagnostic and is
+not part of `CI / required`.
+
+### Test classes and timing evidence
+
+Tests are grouped by the boundary they prove rather than by source-file size:
+
+| Class | Boundary | Required PR lane |
+| --- | --- | --- |
+| Unit | Deterministic behavior inside one Rust component | Linux nextest partitions |
+| Integration | Multiple in-process components or one public binary/API boundary | Linux nextest partitions or `quality` |
+| Real process | Starts child Aster processes, binds sockets, or exercises restart/shutdown | Serialized nextest group or `quality` process smoke |
+| Platform contract | OS-specific compile/link or fail-closed behavior | Focused required macOS lane and applicable Linux tests |
+| Qualification | Validates retained evidence or a named evaluation profile | `quality`; claims remain limited to the named profile |
+| Device/hardware | Exercises physical systems, packaging, networks, or resource brackets | Separate retained validation; never inferred from hosted CI |
+
+The functional population uses three complementary evidence forms:
+
+- **Default correctness tests** use the smallest deterministic fixture that
+  crosses the semantic boundary. They run in the normal local and required-CI
+  population.
+- **Production-limit contracts** assert configured production constants and
+  fail-closed validation without allocating production-scale fixtures merely
+  to prove a constant.
+- **Explicit qualification and benchmark commands** retain intentionally
+  physical-scale, multi-process, or device workloads. They are named,
+  runnable, excluded from default nextest selection, and documented with the
+  environment to which their evidence applies.
+
+Fixture minimization changes neither requirement credit nor capability
+maturity. A requirement keeps credit only when its original behavioral
+assertions remain in a default correctness test or the applicable retained
+evidence; moving physical scale to qualification does not add credit, and
+reducing a fixture without changing its semantic boundary does not remove it.
+The assertion mapping and the complete initial over-target inventory are
+retained in
+[`2026-10-20-fast-test-baseline.md`](../superpowers/reports/2026-10-20-fast-test-baseline.md).
+
+The two Linux nextest partitions use the `ci` profile in
+`.config/nextest.toml`. Each partition writes one bounded JUnit report without
+successful-test output, appends its twenty slowest tests to the Actions step
+summary, and retains the raw report for 14 days. Partition reports remain
+separate so skipped tests and repeated identifiers are not merged incorrectly.
+
+The 10-second per-test target is advisory. Reports tag every finite duration
+above the target, while durations at or below it remain untagged. Duration
+problems do not terminate tests, make functional CI fail, create an allowlist,
+or trigger retries. Missing, empty, malformed, negative, NaN, or infinite timing
+evidence still fails closed because the measurement itself is invalid. Raw
+JUnit remains the authoritative artifact, and an individual local or hosted
+duration is an observation rather than a performance guarantee.
+
 ### CI critical-path profile (2026-09-17)
 
 Recent successful Linux quality jobs took approximately 31--38 minutes. In
@@ -132,7 +198,13 @@ the pinned [mise 2026.4.28](https://github.com/jdx/mise/blob/v2026.4.28/docs/tas
 instead of shell commands invoking mise. A failed step stops the sequence.
 
 Hosted Linux CI runs `mise run check-clippy` alongside two nextest partitions,
-while `quality` runs the foundation and integration segments. Locally,
+while `quality` runs `check-foundation-core` and the integration segment. The
+required `cargo-lockfiles` prerequisite owns the Cargo graph validation in CI;
+the local `check-foundation` aggregate composes `check-lockfiles`,
+`check-foundation-core`, and `check-compose-policy`, so local coverage remains
+complete without repeating the prerequisite in `quality`. CI retains the
+explicit fail-closed Compose policy step required by its release validator;
+those suites are excluded from the foundation core and execute once. Locally,
 `mise run check-workspace-tests` executes the complete suite without
 partitioning and then all doctests.
 The stable `required` job fails unless Clippy, both test partitions, and every
@@ -161,11 +233,10 @@ and warm hosted runs.
   Rust cache while allowing repeated pull-request runs to reuse compatible
   fuzz compilation results. Its cache server remains alive through the
   campaigns so the action can report final hit and miss statistics.
-- The macOS lane uses the separate
+- The required and full macOS lanes use the separate
   `aster-macos-arm64-rust-1.97.1-v1` read-write namespace and disables dev/test
-  debug information for the complete job. The workspace tests and later
-  real-process smoke therefore use compatible debug settings, while Apple ARM
-  compiler objects remain isolated from Linux objects.
+  debug information. Apple ARM compiler objects remain isolated from Linux
+  objects.
 - The workflow does not archive the complete Cargo `target` directory. Cache
   eviction, storage limits, hit rates, transfer time, and compilation time
   remain visible in the Actions and `sccache` statistics.
@@ -307,7 +378,13 @@ and optional `--offline`/`--no-run`) executes two package selections with
 distinct target directories. The first excludes `aster-compose-credentials`;
 the second tests it directly. This prevents Cargo's shared output filename from
 making either package inspect the other package's binary. Other wrapper command
-shapes are executed unchanged.
+shapes are executed unchanged. The macOS compatibility runner constructs these
+same two selections directly, first with `--no-run` and then with the
+`platform_compat_` filter, and pins both phases to their matching target
+directory. Keep those selections and target-directory assignments paired when
+adding a macOS platform contract; using an unpartitioned target directory can
+reintroduce the binary collision, while using a third directory discards the
+compiled artifacts and repeats the build.
 
 These tests keep exact data and zero-contact-error assertions. Blob waiting
 tracks committed carrier prefixes. State/Record waiting counts each expected
@@ -1091,7 +1168,7 @@ State/Record, and Blob activity remain zero.
 
 The raw root is owner-only evidence containing participant mission bundles,
 identity keys, and stores. Keep it outside source control. The runner/checker
-inventory those six secret files by metadata only and never open, read, or hash
+inventory the participant secret files and publication journal by metadata only and never open, read, or hash
 their contents. A new capture requires a clean, good-signed source checkout and
 a fresh exclusive raw-root path:
 
@@ -1106,11 +1183,20 @@ python3 tools/check-selected-live-event-receipt.py - \
   --output /private/tmp/event-receipt/selected-live-event-receipt.json
 ```
 
+Current native Event and Linux custody captures use v2 receipts with an explicit
+`numbered-v1` publication model and one private publication journal. The journal
+is included in the exact inventory and inspected only by metadata. V2 also
+classifies the exact bounded publication diagnostics retained from pipelining;
+unknown stderr and inconsistent outcome or writer accounting fail validation. The v1
+receipts retained below describe their original execution; use
+`--historical-v1` to invoke the frozen verifier without relabeling them. No new
+physical or performance qualification follows from this producer migration.
+
 Replaying the checked-in projection requires the externally retained raw root
 and a clean checkout detached at its exact signed source:
 
 ```sh
-python3 tools/check-selected-live-event-receipt.py \
+python3 tools/check-selected-live-event-receipt.py --historical-v1 \
   --raw-root /path/to/retained/selected-live-event-raw-root \
   --source /path/to/aster-source-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
   docs/validation/evidence/selected-live-event-c464129.json
@@ -1475,7 +1561,7 @@ The validator binds the public receipt to the immutable signed Git objects and
 all curated raw artifacts:
 
 ```sh
-python3 tools/check-selected-iroh-nat-receipt.py \
+python3 tools/check-selected-iroh-nat-receipt.py --historical-v1 \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
   docs/validation/evidence/selected-iroh-nat-15f4e0b.json
@@ -1647,13 +1733,17 @@ administration, non-Linux/cross-class finite-TTL custody, protected provisioning
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.
 
-One explicit `cargo deny` advisory ignore covers a bounded active pilot graph.
-`RUSTSEC-2026-0173` covers unmaintained build-time `proc-macro-error2` 2.0.1 in
-the non-production age-provider pilot. RustSec reports no vulnerability and no
-patched release; current Rust separately emits future-incompatibility `E0365`.
-The ignore permits that exact informational finding only. It does not suppress
-other advisories, change exact package checksums, permit online execution after
-the acquisition step, or authorize the provider for production.
+Two explicit `cargo deny` advisory ignores cover one bounded active pilot
+graph. `RUSTSEC-2026-0173` covers unmaintained build-time
+`proc-macro-error2` 2.0.1, and `RUSTSEC-2026-0374` covers unmaintained
+compile-time configuration parser `basic-toml` 0.1.10, both in the
+non-production age-provider pilot. RustSec reports no vulnerability and no
+patched release for either package; current Rust separately emits
+future-incompatibility `E0365` for `proc-macro-error2`. The ignores permit only
+those exact informational findings. They do not suppress other advisories,
+change exact package checksums, permit online execution after the acquisition
+step, or authorize the provider for production. Decision 0018 records the
+upstream `basic-toml` replacement, release gap, and removal gate.
 
 The former `RUSTSEC-2024-0436` exception is retired. A path-patched exact
 `netlink-packet-core` 0.8.2 preserves its API while resolving the dependency
@@ -1668,10 +1758,10 @@ a disposable dependency-minimized copy. The decision continues to admit
 first-party packages and distributed project files remain subject to the
 separate byte-identical Apache-2.0 gate.
 
-The companion scope gate fails if the remaining ignored package's reverse graph
-drifts, if it appears in the separately excluded fuzz graph, or if any `paste`
-version reappears. Any change to a package chain or advisory disposition
-requires a recorded pilot review.
+The companion scope gate fails if either ignored package's reverse graph
+drifts, if either appears in the separately excluded fuzz graph, or if any
+`paste` version reappears. Any change to a package chain or advisory
+disposition requires a recorded pilot review.
 
 The selected Iroh graph carries five stakeholder-approved, exact-coordinate
 license exceptions recorded by Decision 0028: `webpki-root-certs` and
@@ -1695,14 +1785,25 @@ The dependency-exception scope gate now requires only the retained safe
 The unrelated age advisory disposition, exact license exceptions, and netlink
 patch remain unchanged.
 
-Current-stack regressions in `aster-node::runtime::tests` exercise production
-mission-authenticated contacts over persistent direct-loopback Iroh endpoints:
-`current_stack_near_two_mib_events_each_direction` sends two Events each way,
-each with `MAX_OBJECT_BYTES - 11 * 1024` plaintext bytes. The measured envelope
-overhead is checked to be above 10 KiB and at most 11 KiB; every sealed Event
-must fit the existing object bound. Exact source bytes and authenticated
-plaintext are checked at the receiver. This is near-two-MiB payload volume per
-direction, not two exact one-MiB plaintext Events or throughput evidence.
+Current-stack regressions in `aster-node::runtime::tests` separate default
+serialization coverage from scale qualification. The default
+`current_stack_near_two_mib_events_each_direction` test checks the exact
+current-stack envelope boundary without a network transfer. The ignored
+`qualify_current_stack_near_two_mib_events_each_direction` test uses production
+mission-authenticated contacts over persistent direct-loopback Iroh endpoints
+and sends two Events each way, each with `MAX_OBJECT_BYTES - 11 * 1024`
+plaintext bytes. Run it explicitly with:
+
+```sh
+mise run qualify-near-two-mib-events
+```
+
+Budget two warm minutes, two CPU cores, 1 GiB of available memory, and 1 GiB of
+temporary disk. The measured envelope overhead is checked to be above 10 KiB
+and at most 11 KiB; every sealed Event must fit the existing object bound.
+Exact source bytes and authenticated plaintext are checked at the receiver.
+This is near-two-MiB payload volume per direction, not two exact one-MiB
+plaintext Events, throughput evidence, or device qualification.
 `current_stack_exact_64_kib_event_after_fresh_auth_reconnect` completes and
 closes a contact, retains both endpoint identities and addresses, rejects a
 fresh contact with the wrong expected mission identity without insertion, then
@@ -1735,14 +1836,17 @@ ambient age CLI.
 Because `deny.toml` expresses an active advisory exception at workspace scope,
 both the primary and dependency-policy gates also run
 `tools/check-dependency-exception-scope.sh`. Its exact reverse-graph assertions
-fail unless `proc-macro-error2` 2.0.1 remains reachable only through the
-isolated age-provider pilot and `paste` remains absent from the root lock and
-resolved workspace/fuzz graphs. The
-ignored package must be absent from fuzz. The same gate proves the vulnerable
-raw-lock Hickory pair remains inactive while allowing Iroh's fixed 0.26.1
-packages. Adversarial wrappers force a fuzz graph command failure, an active
-vulnerable Hickory package, and reintroduced `paste` versions; each must fail
-closed.
+fail unless `proc-macro-error2` 2.0.1 and `basic-toml` 0.1.10 remain reachable
+only through the isolated age-provider pilot. Each ignored package must occur
+exactly once in the root lock with its reviewed version, crates.io registry
+source, and archive checksum; both must be absent from fuzz. `paste` must remain
+absent from the root lock and resolved workspace/fuzz graphs. The same gate
+proves the vulnerable raw-lock Hickory pair remains inactive while allowing
+Iroh's fixed 0.26.1 packages. Adversarial checks force a fuzz graph command
+failure, an active vulnerable Hickory package, reintroduced `paste` versions,
+an expanded `basic-toml` reverse graph, `basic-toml` in fuzz, a second ignored
+package version, an alternate package source, and a changed archive checksum;
+each must fail closed.
 
 ## Security posture
 
@@ -1797,6 +1901,50 @@ Install the repository toolchain and run the primary gate:
 mise install
 mise run check
 ```
+
+For the normal edit/test loop, run the narrow owning package or exact identity
+first, then the complete Rust population before handoff:
+
+```sh
+# Examples; replace the filter with the identity you changed.
+cargo test --locked -p aster-node --all-features TEST_FILTER -- --exact
+cargo test --locked -p aster-lab --all-features --test reconciliation_bakeoff TEST_FILTER -- --exact
+
+# Complete default Rust tests and doctests, with two nextest workers.
+mise run check-workspace-tests
+```
+
+The two required-CI Rust selections are reproducible independently. Each task
+uses the `ci` nextest profile and writes its latest raw report to
+`target/nextest/ci/junit.xml`; copy or summarize that file before running the
+other slice because the second run replaces it.
+
+```sh
+mise run check-rust-ci-slice-1
+python3 .github/scripts/summarize-nextest-junit.py \
+  --input target/nextest/ci/junit.xml \
+  --output /tmp/aster-rust-slice-1.md \
+  --partition 1/2 --problem-seconds 10
+
+mise run check-rust-ci-slice-2
+python3 .github/scripts/summarize-nextest-junit.py \
+  --input target/nextest/ci/junit.xml \
+  --output /tmp/aster-rust-slice-2.md \
+  --partition 2/2 --problem-seconds 10
+
+# Reporter selection, warning, and malformed-input contracts.
+python3 .github/scripts/test-nextest-timing.py
+python3 .github/scripts/test-ci-test-lanes.py
+```
+
+A `Duration problems (> 10.000s)` table or `Rust test duration` annotation is
+an optimization tag. It does not fail, terminate, retry, or exclude the test.
+Functional failures still fail normally, and malformed timing evidence fails
+the reporting step because there is no valid measurement to retain. Compare
+the JUnit test durations separately from job wall time: dependency downloads,
+cold compilation, linking, and compiler-cache misses are setup/build time and
+must not be reported as test execution time. Record both when profiling the CI
+critical path.
 
 The primary gate runs `tools/check-project-license.py`. It requires every
 first-party Cargo package to declare exactly `Apache-2.0`, carry a byte-identical

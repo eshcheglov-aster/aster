@@ -8,15 +8,15 @@ use std::{
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
     AuthenticatedPeerStatus, CommittedEventContent, ContactSyncStatus as NodeContactSyncStatus,
-    EventAcknowledgement, EventClientId, EventDelivery as NodeEventDelivery,
-    EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationCapacityWarning, EventOperationLedgerMode,
-    EventOperationSequence, EventPollRequest, EventPublicationSession, EventPublishOptions,
-    EventPublishRequest, EventPublishResult, EventQuery, EventResultAcknowledgement,
-    EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
-    EventUnsubscribe, NumberedEventPublishRequest, NumberedEventResult,
-    PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
-    SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
+    EventAcknowledgement, EventClientContext, EventClientDisposition, EventClientId,
+    EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
+    EventItem, EventOperationAbandonment, EventOperationAuditState, EventOperationCapacityWarning,
+    EventOperationLedgerMode, EventOperationSequence, EventPollRequest, EventPublicationSession,
+    EventPublishOptions, EventQuery, EventResultAcknowledgement, EventSubscriptionId,
+    EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
+    NumberedEventPublishRequest, NumberedEventResult, PeerAuthorization as NodePeerAuthorization,
+    Priority as NodePriority, Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus,
+    Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -164,16 +164,6 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
-            "PublishEvent",
-            rejection_handler::<api::PublishEventRequest, api::PublishEventResponse>(),
-        )
-        .route_bidi_stream(
-            APPLICATION_SERVICE_NAME,
-            "PublishEvents",
-            rejection_handler::<api::PublishEventsRequest, api::PublishEventsResponse>(),
-        )
-        .route_bidi_stream(
-            APPLICATION_SERVICE_NAME,
             "BeginEventPublicationSession",
             rejection_handler::<
                 api::BeginEventPublicationSessionRequest,
@@ -187,6 +177,11 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
                 api::CompleteEventPublicationRecoveryRequest,
                 api::CompleteEventPublicationRecoveryResponse,
             >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PublishNumberedEvents",
+            rejection_handler::<api::PublishNumberedEventsRequest, api::PublishNumberedEventsResponse>(),
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
@@ -221,6 +216,11 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
                 api::CreateEventSubscriptionRequest,
                 api::CreateEventSubscriptionResponse,
             >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "GetEventClientStatus",
+            rejection_handler::<api::GetEventClientStatusRequest, api::GetEventClientStatusResponse>(),
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
@@ -325,31 +325,16 @@ impl api::AsterApplicationService for AsterConnectService {
         blobs.read(request.to_owned_message()).await
     }
 
-    async fn publish_event(
-        &self,
-        _ctx: RequestContext,
-        request: ServiceRequest<'_, api::PublishEventRequest>,
-    ) -> ServiceResult<api::PublishEventResponse> {
-        let request = request.to_owned_message();
-        let options = publish_options(&request)?;
-        let result = self
-            .events
-            .publish_with_options(publish_request(request)?, options)
-            .await
-            .map_err(connect_application_error)?;
-        bounded_response(publish_response(result), PublicOperation::PublishEvent)
-    }
-
-    async fn publish_events(
+    async fn publish_numbered_events(
         &self,
         ctx: RequestContext,
-        requests: connectrpc::InboundStream<api::PublishEventsRequest>,
-    ) -> ServiceResult<ServiceStream<api::PublishEventsResponse>> {
+        requests: connectrpc::InboundStream<api::PublishNumberedEventsRequest>,
+    ) -> ServiceResult<ServiceStream<api::PublishNumberedEventsResponse>> {
         if ctx.protocol() == Some(connectrpc::Protocol::GrpcWeb) {
             return Err(public_error(
                 ErrorCode::Unimplemented,
                 api::PublicErrorReason::UnsupportedValue,
-                PublicOperation::PublishEvents,
+                PublicOperation::PublishNumberedEvents,
                 false,
                 None,
             ));
@@ -360,36 +345,43 @@ impl api::AsterApplicationService for AsterConnectService {
                 let events = events.clone();
                 async move {
                     let request = request?.to_owned_message();
-                    let response = match stream_publication_request(request) {
+                    let response = match numbered_stream_publication_request(request) {
                         Ok((request, options)) => {
-                            match events.publish_with_options(request, options).await {
-                                Ok(published) => api::PublishEventsResponse {
+                            match events.publish_numbered(request, options).await {
+                                Ok(published) => api::PublishNumberedEventsResponse {
                                     outcome: Some(
-                                        api::publish_events_response::Outcome::Published(Box::new(
-                                            publish_response(published),
-                                        )),
+                                        api::publish_numbered_events_response::Outcome::Published(
+                                            Box::new(api::PublishNumberedEventResponse {
+                                                result: numbered_result_message(published.result)
+                                                    .into(),
+                                                inserted: published.inserted,
+                                                ..Default::default()
+                                            }),
+                                        ),
                                     ),
                                     ..Default::default()
                                 },
-                                Err(error) => api::PublishEventsResponse {
-                                    outcome: Some(api::publish_events_response::Outcome::Failure(
-                                        Box::new(public_application_error_detail(
-                                            error,
-                                            PublicOperation::PublishEvents,
-                                        )),
-                                    )),
+                                Err(error) => api::PublishNumberedEventsResponse {
+                                    outcome: Some(
+                                        api::publish_numbered_events_response::Outcome::Failure(
+                                            Box::new(public_application_error_detail(
+                                                error,
+                                                PublicOperation::PublishNumberedEvents,
+                                            )),
+                                        ),
+                                    ),
                                     ..Default::default()
                                 },
                             }
                         }
-                        Err(failure) => api::PublishEventsResponse {
-                            outcome: Some(api::publish_events_response::Outcome::Failure(
+                        Err(failure) => api::PublishNumberedEventsResponse {
+                            outcome: Some(api::publish_numbered_events_response::Outcome::Failure(
                                 Box::new(failure),
                             )),
                             ..Default::default()
                         },
                     };
-                    bounded_message(response, PublicOperation::PublishEvents)
+                    bounded_message(response, PublicOperation::PublishNumberedEvents)
                 }
             })
             .buffered(PUBLISH_EVENTS_WINDOW);
@@ -456,12 +448,7 @@ impl api::AsterApplicationService for AsterConnectService {
     ) -> ServiceResult<api::PublishNumberedEventResponse> {
         let request = request.to_owned_message();
         let operation = PublicOperation::PublishNumberedEvent;
-        let options = request
-            .ttl_ms
-            .map(EventPublishOptions::finite_ttl_ms)
-            .transpose()
-            .map_err(connect_application_error)?
-            .unwrap_or_else(EventPublishOptions::durable);
+        let options = publish_options(&request)?;
         let outcome = self
             .events
             .publish_numbered(
@@ -583,6 +570,7 @@ impl api::AsterApplicationService for AsterConnectService {
                 subscriptions: subscriptions
                     .into_iter()
                     .map(|row| api::EventSubscription {
+                        owner_client_id: row.owner.as_bytes().to_vec(),
                         subscription_id: row.id.as_bytes().to_vec(),
                         topic: row.topic.as_str().to_owned(),
                         scope: row.scope.as_str().to_owned(),
@@ -597,6 +585,47 @@ impl api::AsterApplicationService for AsterConnectService {
         )
     }
 
+    async fn get_event_client_status(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::GetEventClientStatusRequest>,
+    ) -> ServiceResult<api::GetEventClientStatusResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::GetEventClientStatus;
+        let client = parse_client_id(request.client_id, operation)?;
+        let observed_session = request
+            .observed_session
+            .map(|session| parse_publication_session(session, operation))
+            .transpose()?;
+        let status = self
+            .events
+            .client_status(client, observed_session)
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::GetEventClientStatusResponse {
+                current_session: status.current_session.map(EventPublicationSession::get),
+                disposition: match status.disposition {
+                    EventClientDisposition::Unregistered => {
+                        api::EventClientDisposition::Unregistered
+                    }
+                    EventClientDisposition::Current => api::EventClientDisposition::Current,
+                    EventClientDisposition::Fenced => api::EventClientDisposition::Fenced,
+                    EventClientDisposition::RecoveryRequired => {
+                        api::EventClientDisposition::RecoveryRequired
+                    }
+                }
+                .into(),
+                subscriptions: status.subscriptions,
+                pending_deliveries: status.pending_deliveries,
+                acknowledged_deliveries: status.acknowledged_deliveries,
+                ownership_metadata_bytes: status.ownership_metadata_bytes,
+                ..Default::default()
+            },
+            operation,
+        )
+    }
+
     async fn create_event_subscription(
         &self,
         _ctx: RequestContext,
@@ -607,6 +636,7 @@ impl api::AsterApplicationService for AsterConnectService {
         let subscription = self
             .events
             .subscribe(EventSubscriptionRequest {
+                client: parse_client_context(request.client.as_option(), operation)?,
                 operation_key: request.operation_key,
                 topic: parse_topic(request.topic, operation)?,
                 scope: parse_scope(request.scope, operation)?,
@@ -634,6 +664,7 @@ impl api::AsterApplicationService for AsterConnectService {
         let page = self
             .events
             .poll(poll_request(
+                parse_client_context(request.client.as_option(), operation)?,
                 request.subscription_id,
                 request.delivery_limit,
                 request.scan_limit,
@@ -668,12 +699,18 @@ impl api::AsterApplicationService for AsterConnectService {
             ));
         }
         let poll = poll_request(
+            parse_client_context(request.client.as_option(), operation)?,
             request.subscription_id,
             request.delivery_limit,
             request.scan_limit,
             operation,
         )?;
+        self.events
+            .require_client_context(poll.client.clone())
+            .await
+            .map_err(connect_application_error)?;
         let state = EventStreamState {
+            client: poll.client,
             events: self.events.clone(),
             subscription: poll.subscription,
             delivery_limit: poll.delivery_limit,
@@ -697,6 +734,7 @@ impl api::AsterApplicationService for AsterConnectService {
         let result = self
             .events
             .acknowledge(
+                parse_client_context(request.client.as_option(), operation)?,
                 parse_subscription_id(&request.subscription_id, operation)?,
                 parse_event_id(&request.event_id, operation)?,
             )
@@ -720,7 +758,10 @@ impl api::AsterApplicationService for AsterConnectService {
         let operation = PublicOperation::DeleteEventSubscription;
         let result = self
             .events
-            .unsubscribe(parse_subscription_id(&request.subscription_id, operation)?)
+            .unsubscribe(
+                parse_client_context(request.client.as_option(), operation)?,
+                parse_subscription_id(&request.subscription_id, operation)?,
+            )
             .await
             .map_err(connect_application_error)?;
         bounded_response(
@@ -763,6 +804,7 @@ impl api::AsterApplicationService for AsterConnectService {
 }
 
 struct EventStreamState {
+    client: EventClientContext,
     events: SelectedEventHandle,
     subscription: EventSubscriptionId,
     delivery_limit: usize,
@@ -783,6 +825,19 @@ async fn next_stream_delivery(
     loop {
         if state.stopped || *state.shutdown.borrow() {
             return None;
+        }
+        if !state.pending.is_empty() {
+            // Linearization point: a delivery authorized here may already be
+            // in flight when takeover commits. Later checks must fence it.
+            if let Err(error) = state
+                .events
+                .require_client_context(state.client.clone())
+                .await
+            {
+                state.pending.clear();
+                state.stopped = true;
+                return Some((Err(connect_application_error(error)), state));
+            }
         }
         if let Some(mut delivery) = state.pending.pop_front() {
             // A slow stream can retain a polled page beyond its Events' TTL.
@@ -834,6 +889,7 @@ async fn next_stream_delivery(
         }
 
         let poll = state.events.poll(EventPollRequest {
+            client: state.client.clone(),
             subscription: state.subscription,
             delivery_limit: state.delivery_limit,
             scan_limit: state.scan_limit,
@@ -863,39 +919,21 @@ async fn next_stream_delivery(
 }
 
 fn publish_options(
-    request: &api::PublishEventRequest,
+    request: &api::PublishNumberedEventRequest,
 ) -> Result<EventPublishOptions, ConnectError> {
     match request.ttl_ms {
         None => Ok(EventPublishOptions::durable()),
-        Some(_) if request.tombstone => Err(malformed_input(PublicOperation::PublishEvent)),
+        Some(_) if request.tombstone => Err(malformed_input(PublicOperation::PublishNumberedEvent)),
         Some(ttl_ms) => {
             EventPublishOptions::finite_ttl_ms(ttl_ms).map_err(connect_application_error)
         }
     }
 }
 
-fn publish_request(request: api::PublishEventRequest) -> Result<EventPublishRequest, ConnectError> {
-    let operation = PublicOperation::PublishEvent;
-    Ok(EventPublishRequest {
-        operation_key: request.operation_key,
-        predecessor: request
-            .predecessor_id
-            .as_deref()
-            .map(|value| parse_event_id(value, operation))
-            .transpose()?,
-        topic: parse_topic(request.topic, operation)?,
-        scope: parse_scope(request.scope, operation)?,
-        priority: parse_priority(request.priority, operation)?,
-        logical_key: request.logical_key,
-        payload: request.payload,
-        tombstone: request.tombstone,
-    })
-}
-
-fn stream_publication_request(
-    request: api::PublishEventsRequest,
-) -> Result<(EventPublishRequest, EventPublishOptions), api::PublicErrorDetail> {
-    let operation = PublicOperation::PublishEvents;
+fn numbered_stream_publication_request(
+    request: api::PublishNumberedEventsRequest,
+) -> Result<(NumberedEventPublishRequest, EventPublishOptions), api::PublicErrorDetail> {
+    let operation = PublicOperation::PublishNumberedEvents;
     let malformed = || {
         public_error_detail(
             api::PublicErrorReason::MalformedInput,
@@ -936,8 +974,11 @@ fn stream_publication_request(
         Some(api::Priority::Unspecified) | None => return Err(unsupported()),
     };
     Ok((
-        EventPublishRequest {
-            operation_key: request.operation_key,
+        NumberedEventPublishRequest {
+            client_id: EventClientId::new(request.client_id).map_err(|_| malformed())?,
+            session: EventPublicationSession::new(request.session).map_err(|_| malformed())?,
+            sequence: EventOperationSequence::new(request.operation_sequence)
+                .map_err(|_| malformed())?,
             predecessor,
             topic: Topic::new(request.topic).map_err(|_| malformed())?,
             scope: Scope::new(request.scope).map_err(|_| malformed())?,
@@ -975,30 +1016,18 @@ fn query_request(request: api::QueryEventsRequest) -> Result<EventQuery, Connect
 }
 
 fn poll_request(
+    client: EventClientContext,
     subscription_id: Vec<u8>,
     delivery_limit: u32,
     scan_limit: u32,
     operation: PublicOperation,
 ) -> Result<EventPollRequest, ConnectError> {
     Ok(EventPollRequest {
+        client,
         subscription: parse_subscription_id(&subscription_id, operation)?,
         delivery_limit: parse_limit(delivery_limit, operation)?,
         scan_limit: parse_limit(scan_limit, operation)?,
     })
-}
-
-fn publish_response(result: EventPublishResult) -> api::PublishEventResponse {
-    api::PublishEventResponse {
-        id: result.id.as_bytes().to_vec(),
-        publisher: result.publisher.to_vec(),
-        publisher_counter: result.publisher_counter,
-        event_sequence: result.event_sequence,
-        priority: priority_message(result.priority).into(),
-        acceptance_marker: result.acceptance_marker,
-        inserted: result.inserted,
-        ttl_ms: result.ttl_ms,
-        ..Default::default()
-    }
 }
 
 fn event_message(event: EventItem) -> api::Event {
@@ -1325,6 +1354,25 @@ fn bounded_message<M: buffa::Message>(
     Ok(message)
 }
 
+fn parse_client_context(
+    context: Option<&api::EventClientContext>,
+    operation: PublicOperation,
+) -> Result<EventClientContext, ConnectError> {
+    let context = context.ok_or_else(|| {
+        public_error(
+            ErrorCode::InvalidArgument,
+            api::PublicErrorReason::MalformedInput,
+            operation,
+            false,
+            None,
+        )
+    })?;
+    Ok(EventClientContext {
+        client_id: parse_client_id(context.client_id.clone(), operation)?,
+        session: parse_publication_session(context.session, operation)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(feature = "client", feature = "server", unix))]
@@ -1353,7 +1401,7 @@ mod tests {
 
     use super::*;
     #[cfg(all(feature = "client", feature = "server"))]
-    use crate::sdk::PipelinedEventPublisher;
+    use crate::sdk::{NumberedEventSdk, PublicationJournal};
     #[cfg(all(feature = "client", feature = "server"))]
     use crate::{BoundAgent, ClientToken};
     use crate::{api, error::PublicOperation};
@@ -1506,8 +1554,46 @@ mod tests {
         .expect("combined status handler");
         assert_eq!(status.body.identity.len(), 32);
 
-        let event_message = api::PublishEventRequest {
-            operation_key: b"non-linux-handler-event".to_vec(),
+        let begin_message = api::BeginEventPublicationSessionRequest {
+            client_id: b"non-linux-handler-event".to_vec(),
+            claim_nonce: {
+                let mut nonce = vec![0_u8; 32];
+                getrandom::fill(&mut nonce).expect("session claim");
+                nonce
+            },
+            ..Default::default()
+        };
+        let begin_body = bytes::Bytes::from(begin_message.encode_to_vec());
+        let begin_view = api::BeginEventPublicationSessionRequest::decode_view(&begin_body)
+            .expect("begin session view");
+        let session = api::AsterApplicationService::begin_event_publication_session(
+            &service,
+            RequestContext::default(),
+            ServiceRequest::from_parts(&begin_view, &begin_body),
+        )
+        .await
+        .expect("begin publication session");
+        let recovery_message = api::CompleteEventPublicationRecoveryRequest {
+            client_id: begin_message.client_id.clone(),
+            session: session.body.session,
+            snapshot_revision: session.body.snapshot_revision,
+            ..Default::default()
+        };
+        let recovery_body = bytes::Bytes::from(recovery_message.encode_to_vec());
+        let recovery_view =
+            api::CompleteEventPublicationRecoveryRequest::decode_view(&recovery_body)
+                .expect("recovery view");
+        api::AsterApplicationService::complete_event_publication_recovery(
+            &service,
+            RequestContext::default(),
+            ServiceRequest::from_parts(&recovery_view, &recovery_body),
+        )
+        .await
+        .expect("complete publication recovery");
+        let event_message = api::PublishNumberedEventRequest {
+            client_id: begin_message.client_id,
+            session: session.body.session,
+            operation_sequence: 1,
             topic: "chat.events".to_owned(),
             scope: "mission/team/alpha".to_owned(),
             priority: api::Priority::Routine.into(),
@@ -1516,9 +1602,10 @@ mod tests {
             ..Default::default()
         };
         let event_body = bytes::Bytes::from(event_message.encode_to_vec());
-        let event_view = api::PublishEventRequest::decode_view(&event_body).expect("event view");
+        let event_view =
+            api::PublishNumberedEventRequest::decode_view(&event_body).expect("event view");
         let event_request = ServiceRequest::from_parts(&event_view, &event_body);
-        let event = api::AsterApplicationService::publish_event(
+        let event = api::AsterApplicationService::publish_numbered_event(
             &service,
             RequestContext::default(),
             event_request,
@@ -1630,8 +1717,15 @@ mod tests {
         .await
         .unwrap();
         let events = node.selected_events();
+        use aster_node::publication_journal::{Backend, Intent, Journal};
+        let path = state.0.join("slow-stream-publication.redb");
+        Journal::initialize(&path, b"slow-stream-fixture").unwrap();
+        let mut journal = Journal::open(&path, b"slow-stream-fixture").unwrap();
+        let mut backend = Backend::Live(&events);
+        journal.recover(&mut backend).await.unwrap();
         let subscription = events
             .subscribe(EventSubscriptionRequest {
+                client: journal.client_context().unwrap(),
                 operation_key: b"slow-stream-subscription".to_vec(),
                 topic: Topic::new("chat.events").unwrap(),
                 scope: Scope::new("mission/team/alpha").unwrap(),
@@ -1639,28 +1733,30 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut publication = EventPublishRequest {
-            operation_key: b"slow-stream-finite".to_vec(),
+        let mut publication = Intent {
             predecessor: None,
-            topic: Topic::new("chat.events").unwrap(),
-            scope: Scope::new("mission/team/alpha").unwrap(),
-            priority: NodePriority::Routine,
+            topic: "chat.events".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            priority: NodePriority::Routine as u8,
             logical_key: b"message".to_vec(),
             payload: b"finite".to_vec(),
             tombstone: false,
+            ttl_ms: Some(2_000),
         };
-        events
-            .publish_with_options(
-                publication.clone(),
-                EventPublishOptions::finite_ttl_ms(2_000).unwrap(),
-            )
+        journal
+            .publish(&mut backend, publication.clone())
             .await
             .unwrap();
-        publication.operation_key = b"slow-stream-durable".to_vec();
+        journal.acknowledge(&mut backend).await.unwrap();
+        publication.ttl_ms = None;
         publication.payload = b"durable".to_vec();
-        let durable = events.publish(publication).await.unwrap();
+        let durable = journal
+            .publish_metadata(&mut backend, publication)
+            .await
+            .unwrap();
         let page = events
             .poll(EventPollRequest {
+                client: journal.client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -1670,6 +1766,7 @@ mod tests {
         assert_eq!(page.deliveries.len(), 2);
         let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         let stream = EventStreamState {
+            client: journal.client_context().unwrap(),
             events,
             subscription: subscription.id,
             delivery_limit: 8,
@@ -1689,9 +1786,178 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn takeover_fences_buffered_stream_items_and_empty_poll_backoff() {
+        use aster_node::publication_journal::{Backend, Intent, Journal};
+        let state = TestState::new();
+        let mission = UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .unwrap();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .unwrap();
+        let events = node.selected_events();
+        let path = state.0.join("stream-owner.redb");
+        Journal::initialize(&path, b"stream-owner").unwrap();
+        let mut journal = Journal::open(&path, b"stream-owner").unwrap();
+        let mut backend = Backend::Live(&events);
+        journal.recover(&mut backend).await.unwrap();
+        let old = journal.client_context().unwrap();
+        let subscription = events
+            .subscribe(EventSubscriptionRequest {
+                client: old.clone(),
+                operation_key: b"feed".to_vec(),
+                topic: Topic::new("chat.events").unwrap(),
+                scope: Scope::new("mission/team/alpha").unwrap(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .unwrap();
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            journal
+                .publish(
+                    &mut backend,
+                    Intent {
+                        predecessor: None,
+                        topic: "chat.events".into(),
+                        scope: "mission/team/alpha".into(),
+                        priority: NodePriority::Routine as u8,
+                        logical_key: b"message".to_vec(),
+                        payload: payload.to_vec(),
+                        tombstone: false,
+                        ttl_ms: None,
+                    },
+                )
+                .await
+                .unwrap();
+            journal.acknowledge(&mut backend).await.unwrap();
+        }
+        let page = events
+            .poll(EventPollRequest {
+                client: old.clone(),
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.deliveries.len(), 2);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let stream = EventStreamState {
+            client: old.clone(),
+            events: events.clone(),
+            subscription: subscription.id,
+            delivery_limit: 8,
+            scan_limit: 8,
+            backoff: Duration::from_millis(1),
+            pending: page.deliveries.into(),
+            backoff_before_poll: false,
+            shutdown: shutdown.clone(),
+            stopped: false,
+        };
+        let (first, stream) = next_stream_delivery(stream).await.unwrap();
+        assert!(first.is_ok());
+        let mut nonce = vec![0; 32];
+        getrandom::fill(&mut nonce).unwrap();
+        let takeover = events
+            .begin_publication_session(old.client_id.clone(), old.session.get(), nonce)
+            .await
+            .unwrap();
+        let before = events
+            .client_status(old.client_id.clone(), Some(old.session))
+            .await
+            .unwrap();
+        assert_eq!(
+            before.disposition,
+            aster_node::application::EventClientDisposition::Fenced
+        );
+        let (second, stream) = next_stream_delivery(stream).await.unwrap();
+        assert_eq!(second.unwrap_err().code, ErrorCode::Aborted);
+        assert!(stream.pending.is_empty());
+        assert!(next_stream_delivery(stream).await.is_none());
+        assert_eq!(
+            events
+                .client_status(old.client_id.clone(), Some(old.session))
+                .await
+                .unwrap(),
+            before
+        );
+        let empty = EventStreamState {
+            client: old.clone(),
+            events: events.clone(),
+            subscription: subscription.id,
+            delivery_limit: 8,
+            scan_limit: 8,
+            backoff: Duration::from_millis(1),
+            pending: VecDeque::new(),
+            backoff_before_poll: true,
+            shutdown,
+            stopped: false,
+        };
+        assert_eq!(
+            next_stream_delivery(empty)
+                .await
+                .unwrap()
+                .0
+                .unwrap_err()
+                .code,
+            ErrorCode::Aborted
+        );
+        assert_eq!(
+            events
+                .query(EventQuery::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        events
+            .complete_publication_recovery(
+                old.client_id.clone(),
+                takeover.session,
+                takeover.snapshot_revision,
+            )
+            .await
+            .unwrap();
+        let current = aster_node::application::EventClientContext {
+            client_id: old.client_id,
+            session: takeover.session,
+        };
+        let resumed = events
+            .poll(EventPollRequest {
+                client: current,
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resumed.deliveries.len(), 2);
+        assert!(
+            resumed
+                .deliveries
+                .iter()
+                .all(|delivery| delivery.attempt == 2)
+        );
+        node.shutdown().await.unwrap();
+    }
+
     #[test]
     fn ttl_options_preserve_presence_and_reject_zero_and_finite_tombstones() {
-        let mut request = api::PublishEventRequest::default();
+        let mut request = api::PublishNumberedEventRequest::default();
         assert_eq!(publish_options(&request).unwrap().ttl_ms(), None);
         request.ttl_ms = Some(0);
         assert_eq!(
@@ -1701,7 +1967,7 @@ mod tests {
         request.ttl_ms = Some(u64::MAX);
         assert_eq!(publish_options(&request).unwrap().ttl_ms(), Some(u64::MAX));
         let encoded = request.encode_to_vec();
-        let decoded = api::PublishEventRequest::decode_from_slice(&encoded).unwrap();
+        let decoded = api::PublishNumberedEventRequest::decode_from_slice(&encoded).unwrap();
         assert_eq!(decoded.ttl_ms, request.ttl_ms);
         request.tombstone = true;
         assert_eq!(
@@ -1713,27 +1979,32 @@ mod tests {
     #[test]
     fn parser_failures_use_closed_operations_and_never_echo_rejected_values() {
         let invalid_topic = "customer secret topic";
-        let topic_error = parse_topic(invalid_topic.to_owned(), PublicOperation::PublishEvent)
-            .expect_err("non-canonical topic");
+        let topic_error = parse_topic(
+            invalid_topic.to_owned(),
+            PublicOperation::PublishNumberedEvent,
+        )
+        .expect_err("non-canonical topic");
         assert_public_detail(
             &topic_error,
             "aster.application.v1alpha1.PublicErrorDetail",
             ErrorCode::InvalidArgument,
             api::PublicErrorReason::MalformedInput,
-            "publish_event",
+            "publish_numbered_event",
             false,
         );
         assert!(!format!("{topic_error:?}").contains(invalid_topic));
 
-        let priority_error =
-            parse_priority(buffa::EnumValue::Unknown(71), PublicOperation::PublishEvent)
-                .expect_err("unsupported priority");
+        let priority_error = parse_priority(
+            buffa::EnumValue::Unknown(71),
+            PublicOperation::PublishNumberedEvent,
+        )
+        .expect_err("unsupported priority");
         assert_public_detail(
             &priority_error,
             "aster.application.v1alpha1.PublicErrorDetail",
             ErrorCode::InvalidArgument,
             api::PublicErrorReason::UnsupportedValue,
-            "publish_event",
+            "publish_numbered_event",
             false,
         );
 
@@ -1753,6 +2024,7 @@ mod tests {
     fn subscription_listing_maximum_fits_response_budget_and_oversize_fails_closed() {
         use buffa::Message as _;
         let row = api::EventSubscription {
+            owner_client_id: vec![0xff; aster_redb_store::MAX_EVENT_CLIENT_ID_BYTES],
             subscription_id: vec![0xff; 32],
             topic: "t".repeat(aster_profile::MAX_TOPIC_BYTES),
             scope: "s".repeat(aster_profile::MAX_SCOPE_BYTES),
@@ -1826,10 +2098,11 @@ mod tests {
                 emission_policy: EventEmissionPolicy::ReceiveOnly,
                 store_usage: AggregateStoreUsage::default(),
                 store_limits: StoreLimits::new(10_000, 64 * 1024 * 1024).expect("limits"),
-                event_operation_capacity: aster_node::application::EventOperationCapacity::new(
-                    Default::default(),
-                    aster_redb_store::EventOperationLimits::DEFAULT,
-                ),
+                event_operation_capacity:
+                    aster_node::application::EventOperationCapacity::from_legacy_inspection(
+                        Default::default(),
+                        aster_redb_store::EventOperationLimits::DEFAULT,
+                    ),
                 event_operation_rolling_accept_rate: 0.0,
                 event_operation_estimated_seconds_to_exhaustion: 0,
                 pending_deliveries: 0,
@@ -1948,7 +2221,7 @@ mod tests {
                     emission_policy: EventEmissionPolicy::Normal,
                     store_usage: AggregateStoreUsage::default(),
                     store_limits: StoreLimits::default(),
-                    event_operation_capacity: EventOperationCapacity::new(
+                    event_operation_capacity: EventOperationCapacity::from_legacy_inspection(
                         EventOperationStats {
                             records_total: rows,
                             records_active: 7,
@@ -2062,14 +2335,37 @@ mod tests {
                             format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
                         ),
                 );
+                let publication_client = format!("http2-fixture-{protocol_index}").into_bytes();
+                let snapshot = client
+                    .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
+                        client_id: publication_client.clone(),
+                        expected_session: 0,
+                        claim_nonce: b"initial-fixture-claim".to_vec(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .into_owned();
+                client
+                    .complete_event_publication_recovery(
+                        api::CompleteEventPublicationRecoveryRequest {
+                            client_id: publication_client.clone(),
+                            session: snapshot.session,
+                            snapshot_revision: snapshot.snapshot_revision,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
                 let mut stream = client
-                    .publish_events()
+                    .publish_numbered_events()
                     .await
                     .expect("open publication stream");
-                let valid = |suffix: u8| api::PublishEventsRequest {
-                    publication: api::PublishEventRequest {
-                        operation_key: format!("publish-events/{protocol_index}/{suffix}")
-                            .into_bytes(),
+                let valid = |suffix: u8| api::PublishNumberedEventsRequest {
+                    publication: api::PublishNumberedEventRequest {
+                        client_id: publication_client.clone(),
+                        session: snapshot.session,
+                        operation_sequence: u64::from(suffix),
                         topic: "chat.events".to_owned(),
                         scope: "mission/team/alpha".to_owned(),
                         priority: api::Priority::Routine.into(),
@@ -2082,9 +2378,11 @@ mod tests {
                 };
                 stream.send(valid(1)).await.expect("send first publication");
                 stream
-                    .send(api::PublishEventsRequest {
-                        publication: api::PublishEventRequest {
-                            operation_key: b"must-not-be-echoed".to_vec(),
+                    .send(api::PublishNumberedEventsRequest {
+                        publication: api::PublishNumberedEventRequest {
+                            client_id: publication_client.clone(),
+                            session: snapshot.session,
+                            operation_sequence: 2,
                             topic: "non canonical secret topic".to_owned(),
                             scope: "mission/team/alpha".to_owned(),
                             priority: api::Priority::Routine.into(),
@@ -2097,10 +2395,11 @@ mod tests {
                     .await
                     .expect("send malformed publication");
                 stream
-                    .send(api::PublishEventsRequest {
-                        publication: api::PublishEventRequest {
-                            operation_key: format!("publish-events/{protocol_index}/1")
-                                .into_bytes(),
+                    .send(api::PublishNumberedEventsRequest {
+                        publication: api::PublishNumberedEventRequest {
+                            client_id: publication_client.clone(),
+                            session: snapshot.session,
+                            operation_sequence: 1,
                             topic: "chat.events".to_owned(),
                             scope: "mission/team/alpha".to_owned(),
                             priority: api::Priority::Routine.into(),
@@ -2120,25 +2419,25 @@ mod tests {
                 stream.close_send();
 
                 let first = stream
-                    .message::<api::PublishEventsResponse>()
+                    .message::<api::PublishNumberedEventsResponse>()
                     .await
                     .expect("first response")
                     .expect("first item")
                     .to_owned_message();
                 let second = stream
-                    .message::<api::PublishEventsResponse>()
+                    .message::<api::PublishNumberedEventsResponse>()
                     .await
                     .expect("second response")
                     .expect("second item")
                     .to_owned_message();
                 let third = stream
-                    .message::<api::PublishEventsResponse>()
+                    .message::<api::PublishNumberedEventsResponse>()
                     .await
                     .expect("third response")
                     .expect("third item")
                     .to_owned_message();
                 let fourth = stream
-                    .message::<api::PublishEventsResponse>()
+                    .message::<api::PublishNumberedEventsResponse>()
                     .await
                     .expect("fourth response")
                     .expect("fourth item")
@@ -2146,35 +2445,39 @@ mod tests {
                 assert!(
                     matches!(
                         first.outcome,
-                        Some(api::publish_events_response::Outcome::Published(_))
+                        Some(api::publish_numbered_events_response::Outcome::Published(_))
                     ),
                     "first response: {first:?}"
                 );
                 let failure = match second.outcome {
-                    Some(api::publish_events_response::Outcome::Failure(failure)) => failure,
+                    Some(api::publish_numbered_events_response::Outcome::Failure(failure)) => {
+                        failure
+                    }
                     other => panic!("expected ordered in-band failure, got {other:?}"),
                 };
                 assert_eq!(failure.reason, api::PublicErrorReason::MalformedInput);
-                assert_eq!(failure.operation, "publish_events");
+                assert_eq!(failure.operation, "publish_numbered_events");
                 assert!(!failure.retryable);
                 assert!(!format!("{failure:?}").contains("must-not-be-echoed"));
                 let conflict = match third.outcome {
-                    Some(api::publish_events_response::Outcome::Failure(failure)) => failure,
+                    Some(api::publish_numbered_events_response::Outcome::Failure(failure)) => {
+                        failure
+                    }
                     other => panic!("expected ordered conflict failure, got {other:?}"),
                 };
                 assert_eq!(
                     conflict.reason,
                     api::PublicErrorReason::OperationKeyConflict
                 );
-                assert_eq!(conflict.operation, "publish_events");
+                assert_eq!(conflict.operation, "publish_numbered_events");
                 assert!(!conflict.retryable);
                 assert!(matches!(
                     fourth.outcome,
-                    Some(api::publish_events_response::Outcome::Published(_))
+                    Some(api::publish_numbered_events_response::Outcome::Published(_))
                 ));
                 assert!(
                     stream
-                        .message::<api::PublishEventsResponse>()
+                        .message::<api::PublishNumberedEventsResponse>()
                         .await
                         .expect("clean stream completion")
                         .is_none()
@@ -2195,28 +2498,26 @@ mod tests {
                         format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
                     ),
             );
-            let sdk = PipelinedEventPublisher::new(sdk_client, 2);
-            let sdk_responses = sdk
-                .publish_all(
-                    (0_u8..8)
-                        .map(|suffix| api::PublishEventRequest {
-                            operation_key: format!("publish-events/sdk/{suffix}").into_bytes(),
-                            topic: "chat.events".to_owned(),
-                            scope: "mission/team/alpha".to_owned(),
-                            priority: api::Priority::Routine.into(),
-                            logical_key: vec![suffix],
-                            payload: vec![suffix],
-                            ..Default::default()
-                        })
-                        .collect(),
-                )
-                .await
-                .expect("SDK pipelined publication");
-            assert_eq!(sdk_responses.len(), PUBLISH_EVENTS_WINDOW);
-            assert!(sdk_responses.into_iter().all(|response| matches!(
-                response.outcome,
-                Some(api::publish_events_response::Outcome::Published(_))
-            )));
+            let journal_path = state.0.join("sdk-publication.redb");
+            PublicationJournal::initialize(&journal_path, b"http2-sdk-fixture").unwrap();
+            let sdk =
+                NumberedEventSdk::open(sdk_client, &journal_path, b"http2-sdk-fixture").unwrap();
+            sdk.recover().await.unwrap();
+            let sequences = (0_u8..8)
+                .map(|suffix| {
+                    sdk.journal_publication(api::PublishNumberedEventRequest {
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        logical_key: vec![suffix],
+                        payload: vec![suffix],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let sdk_results = sdk.publish_journaled_pipeline(&sequences, 2).await.unwrap();
+            assert_eq!(sdk_results.len(), PUBLISH_EVENTS_WINDOW);
 
             let grpc_web_client = api::AsterApplicationServiceClient::new(
                 HttpClient::plaintext(),
@@ -2228,11 +2529,13 @@ mod tests {
                     ),
             );
             let mut grpc_web_stream = grpc_web_client
-                .publish_events()
+                .publish_numbered_events()
                 .await
                 .expect("gRPC-Web call initializes lazily");
-            let rejected_publication = api::PublishEventRequest {
-                operation_key: b"publish-events/grpc-web-rejected".to_vec(),
+            let rejected_publication = api::PublishNumberedEventRequest {
+                client_id: b"web-fixture".to_vec(),
+                session: 1,
+                operation_sequence: 1,
                 topic: "chat.events".to_owned(),
                 scope: "mission/team/alpha".to_owned(),
                 priority: api::Priority::Routine.into(),
@@ -2241,7 +2544,7 @@ mod tests {
                 ..Default::default()
             };
             grpc_web_stream
-                .send(api::PublishEventsRequest {
+                .send(api::PublishNumberedEventsRequest {
                     publication: rejected_publication.clone().into(),
                     ..Default::default()
                 })
@@ -2249,38 +2552,48 @@ mod tests {
                 .expect("buffer rejected gRPC-Web request");
             grpc_web_stream.close_send();
             let grpc_web_error = grpc_web_stream
-                .message::<api::PublishEventsResponse>()
+                .message::<api::PublishNumberedEventsResponse>()
                 .await
                 .expect_err("gRPC-Web request streaming must fail closed");
             assert_eq!(grpc_web_error.code, ErrorCode::Unimplemented);
 
-            let fallback_requests =
-                std::iter::once(rejected_publication).chain((1_u8..8).map(|suffix| {
-                    api::PublishEventRequest {
-                        operation_key: format!("publish-events/grpc-web-fallback/{suffix}")
-                            .into_bytes(),
+            let web_id = b"web-fixture".to_vec();
+            let snapshot = grpc_web_client
+                .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
+                    client_id: web_id.clone(),
+                    claim_nonce: b"initial-web-claim".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_owned();
+            grpc_web_client
+                .complete_event_publication_recovery(api::CompleteEventPublicationRecoveryRequest {
+                    client_id: web_id.clone(),
+                    session: snapshot.session,
+                    snapshot_revision: snapshot.snapshot_revision,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            for suffix in 0_u8..8 {
+                let result = grpc_web_client
+                    .publish_numbered_event(api::PublishNumberedEventRequest {
+                        client_id: web_id.clone(),
+                        session: snapshot.session,
+                        operation_sequence: u64::from(suffix) + 1,
                         topic: "chat.events".to_owned(),
                         scope: "mission/team/alpha".to_owned(),
                         priority: api::Priority::Routine.into(),
                         logical_key: vec![suffix],
                         payload: vec![suffix],
                         ..Default::default()
-                    }
-                }));
-            let fallback = futures::stream::iter(fallback_requests)
-                .map(|request| {
-                    let client = grpc_web_client.clone();
-                    async move { client.publish_event(request).await }
-                })
-                .buffered(PUBLISH_EVENTS_WINDOW)
-                .collect::<Vec<_>>()
-                .await;
-            assert_eq!(fallback.len(), PUBLISH_EVENTS_WINDOW);
-            assert!(fallback.into_iter().all(|result| {
-                result
-                    .map(|response| response.into_owned().inserted)
-                    .unwrap_or(false)
-            }));
+                    })
+                    .await
+                    .unwrap()
+                    .into_owned();
+                assert!(result.inserted);
+            }
 
             shutdown_tx.send(true).expect("request agent shutdown");
             tokio::time::timeout(Duration::from_secs(5), server)
@@ -2345,7 +2658,10 @@ mod tests {
                         ),
                 );
                 let error = client
-                    .publish_event(api::PublishEventRequest {
+                    .publish_numbered_event(api::PublishNumberedEventRequest {
+                        client_id: b"error-fixture".to_vec(),
+                        session: 1,
+                        operation_sequence: 1,
                         topic: "transport canary topic".to_owned(),
                         scope: "mission/team/alpha".to_owned(),
                         priority: api::Priority::Routine.into(),
@@ -2358,7 +2674,7 @@ mod tests {
                     expected_type_url,
                     ErrorCode::InvalidArgument,
                     api::PublicErrorReason::MalformedInput,
-                    "publish_event",
+                    "publish_numbered_event",
                     false,
                 );
                 assert!(!format!("{error:?}").contains("transport canary topic"));
@@ -2379,7 +2695,10 @@ mod tests {
                     ),
             );
             let error = grpc_client
-                .publish_event(api::PublishEventRequest {
+                .publish_numbered_event(api::PublishNumberedEventRequest {
+                    client_id: b"error-fixture".to_vec(),
+                    session: 1,
+                    operation_sequence: 1,
                     topic: "transport canary topic".to_owned(),
                     scope: "mission/team/alpha".to_owned(),
                     priority: api::Priority::Routine.into(),
@@ -2392,7 +2711,7 @@ mod tests {
                 api::PublicErrorDetail::TYPE_URL,
                 ErrorCode::InvalidArgument,
                 api::PublicErrorReason::MalformedInput,
-                "publish_event",
+                "publish_numbered_event",
                 false,
             );
             assert!(!format!("{error:?}").contains("transport canary topic"));

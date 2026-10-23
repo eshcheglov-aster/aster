@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed `MeshService` and updated tests.
+- Restored runtime-volume diagnostics using Aster/Iroh.
+
 - Faster Blob transfers. Breaking change: both nodes must be updated.
 - Replaced libp2p-based tests with Event delivery and reconnection tests using Iroh. Removed the unused libp2p provider and its dependencies.
 - Fixed a test failure caused by `iroh` in the checkout directory name.

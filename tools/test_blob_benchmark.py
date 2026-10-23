@@ -29,7 +29,7 @@ class MainPublication(unittest.TestCase):
         self.binary = self.root / "fixture"
         self.addCleanup(os.umask, os.umask(0o077))
 
-    def run_fixture(self, change_source=False):
+    def run_fixture(self, change_source=False, campaign_name="default", size=16384):
         # A real subprocess emits a complete receipt; no transport/perf run is needed.
         script = (
             f"#!{sys.executable}\n"
@@ -46,7 +46,7 @@ class MainPublication(unittest.TestCase):
         self.binary.chmod(0o700)
         argv = ["blob_benchmark", "--variant", "fixture", str(self.repo), str(self.binary),
                 "--output", str(self.output), "--state", str(self.root / "state"),
-                "--sizes", "16384"]
+                "--campaign", campaign_name, "--sizes", str(size)]
         with patch.object(sys, "argv", argv):
             main()
 
@@ -73,12 +73,39 @@ class MainPublication(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse((self.output / name).exists())
 
+    def test_scale_campaign_selects_100_mib_and_records_profile(self):
+        self.run_fixture(campaign_name="scale", size=100 * 1024 * 1024)
+        metadata = json.loads((self.output / "metadata.json").read_text())
+        self.assertEqual(metadata["campaign"], "scale")
+        self.assertEqual(
+            metadata["cases"],
+            [[f"{100 * 1024 * 1024}-1", 100 * 1024 * 1024, 300]],
+        )
+
+    def test_campaign_rejects_a_size_not_listed_in_the_selected_profile(self):
+        argv = [
+            "blob_benchmark",
+            "--variant", "fixture", str(self.repo), str(self.binary),
+            "--output", str(self.output),
+            "--state", str(self.root / "state"),
+            "--campaign", "scale",
+            "--sizes", "16384",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as error:
+            main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertFalse(self.output.exists())
+
 
 
 class Results(unittest.TestCase):
     def test_campaign_is_exactly_four_small_single_samples(self):
         self.assertEqual(campaign(), [(f"{size}-1", size, 300)
                                     for size in (16384, 65536, 262144, 1048576)])
+
+    def test_scale_campaign_is_exactly_one_100_mib_sample(self):
+        size = 100 * 1024 * 1024
+        self.assertEqual(campaign("scale"), [(f"{size}-1", size, 300)])
 
     def test_summary_counts_timeouts_but_never_pools_their_elapsed_time(self):
         runs = []

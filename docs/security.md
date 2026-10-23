@@ -194,7 +194,7 @@ review, exceptions, and exit gates.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The raw
-`ApplicationNode::open`, `MeshService::open`, FFI, Go, and Python paths remain
+`ApplicationNode::open`, FFI, Go, and Python paths remain
 unprotected compatibility/test ingestion. The stock `aster node`,
 `control-revoke`, and `control-rekey` CLI paths also still require an owner-only
 unprotected-reference bundle. A Rust embedding can instead construct a live
@@ -392,9 +392,8 @@ are recorded separately in the
   cryptographic state without consuming that state until the flight succeeds. A
   forged or malformed ServerHello, ClientAuth, or ServerFinished is discarded
   while the exact prior state and its bounded retained outbound flight remain
-  available for retransmission. `MeshService` retains one zeroizing in-process
-  canonical bundle copy for backend rebuilds; the runtime creates no additional
-  serialized or persistent recovery copy. Failures after record
+  available for retransmission. The runtime creates no additional serialized
+  or persistent recovery copy. Failures after record
   authentication--including wire, synchronization, backend, and internal
   contract errors--remain fatal to the containing contact rather than being
   hidden as carrier noise.

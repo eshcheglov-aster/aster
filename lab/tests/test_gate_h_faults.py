@@ -304,7 +304,7 @@ class GateHFaultTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             faults.TEST_PACKAGE_FEATURE_ARGS["aster-host"] = (  # type: ignore[index]
                 "--features",
-                "legacy-single-contact-service",
+                "default",
             )
         for entry in plan:
             self.assertEqual(entry["argv"][0:3], ["cargo", "test", "--locked"])
@@ -1531,7 +1531,6 @@ class GateHFaultTests(unittest.TestCase):
             ("", True),
             ("└── iroh v1.3.0 features=[]\n", False),
             ("└── libp2p-core v0.1.0 features=[]\n", False),
-            ('└── aster-host feature "legacy-lab"\n', False),
         ):
             with self.subTest(extra=extra), mock.patch.object(
                 faults,
@@ -1573,7 +1572,7 @@ class GateHFaultTests(unittest.TestCase):
         }
         checks = faults.execute_static_checks(freeze, execution=execution)
         self.assertEqual(set(checks), faults.STATIC_CHECK_NAMES)
-        self.assertEqual(len(checks), 26)
+        self.assertEqual(len(checks), 20)
         self.assertEqual(
             {
                 "host_event_has_no_authenticated_admission_bypass",

@@ -6,8 +6,8 @@ containing their code or data. This file does not relicense Aster.
 
 | Package | Version | crates.io archive SHA-256 | License |
 |---|---:|---|---|
-| `webpki-root-certs` | 1.0.9 | `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` | CDLA-Permissive-2.0 |
-| `webpki-roots` | 1.0.9 | `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` | CDLA-Permissive-2.0 |
+| `webpki-root-certs` | 1.0.10 | `58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb` | CDLA-Permissive-2.0 |
+| `webpki-roots` | 1.0.10 | `1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9` | CDLA-Permissive-2.0 |
 | `async_io_stream` | 0.3.3 | `b6d7b9decdf35d8908a7e3ef02f64c5e9b1695e230154c0e8de3969142d9b94c` | Unlicense |
 | `pharos` | 0.5.3 | `e9567389417feee6ce15dd6527a8a1ecac205ef62c2932bcf3d9f6fc5b78b414` | Unlicense |
 | `ws_stream_wasm` | 0.7.5 | `6c173014acad22e83f16403ee360115b38846fe754e735c5d9d3803fe70c6abc` | Unlicense |

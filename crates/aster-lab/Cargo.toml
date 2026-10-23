@@ -1,6 +1,6 @@
 [package]
 name = "aster-lab"
-description = "Deterministic fault-injection and scale laboratory for Aster Mesh"
+description = "Native mesh and transport laboratory for Aster Mesh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,8 +26,7 @@ zeroize.workspace = true
 rustix = { workspace = true, optional = true }
 
 [features]
-default = ["legacy-lab"]
-legacy-lab = ["aster-host/legacy-single-contact-service"]
+default = []
 gate-h = ["aster-host/gate-h-formal"]
 selected-nat = [
   "dep:aster-node",
@@ -43,7 +42,6 @@ selected-nat = [
 [[bin]]
 name = "aster-lab"
 path = "src/main.rs"
-required-features = ["legacy-lab"]
 
 [[bin]]
 name = "aster-gate-h"

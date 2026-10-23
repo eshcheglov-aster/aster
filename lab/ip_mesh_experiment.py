@@ -2140,8 +2140,6 @@ def _validate_gate_h_execution_provenance(
             "aster_host_gate_h_formal": 1,
         },
         "forbidden_tokens": [
-            "legacy-single-contact-service",
-            "legacy-lab",
             "libp2p*",
             "iroh*",
         ],
@@ -2188,7 +2186,7 @@ def _validate_gate_h_execution_provenance(
         "forbidden_tokens": sorted(
             set(
                 re.findall(
-                    r"(?i)\b(?:legacy-single-contact-service|legacy-lab|libp2p|iroh)[a-z0-9_-]*\b",
+                    r"(?i)\b(?:libp2p|iroh)[a-z0-9_-]*\b",
                     graph_text,
                 )
             )
@@ -2737,7 +2735,7 @@ def validate_gate_h_fault_receipt(
             forbidden = sorted(
                 set(
                     re.findall(
-                        r"(?i)\b(?:legacy-single-contact-service|legacy-lab|libp2p|iroh)[a-z0-9_-]*\b",
+                        r"(?i)\b(?:libp2p|iroh)[a-z0-9_-]*\b",
                         decoded,
                     )
                 )
@@ -2754,8 +2752,6 @@ def validate_gate_h_fault_receipt(
                         "aster_host_gate_h_formal": 1,
                     },
                     "forbidden_tokens": [
-                        "legacy-single-contact-service",
-                        "legacy-lab",
                         "libp2p*",
                         "iroh*",
                     ],

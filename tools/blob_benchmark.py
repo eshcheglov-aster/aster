@@ -34,9 +34,14 @@ def summarize(runs):
     return rows
 
 
-def campaign():
-    return [(f"{size}-1", size, 300)
-            for size in (16384, 65536, 262144, 1048576)]
+CAMPAIGN_SIZES = {
+    "default": (16384, 65536, 262144, 1048576),
+    "scale": (100 * 1024 * 1024,),
+}
+
+
+def campaign(profile="default"):
+    return [(f"{size}-1", size, 300) for size in CAMPAIGN_SIZES[profile]]
 
 
 def parse_records(text):
@@ -144,13 +149,14 @@ def main():
     parser.add_argument("--variant", nargs=3, action="append", required=True, metavar=("LABEL", "REPO", "BINARY"))
     parser.add_argument("--output", type=Path, required=True, help="new durable result directory")
     parser.add_argument("--state", type=Path, required=True, help="new scratch fixture directory")
+    parser.add_argument("--campaign", choices=CAMPAIGN_SIZES, default="default")
     parser.add_argument("--sizes", type=int, nargs="+", help="optional subset, exact byte sizes")
     args = parser.parse_args()
     os.umask(0o077)
     labels = [v[0] for v in args.variant]
     if len(set(labels)) != len(labels) or any(not label.replace("-", "").isalnum() for label in labels):
         parser.error("variant labels must be unique alphanumeric/hyphen names")
-    cases = [c for c in campaign() if args.sizes is None or c[1] in args.sizes]
+    cases = [c for c in campaign(args.campaign) if args.sizes is None or c[1] in args.sizes]
     if not cases or (args.sizes and set(args.sizes) != {c[1] for c in cases}):
         parser.error("sizes must be from the documented campaign")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -159,7 +165,8 @@ def main():
     identities = {label: source_identity(repo, binary) for label, repo, binary in variants}
     if len({v["example_sha256"] for v in identities.values()}) != 1:
         raise ValueError("variant examples differ")
-    write_json(args.output / "metadata.json", {"variants": identities, "cases": cases,
+    write_json(args.output / "metadata.json", {"campaign": args.campaign,
+        "variants": identities, "cases": cases,
         "planned_runs": len(cases) * len(variants), "machine": platform.uname()._asdict(),
         "cpu": command(["lscpu"]), "memory": Path("/proc/meminfo").read_text(),
         "disk": command(["df", "-B1", str(args.state)]), "power_initial": power()})

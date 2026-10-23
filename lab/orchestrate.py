@@ -65,7 +65,7 @@ SELECTED_NAT_RELAY_MAX_ADMITTED_CONNECTIONS = 8
 SELECTED_NAT_RELAY_BYTES_PER_SECOND = 1_048_576
 SELECTED_NAT_RELAY_MAX_BURST_BYTES = 1_048_576
 SELECTED_NAT_RELAY_KEY_CACHE_CAPACITY = 256
-SELECTED_NAT_RECEIPT_SCHEMA = "aster-selected-iroh-nat-receipt/v1"
+SELECTED_NAT_RECEIPT_SCHEMA = "aster-selected-iroh-nat-receipt/v2"
 SELECTED_NAT_RECEIPT_CLAIM = (
     "selected-iroh-one-host-namespace-nat-two-cell-acceptance"
 )
@@ -89,10 +89,6 @@ NAT_NETWORKS = {
 DIRECT_SPEC = (DIRECT_NETWORK, "10.250.10.0/24", "10.250.10.254")
 
 FIXED_CONTAINER_NAMES = {
-    "transfer": "aster-lab-transfer",
-    "blob": "aster-lab-blob",
-    "scale": "aster-lab-scale",
-    "resource": "aster-lab-resource",
     "provision": "aster-lab-provision",
     "node-a": "aster-lab-node-a",
     "node-b": "aster-lab-node-b",
@@ -1235,23 +1231,6 @@ def container_run_args(
     return args
 
 
-def fault_args(args: argparse.Namespace) -> list[str]:
-    return [
-        "--seed",
-        str(args.seed),
-        "--mtu",
-        str(args.mtu),
-        "--bps",
-        str(args.bps),
-        "--loss-per-mille",
-        str(args.loss_per_mille),
-        "--reorder-ticks",
-        str(args.reorder_ticks),
-        "--tick-ms",
-        str(args.tick_ms),
-    ]
-
-
 def plan_output(
     label: str,
     resources: Iterable[PlannedResource],
@@ -1281,110 +1260,11 @@ def plan_output(
     )
 
 
-def scenario_metrics(
-    ctx: RunContext,
-    relative: str,
-    expected: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    path = ctx.run_dir / relative / "metrics.json"
-    if not path.is_file():
-        raise LabError(f"scenario emitted no metrics: {path}")
-    with path.open(encoding="utf-8") as stream:
-        metrics = json.load(stream)
-    if metrics.get("schema") != "aster-lab-metrics/v1":
-        raise LabError("scenario metrics schema mismatch")
-    if metrics.get("converged") is not True:
-        raise LabError("scenario did not report convergence")
-    if expected is not None:
-        for key, value in expected.items():
-            observed = metrics.get(key)
-            if type(observed) is not type(value) or observed != value:
-                raise LabError(
-                    f"scenario metrics differ for {key}: expected {value!r}, "
-                    f"found {observed!r}"
-                )
-    return metrics
-
-
 def write_scenario_request(ctx: RunContext, **values: Any) -> None:
     write_exclusive_json(
         ctx.run_dir / "scenario-request.json",
         {"schema": SCHEMA, "operation": ctx.label, **values},
     )
-
-
-def read_key_value_record(path: Path, prefix: str) -> dict[str, str]:
-    if not path.is_file() or path.stat().st_size > 16_384:
-        raise LabError(f"missing or oversized evidence record: {path}")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if len(lines) != 1:
-        raise LabError(f"evidence record must contain exactly one line: {path}")
-    fields = lines[0].split("\t")
-    if not fields or fields[0] != prefix:
-        raise LabError(f"evidence record header mismatch: {path}")
-    values: dict[str, str] = {}
-    for field in fields[1:]:
-        if "=" not in field:
-            raise LabError(f"malformed evidence record field: {path}")
-        key, value = field.split("=", 1)
-        if not key or key in values:
-            raise LabError(f"duplicate or empty evidence record field: {path}")
-        values[key] = value
-    return values
-
-
-def verify_live_node_metrics(
-    ctx: RunContext,
-    relative: str,
-    *,
-    own_identity: str,
-    peer_identity: str,
-    peer_endpoint: str,
-    seed: int,
-    items: int,
-) -> None:
-    expected_total = items * 2
-    scenario_metrics(
-        ctx,
-        relative,
-        {
-            "scenario": "node-udp",
-            "seed": seed,
-            "shards": 1,
-            "nodes": 1,
-            "published_items": items,
-            "delivered_items": expected_total,
-        },
-    )
-    live = read_key_value_record(
-        ctx.run_dir / relative / "live-metrics.txt", "ASTER_LAB_LIVE_METRICS"
-    )
-    expected = {
-        "version": "1",
-        "node": own_identity,
-        "peer": peer_identity,
-        "carrier": "fixed-udp",
-        "local_endpoint": "0.0.0.0:44000",
-        "resolved_peer_endpoint": peer_endpoint,
-        "durable_reopen": "false",
-        "published_this_run": str(items),
-        "reused_publications": "0",
-        "observed_items": str(expected_total),
-        "authenticated": "true",
-        "converged": "true",
-    }
-    for key, value in expected.items():
-        if live.get(key) != value:
-            raise LabError(
-                f"live metrics differ for {relative} {key}: expected {value!r}, "
-                f"found {live.get(key)!r}"
-            )
-    try:
-        authenticated_pumps = int(live.get("authenticated_pumps", ""))
-    except ValueError as error:
-        raise LabError("live metrics authenticated_pumps is not numeric") from error
-    if authenticated_pumps <= 0:
-        raise LabError("live node reported no authenticated pump")
 
 
 def exact_resources(label: str, names: Iterable[tuple[str, str]]) -> list[PlannedResource]:
@@ -1924,431 +1804,9 @@ def run_build(args: argparse.Namespace) -> None:
     print(ctx.run_dir)
 
 
-def run_self_contained(args: argparse.Namespace) -> None:
-    role = "transfer" if args.scenario == "transfer" else "blob"
-    if args.scenario == "blob-recovery" and args.restart_after_frames == 0:
-        raise LabError("Blob recovery requires a positive restart checkpoint")
-    name = FIXED_CONTAINER_NAMES[role]
-    resources = [PlannedResource("container", name, role)]
-    command = [args.scenario, "--root", "/output/run", *fault_args(args)]
-    if args.scenario == "transfer":
-        command.extend(
-            [
-                "--items",
-                str(args.items),
-                "--payload-bytes",
-                str(args.payload_bytes),
-                "--restart-after-frames",
-                str(args.restart_after_frames),
-                "--max-pumps",
-                str(args.max_pumps),
-            ]
-        )
-    else:
-        command.extend(
-            [
-                "--blob-bytes",
-                str(args.blob_bytes),
-                "--chunk-bytes",
-                str(args.chunk_bytes),
-                "--restart-after-frames",
-                str(args.restart_after_frames),
-                "--max-pumps",
-                str(args.max_pumps),
-            ]
-        )
-    if not args.execute:
-        plan_output(
-            role,
-            resources,
-            [
-                {
-                    "docker_run": command,
-                    "security": "--pull=never, network=none, read-only, cap-drop=ALL",
-                }
-            ],
-        )
-        return
-    ctx = RunContext.create(args.evidence_root, role, resources)
-    docker_preflight(ctx, containers=[name], networks=[])
-    write_scenario_request(
-        ctx,
-        scenario=args.scenario,
-        seed=args.seed,
-        items=args.items if args.scenario == "transfer" else None,
-        payload_bytes=args.payload_bytes if args.scenario == "transfer" else None,
-        blob_bytes=args.blob_bytes if args.scenario == "blob-recovery" else None,
-        chunk_bytes=args.chunk_bytes if args.scenario == "blob-recovery" else None,
-        restart_after_frames=args.restart_after_frames,
-        max_pumps=args.max_pumps,
-        mtu=args.mtu,
-        bits_per_second=args.bps,
-        loss_per_mille=args.loss_per_mille,
-        reorder_ticks=args.reorder_ticks,
-        tick_ms=args.tick_ms,
-    )
-    verified = False
-    try:
-        output_dir = create_output_directory(ctx, role)
-        completed = ctx.runner.run(
-            container_run_args(
-                ctx,
-                name=name,
-                role=role,
-                command=command,
-                cpus=args.cpus,
-                memory=args.memory,
-                pids=512,
-                output_dir=output_dir,
-            ),
-            check=False,
-            timeout=args.timeout,
-        )
-        ctx.event("container-run-complete", name=name, returncode=completed.returncode)
-        if completed.returncode != 0:
-            raise LabError(f"{args.scenario} container failed with {completed.returncode}")
-        verify_container_configuration(
-            ctx,
-            name,
-            output_dir=output_dir,
-            memory=args.memory,
-            cpus=args.cpus,
-            pids=512,
-            network="none",
-        )
-        expected = {
-            "scenario": args.scenario,
-            "seed": args.seed,
-            "shards": 1,
-            "nodes": 2 if args.scenario == "transfer" else 3,
-            "published_items": args.items if args.scenario == "transfer" else 1,
-            "delivered_items": args.items if args.scenario == "transfer" else 2,
-            "blob_bytes": 0 if args.scenario == "transfer" else args.blob_bytes,
-            "configured_bits_per_second": args.bps,
-            "configured_loss_per_mille": args.loss_per_mille,
-            "loss_window_frames": 1_000,
-        }
-        if args.scenario == "blob-recovery":
-            expected["partial_restart_observed"] = True
-            expected["durable_progress_preserved"] = True
-        metrics = scenario_metrics(ctx, f"outputs/{role}/run", expected)
-        if args.scenario == "blob-recovery":
-            partial_bytes = metrics.get("partial_durable_blob_bytes")
-            reopened_bytes = metrics.get("reopened_durable_blob_bytes")
-            if (
-                type(partial_bytes) is not int
-                or type(reopened_bytes) is not int
-                or partial_bytes <= 0
-                or reopened_bytes < partial_bytes
-            ):
-                raise LabError(
-                    "Blob recovery did not preserve measured durable partial bytes across reopen"
-                )
-        ctx.event("scenario-verified", scenario=args.scenario)
-        verified = True
-    finally:
-        cleanup_context(ctx, tolerate_errors=not verified)
-    print(ctx.run_dir)
-
-
 def create_network(ctx: RunContext, spec: NetworkSpec, role: str) -> None:
     ctx.runner.run(network_create_args(ctx, spec, role))
     ctx.event("resource-created", kind="network", name=spec.name, role=role)
-
-
-def parse_provision_manifest(path: Path, expected: int) -> list[dict[str, str]]:
-    if not path.is_file():
-        raise LabError("provisioning manifest is missing")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines or not lines[0].startswith("ASTER_LAB_NODE_MANIFEST\t"):
-        raise LabError("provisioning manifest header mismatch")
-    header = {}
-    for field in lines[0].split("\t")[1:]:
-        if "=" not in field:
-            raise LabError("malformed provisioning manifest header")
-        key, value = field.split("=", 1)
-        if key in header:
-            raise LabError("duplicate provisioning manifest header field")
-        header[key] = value
-    if (
-        header.get("version") != "1"
-        or header.get("topic") != "lab.live-ip"
-        or header.get("scope") != "lab/live-ip"
-        or header.get("nodes") != str(expected)
-    ):
-        raise LabError("provisioning manifest parameters mismatch")
-    if len(lines) < 2 or lines[1] != "index\tserial\tnode_id":
-        raise LabError("provisioning manifest column header mismatch")
-    records = []
-    for expected_index, line in enumerate(lines[2:]):
-        fields = line.split("\t")
-        if (
-            len(fields) != 3
-            or fields[0] != str(expected_index)
-            or not fields[1].isdigit()
-            or int(fields[1]) <= 0
-            or not re.fullmatch(r"[0-9a-f]{64}", fields[2])
-        ):
-            raise LabError("malformed provisioning manifest record")
-        records.append(
-            {"index": fields[0], "serial": fields[1], "identity": fields[2]}
-        )
-    if len(records) != expected:
-        raise LabError(f"expected {expected} provisioned nodes, found {len(records)}")
-    return records
-
-
-def wait_for_containers(ctx: RunContext, names: Sequence[str], timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    pending = set(names)
-    while pending:
-        if time.monotonic() >= deadline:
-            raise LabError(f"container timeout: {', '.join(sorted(pending))}")
-        for name in list(pending):
-            state = ctx.runner.run(
-                [require_docker(), "container", "inspect", name, "--format", "{{json .State}}"]
-            )
-            try:
-                decoded = json.loads(state.stdout)
-            except json.JSONDecodeError as error:
-                raise LabError("Docker returned malformed container state") from error
-            if not decoded.get("Running", False):
-                pending.remove(name)
-        if pending:
-            time.sleep(1.0)
-
-
-def verify_container_exit(ctx: RunContext, name: str) -> None:
-    state = ctx.runner.run(
-        [require_docker(), "container", "inspect", name, "--format", "{{json .State}}"]
-    )
-    decoded = json.loads(state.stdout)
-    if decoded.get("ExitCode") != 0:
-        logs = ctx.runner.run([require_docker(), "container", "logs", name], check=False)
-        raise LabError(
-            f"container {name} exited {decoded.get('ExitCode')}: "
-            f"{(logs.stderr or logs.stdout).strip()}"
-        )
-    logs = ctx.runner.run([require_docker(), "container", "logs", name])
-    write_exclusive_text(ctx.run_dir / f"{name}.log", logs.stdout + logs.stderr)
-
-
-def run_two_node(args: argparse.Namespace) -> None:
-    spec = NetworkSpec.from_tuple(DIRECT_SPEC)
-    names = [
-        FIXED_CONTAINER_NAMES["provision"],
-        FIXED_CONTAINER_NAMES["node-a"],
-        FIXED_CONTAINER_NAMES["node-b"],
-    ]
-    resources = [
-        PlannedResource("network", spec.name, "direct"),
-        PlannedResource("container", names[0], "provision"),
-        PlannedResource("container", names[1], "node-a"),
-        PlannedResource("container", names[2], "node-b"),
-    ]
-    if not args.execute:
-        plan_output(
-            "two-node",
-            resources,
-            [
-                "create one internal bridge at 10.250.10.0/24",
-                "provision two identities in an offline container",
-                "run two unprivileged node-udp containers at .10 and .11",
-                "require both metrics records to report authenticated convergence",
-            ],
-        )
-        return
-    ctx = RunContext.create(args.evidence_root, "two-node", resources)
-    docker_preflight(ctx, containers=names, networks=[spec])
-    write_scenario_request(
-        ctx,
-        scenario="two-node-live-udp",
-        workload_seed=args.seed,
-        items_per_node=args.items,
-        expected_items_per_node=args.items * 2,
-        payload_bytes=args.payload_bytes,
-        duration_ms=args.duration_ms,
-        max_pumps=args.max_pumps,
-        responder_settle_ms=args.responder_settle_ms,
-    )
-    verified = False
-    try:
-        create_network(ctx, spec, "direct")
-        provision_output = create_output_directory(ctx, "provision")
-        provision = container_run_args(
-            ctx,
-            name=names[0],
-            role="provision",
-            command=[
-                "provision",
-                "--root",
-                "/output",
-                "--nodes",
-                "2",
-                "--scope",
-                "lab/live-ip",
-                "--topic",
-                "lab.live-ip",
-            ],
-            memory="1g",
-            output_dir=provision_output,
-        )
-        ctx.runner.run(provision, timeout=120)
-        verify_container_configuration(
-            ctx,
-            names[0],
-            output_dir=provision_output,
-            memory="1g",
-            cpus="1",
-            pids=256,
-            network="none",
-        )
-        records = parse_provision_manifest(provision_output / "manifest.tsv", 2)
-        if records[0]["identity"] == records[1]["identity"]:
-            raise LabError("provisioner emitted duplicate node identities")
-        scenario_metrics(
-            ctx,
-            "outputs/provision",
-            {"scenario": "provision", "shards": 1, "nodes": 2},
-        )
-        bundle_a = provision_output / "private" / "node-0000.bundle"
-        bundle_b = provision_output / "private" / "node-0001.bundle"
-        private_dir = provision_output / "private"
-        if private_dir.is_symlink() or not private_dir.is_dir():
-            raise LabError("provisioning private directory is missing or symbolic")
-        if private_dir.stat().st_mode & 0o777 != 0o700:
-            raise LabError("provisioning private directory mode is not 0700")
-        for bundle in [bundle_a, bundle_b]:
-            if bundle.is_symlink() or not bundle.is_file():
-                raise LabError(f"provisioning bundle is missing or symbolic: {bundle}")
-            if bundle.resolve().parent != private_dir.resolve():
-                raise LabError(f"provisioning bundle escapes its private directory: {bundle}")
-            if bundle.stat().st_mode & 0o777 != 0o600:
-                raise LabError(f"provisioning bundle mode is not 0600: {bundle}")
-        node_a_output = create_output_directory(ctx, "node-a")
-        node_b_output = create_output_directory(ctx, "node-b")
-        common = [
-            "--seed",
-            str(args.seed),
-            "--duration-ms",
-            str(args.duration_ms),
-            "--max-pumps",
-            str(args.max_pumps),
-            "--payload-bytes",
-            str(args.payload_bytes),
-            "--expect-items",
-            str(args.items * 2),
-        ]
-        node_a = container_run_args(
-            ctx,
-            name=names[1],
-            role="node-a",
-            detach=True,
-            network=spec.name,
-            ip="10.250.10.10",
-            memory=args.memory,
-            cpus=args.cpus,
-            command=[
-                "node-udp",
-                "--root",
-                "/output",
-                "--bundle",
-                "/run/secrets/node.bundle",
-                "--bind",
-                "0.0.0.0:44000",
-                "--peer-id",
-                records[1]["identity"],
-                "--peer-address",
-                "10.250.10.11:44000",
-                "--publish-items",
-                str(args.items),
-                *common,
-            ],
-            output_dir=node_a_output,
-            read_only_mounts=[(bundle_a, "/run/secrets/node.bundle")],
-        )
-        node_b = container_run_args(
-            ctx,
-            name=names[2],
-            role="node-b",
-            detach=True,
-            network=spec.name,
-            ip="10.250.10.11",
-            memory=args.memory,
-            cpus=args.cpus,
-            command=[
-                "node-udp",
-                "--root",
-                "/output",
-                "--bundle",
-                "/run/secrets/node.bundle",
-                "--bind",
-                "0.0.0.0:44000",
-                "--peer-id",
-                records[0]["identity"],
-                "--peer-address",
-                "10.250.10.10:44000",
-                "--publish-items",
-                str(args.items),
-                *common,
-            ],
-            output_dir=node_b_output,
-            read_only_mounts=[(bundle_b, "/run/secrets/node.bundle")],
-        )
-        commands = [(records[0]["identity"], node_a), (records[1]["identity"], node_b)]
-        # MeshService assigns the lexicographically higher NodeID the responder
-        # role; start it first so it is listening when the initiator emits flight 1.
-        commands.sort(key=lambda value: value[0], reverse=True)
-        ctx.runner.run(commands[0][1])
-        time.sleep(args.responder_settle_ms / 1000)
-        ctx.event("responder-settled", milliseconds=args.responder_settle_ms)
-        ctx.runner.run(commands[1][1])
-        verify_container_configuration(
-            ctx,
-            names[1],
-            output_dir=node_a_output,
-            memory=args.memory,
-            cpus=args.cpus,
-            pids=256,
-            network=spec.name,
-            read_only_mounts=[(bundle_a, "/run/secrets/node.bundle")],
-        )
-        verify_container_configuration(
-            ctx,
-            names[2],
-            output_dir=node_b_output,
-            memory=args.memory,
-            cpus=args.cpus,
-            pids=256,
-            network=spec.name,
-            read_only_mounts=[(bundle_b, "/run/secrets/node.bundle")],
-        )
-        wait_for_containers(ctx, names[1:], args.duration_ms / 1000 + 30)
-        for name in names[1:]:
-            verify_container_exit(ctx, name)
-        verify_live_node_metrics(
-            ctx,
-            "outputs/node-a",
-            own_identity=records[0]["identity"],
-            peer_identity=records[1]["identity"],
-            peer_endpoint="10.250.10.11:44000",
-            seed=args.seed,
-            items=args.items,
-        )
-        verify_live_node_metrics(
-            ctx,
-            "outputs/node-b",
-            own_identity=records[1]["identity"],
-            peer_identity=records[0]["identity"],
-            peer_endpoint="10.250.10.10:44000",
-            seed=args.seed,
-            items=args.items,
-        )
-        ctx.event("scenario-verified", scenario="two-node-live-udp")
-        verified = True
-    finally:
-        cleanup_context(ctx, tolerate_errors=not verified)
-    print(ctx.run_dir)
 
 
 CGROUP_FILES = [
@@ -2371,85 +1829,6 @@ CGROUP_FILES = [
 # explicit availability marker and the failed read receipt, but do not discard
 # the mandatory memory-limit/OOM/CPU/accounting evidence when PSI is absent.
 OPTIONAL_CGROUP_FILES = ["/sys/fs/cgroup/cpu.pressure"]
-
-
-def parse_nonnegative_integer(value: Any, label: str) -> int:
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value.strip()):
-        raise LabError(f"resource sample {label} is not a nonnegative integer")
-    return int(value.strip())
-
-
-def parse_counter_file(value: Any, label: str) -> dict[str, int]:
-    if not isinstance(value, str) or not value.strip():
-        raise LabError(f"resource sample {label} is empty")
-    counters: dict[str, int] = {}
-    for line in value.splitlines():
-        fields = line.split()
-        if len(fields) != 2 or fields[0] in counters or not fields[1].isdigit():
-            raise LabError(f"resource sample {label} is malformed")
-        counters[fields[0]] = int(fields[1])
-    return counters
-
-
-def parse_io_stat(value: Any) -> list[dict[str, int | str]]:
-    if not isinstance(value, str) or not value.strip():
-        raise LabError("resource sample io.stat is empty")
-    records: list[dict[str, int | str]] = []
-    for line in value.splitlines():
-        fields = line.split()
-        if not fields or not re.fullmatch(r"[0-9]+:[0-9]+", fields[0]):
-            raise LabError("resource sample io.stat has a malformed device")
-        record: dict[str, int | str] = {"device": fields[0]}
-        for field in fields[1:]:
-            if "=" not in field:
-                raise LabError("resource sample io.stat has a malformed counter")
-            key, counter = field.split("=", 1)
-            if not key or key in record or not counter.isdigit():
-                raise LabError("resource sample io.stat has a malformed counter")
-            record[key] = int(counter)
-        if len(record) == 1:
-            raise LabError("resource sample io.stat has no counters")
-        records.append(record)
-    return records
-
-
-def validate_resource_sample(
-    sample: dict[str, Any], expected_memory_bytes: int, *, require_process: bool = True
-) -> None:
-    for key in ["memory.current", "memory.peak", "pids.current"]:
-        parse_nonnegative_integer(sample.get(key), key)
-    if parse_nonnegative_integer(sample.get("memory.max"), "memory.max") != expected_memory_bytes:
-        raise LabError("cgroup memory.max differs from the requested Docker limit")
-    parse_nonnegative_integer(sample.get("memory.swap.current"), "memory.swap.current")
-    if parse_nonnegative_integer(sample.get("memory.swap.max"), "memory.swap.max") != 0:
-        raise LabError("resource cgroup unexpectedly permits swap")
-    memory_events = parse_counter_file(sample.get("memory.events"), "memory.events")
-    for key in ["oom", "oom_kill"]:
-        if key not in memory_events:
-            raise LabError(f"memory.events is missing {key}")
-        if memory_events[key] != 0:
-            raise LabError(f"resource cgroup reports {key}={memory_events[key]}")
-    parse_counter_file(sample.get("memory.stat"), "memory.stat")
-    parse_counter_file(sample.get("cpu.stat"), "cpu.stat")
-    parse_counter_file(sample.get("pids.events"), "pids.events")
-    pressure_available = sample.get("cpu.pressure_available")
-    if not isinstance(pressure_available, bool):
-        raise LabError("cpu.pressure availability marker is missing")
-    pressure = sample.get("cpu.pressure")
-    if pressure_available:
-        if not isinstance(pressure, str) or "some " not in pressure or "total=" not in pressure:
-            raise LabError("available cpu.pressure has malformed pressure counters")
-    elif pressure is not None:
-        raise LabError("unavailable cpu.pressure unexpectedly contains counters")
-    parse_io_stat(sample.get("io.stat"))
-    if require_process:
-        for key in ["smaps_rollup", "status"]:
-            value = sample.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise LabError(f"process {key} evidence is missing")
-    stats = sample.get("docker_stats")
-    if not isinstance(stats, dict) or not stats:
-        raise LabError("Docker stats evidence is missing or malformed")
 
 
 def docker_memory_bytes(value: str) -> int:
@@ -2674,236 +2053,6 @@ def verify_container_configuration(
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.json", target_name):
         raise LabError("container configuration receipt name is invalid")
     write_exclusive_json(ctx.run_dir / target_name, value)
-
-
-def resource_sample(
-    ctx: RunContext, name: str, expected_memory_bytes: int
-) -> dict[str, Any]:
-    docker = require_docker()
-    sample: dict[str, Any] = {"utc": utc_now(), "monotonic_ns": time.monotonic_ns()}
-    stats = ctx.runner.run(
-        [docker, "stats", "--no-stream", "--format", "{{json .}}", name], check=False
-    )
-    if stats.returncode != 0 or not stats.stdout.strip():
-        raise LabError("Docker stats failed during mandatory resource sampling")
-    try:
-        sample["docker_stats"] = json.loads(stats.stdout)
-    except json.JSONDecodeError as error:
-        raise LabError("Docker stats returned malformed JSON") from error
-    for path in CGROUP_FILES:
-        result = ctx.runner.run([docker, "exec", name, "/usr/bin/cat", path], check=False)
-        if result.returncode != 0:
-            raise LabError(f"mandatory cgroup read failed: {path}")
-        sample[path.rsplit("/", 1)[-1]] = result.stdout.strip()
-    for path in OPTIONAL_CGROUP_FILES:
-        result = ctx.runner.run([docker, "exec", name, "/usr/bin/cat", path], check=False)
-        key = path.rsplit("/", 1)[-1]
-        available = result.returncode == 0
-        sample[f"{key}_available"] = available
-        sample[key] = result.stdout.strip() if available else None
-    process = ctx.runner.run(
-        [docker, "exec", name, "/usr/bin/pgrep", "--oldest", "--exact", "aster-lab"],
-        check=False,
-    )
-    if process.returncode not in {0, 1}:
-        raise LabError("aster-lab process state probe failed")
-    process_id = process.stdout.strip() if process.returncode == 0 else ""
-    process_observed = bool(re.fullmatch(r"[1-9][0-9]*", process_id))
-    if process.returncode == 0 and not process_observed:
-        raise LabError("aster-lab process state probe returned a malformed PID")
-    if process_observed:
-        sample["process_pid"] = int(process_id)
-        for path in [f"/proc/{process_id}/smaps_rollup", f"/proc/{process_id}/status"]:
-            result = ctx.runner.run([docker, "exec", name, "/usr/bin/cat", path], check=False)
-            if result.returncode != 0:
-                # The workload may have exited between pgrep and this read. The
-                # already captured cgroup counters remain a valid terminal sample.
-                sample.pop("smaps_rollup", None)
-                sample.pop("status", None)
-                sample.pop("process_pid", None)
-                process_observed = False
-                break
-            sample[path.rsplit("/", 1)[-1]] = result.stdout
-    sample["process_observed"] = process_observed
-    sample["phase"] = "running" if process_observed else "terminal-cgroup"
-    validate_resource_sample(
-        sample, expected_memory_bytes, require_process=process_observed
-    )
-    append_jsonl(ctx.run_dir / "resource-samples.jsonl", sample)
-    return sample
-
-
-def run_resource(args: argparse.Namespace) -> None:
-    name = FIXED_CONTAINER_NAMES["resource"]
-    resources = [PlannedResource("container", name, "resource")]
-    command = [
-        "scale",
-        "--root",
-        "/output/run",
-        "--nodes",
-        "1",
-        "--shards",
-        "1",
-        "--items",
-        str(args.items),
-        "--payload-bytes",
-        str(args.payload_bytes),
-        "--max-pumps",
-        str(args.max_pumps),
-        *fault_args(args),
-    ]
-    if not args.execute:
-        plan_output(
-            "resource",
-            resources,
-            [
-                {
-                    "container_pid1": ["/usr/bin/sleep", "infinity"],
-                    "foreground_receipted_exec": command,
-                    "limits": {"cpus": args.cpus, "memory": args.memory, "swap": args.memory},
-                    "capture": CGROUP_FILES
-                    + OPTIONAL_CGROUP_FILES
-                    + ["/proc/<oldest-exact-aster-lab-pid>/smaps_rollup", "/proc/<pid>/status"],
-                }
-            ],
-        )
-        return
-    ctx = RunContext.create(args.evidence_root, "resource", resources)
-    docker_preflight(ctx, containers=[name], networks=[], require_cgroup_v2=True)
-    write_scenario_request(
-        ctx,
-        scenario="scale-resource",
-        seed=args.seed,
-        nodes=1,
-        shards=1,
-        items=args.items,
-        payload_bytes=args.payload_bytes,
-        max_pumps=args.max_pumps,
-        mtu=args.mtu,
-        bits_per_second=args.bps,
-        loss_per_mille=args.loss_per_mille,
-        reorder_ticks=args.reorder_ticks,
-        tick_ms=args.tick_ms,
-        cpus=args.cpus,
-        memory=args.memory,
-    )
-    verified = False
-    try:
-        output_dir = create_output_directory(ctx, "resource")
-        ctx.runner.run(
-            container_run_args(
-                ctx,
-                name=name,
-                role="resource",
-                command=["infinity"],
-                detach=True,
-                cpus=args.cpus,
-                memory=args.memory,
-                pids=128,
-                output_dir=output_dir,
-                entrypoint="/usr/bin/sleep",
-            )
-        )
-        verify_container_configuration(
-            ctx,
-            name,
-            output_dir=output_dir,
-            memory=args.memory,
-            cpus=args.cpus,
-            pids=128,
-            network="none",
-            entrypoint="/usr/bin/sleep",
-        )
-        workload = ctx.runner.start(
-            [
-                require_docker(),
-                "exec",
-                name,
-                "/usr/local/bin/aster-lab",
-                *command,
-            ]
-        )
-        try:
-            deadline = time.monotonic() + args.timeout
-            startup_deadline = min(deadline, time.monotonic() + 10.0)
-            while workload.poll() is None:
-                process = ctx.runner.run(
-                    [
-                        require_docker(),
-                        "exec",
-                        name,
-                        "/usr/bin/pgrep",
-                        "--oldest",
-                        "--exact",
-                        "aster-lab",
-                    ],
-                    check=False,
-                )
-                if process.returncode == 0:
-                    break
-                if process.returncode != 1:
-                    raise LabError("resource workload process state probe failed")
-                if time.monotonic() >= startup_deadline:
-                    raise LabError("resource workload did not become observable")
-                time.sleep(0.05)
-            if workload.poll() is not None:
-                workload.finish(check=True)
-                raise LabError("resource workload ended before its process became observable")
-
-            samples = 0
-            expected_memory_bytes = docker_memory_bytes(args.memory)
-            while workload.poll() is None:
-                sample = resource_sample(ctx, name, expected_memory_bytes)
-                if sample["process_observed"] is True:
-                    samples += 1
-                    sleep_interval = args.sample_interval
-                else:
-                    sleep_interval = min(args.sample_interval, 0.05)
-                if time.monotonic() >= deadline:
-                    workload.terminate()
-                    raise LabError("resource scenario timed out")
-                time.sleep(sleep_interval)
-            returncode = workload.finish(check=False)
-            terminal_sample = resource_sample(ctx, name, expected_memory_bytes)
-            if terminal_sample["process_observed"] is not False:
-                raise LabError("terminal cgroup snapshot still observed the workload process")
-            if returncode != 0:
-                stderr = (ctx.run_dir / workload.stderr_name).read_text(
-                    encoding="utf-8", errors="replace"
-                ).strip()
-                raise LabError(
-                    f"resource workload failed with {returncode}"
-                    + (f": {stderr}" if stderr else "")
-                )
-        finally:
-            if not workload.finished:
-                workload.terminate()
-        scenario_metrics(
-            ctx,
-            "outputs/resource/run",
-            {
-                "scenario": "scale",
-                "seed": args.seed,
-                "shards": 1,
-                "nodes": 1,
-                "published_items": args.items,
-                "delivered_items": args.items,
-                "configured_bits_per_second": args.bps,
-                "configured_loss_per_mille": args.loss_per_mille,
-                "loss_window_frames": 1_000,
-            },
-        )
-        if samples == 0:
-            raise LabError("resource scenario ended before process RSS was captured")
-        ctx.event(
-            "resource-capture-verified",
-            running_samples=samples,
-            terminal_cgroup_samples=1,
-        )
-        verified = True
-    finally:
-        cleanup_context(ctx, tolerate_errors=not verified)
-    print(ctx.run_dir)
 
 
 def interface_for_address(ctx: RunContext, container: str, address: str) -> str:
@@ -4744,9 +3893,14 @@ def validate_selected_nat_destroy(
 ) -> dict[str, str]:
     require_receipt_line_prefixes(value, [prefix])
     record = exact_receipt(value, prefix)
+    expected_version = "2" if prefix == "SELECTED_NAT_CANARY_DESTROY" else "1"
+    expected_extra = {"publication_journals_destroyed"} if expected_version == "2" else set()
+    if expected_extra and record.get("publication_journals_destroyed") != "2":
+        raise LabError("selected NAT publication journals were not destroyed")
     require_receipt_keys(
         record,
         {
+            *expected_extra,
             "status",
             "version",
             "artifact_destroyed",
@@ -4765,7 +3919,7 @@ def validate_selected_nat_destroy(
     )
     if (
         record.get("status") != "pass"
-        or record.get("version") != "1"
+        or record.get("version") != expected_version
         or record.get("artifact_destroyed") != "true"
         or record.get("global_secret_destruction") != "false"
         or record.get("target") != target
@@ -6454,6 +5608,7 @@ def validate_selected_nat_publish(
         {
             "status",
             "version",
+            "publication_model",
             "node",
             "event_id",
             "publisher",
@@ -6473,7 +5628,8 @@ def validate_selected_nat_publish(
     canary = manifest["canary_sha256"]
     if (
         record.get("status") != "pass"
-        or record.get("version") != "1"
+        or record.get("version") != "2"
+        or record.get("publication_model") != "numbered-v1"
         or record.get("node") != "a"
         or record.get("publisher") != manifest["nodes"]["a"]["mission_id"]
         or record.get("sequence") != "1"
@@ -7137,7 +6293,6 @@ def run_nat_up(args: argparse.Namespace) -> None:
         if not succeeded:
             cleanup_context(ctx, tolerate_errors=True)
     print(ctx.run_dir)
-
 
 
 def run_selected_nat_cell(
@@ -8332,108 +7487,6 @@ def cleanup_selected_nat_context(ctx: RunContext, *, tolerate_errors: bool) -> N
         raise LabError("selected NAT cleanup failed: " + "; ".join(errors))
 
 
-def run_scale(args: argparse.Namespace) -> None:
-    name = FIXED_CONTAINER_NAMES["scale"]
-    resources = [PlannedResource("container", name, "scale")]
-    command = [
-        "scale",
-        "--root",
-        "/output/run",
-        "--nodes",
-        str(args.nodes),
-        "--shards",
-        str(args.shards),
-        "--items",
-        str(args.items),
-        "--payload-bytes",
-        str(args.payload_bytes),
-        "--max-pumps",
-        str(args.max_pumps),
-        *fault_args(args),
-    ]
-    if not args.execute:
-        plan_output(
-            "scale",
-            resources,
-            [
-                {
-                    "docker_run": command,
-                    "limits": {"cpus": args.cpus, "memory": args.memory},
-                    "interpretation": "process-sharded deterministic chain simulation; not bridged live-IP acceptance",
-                }
-            ],
-        )
-        return
-    ctx = RunContext.create(args.evidence_root, "scale", resources)
-    docker_preflight(ctx, containers=[name], networks=[])
-    write_scenario_request(
-        ctx,
-        scenario="scale",
-        seed=args.seed,
-        nodes=args.nodes,
-        shards=args.shards,
-        items_per_shard=args.items,
-        payload_bytes=args.payload_bytes,
-        max_pumps=args.max_pumps,
-        mtu=args.mtu,
-        bits_per_second=args.bps,
-        loss_per_mille=args.loss_per_mille,
-        reorder_ticks=args.reorder_ticks,
-        tick_ms=args.tick_ms,
-        cpus=args.cpus,
-        memory=args.memory,
-    )
-    verified = False
-    try:
-        output_dir = create_output_directory(ctx, "scale")
-        pids = max(128, args.shards * 4 + 32)
-        completed = ctx.runner.run(
-            container_run_args(
-                ctx,
-                name=name,
-                role="scale",
-                command=command,
-                cpus=args.cpus,
-                memory=args.memory,
-                pids=pids,
-                output_dir=output_dir,
-            ),
-            check=False,
-            timeout=args.timeout,
-        )
-        if completed.returncode != 0:
-            raise LabError(f"scale container failed with {completed.returncode}")
-        verify_container_configuration(
-            ctx,
-            name,
-            output_dir=output_dir,
-            memory=args.memory,
-            cpus=args.cpus,
-            pids=pids,
-            network="none",
-        )
-        scenario_metrics(
-            ctx,
-            "outputs/scale/run",
-            {
-                "scenario": "scale",
-                "seed": args.seed,
-                "nodes": args.nodes,
-                "shards": args.shards,
-                "published_items": args.items * args.shards,
-                "delivered_items": args.items * args.nodes,
-                "configured_bits_per_second": args.bps,
-                "configured_loss_per_mille": args.loss_per_mille,
-                "loss_window_frames": 1_000,
-            },
-        )
-        ctx.event("scenario-verified", scenario="scale", nodes=args.nodes, shards=args.shards)
-        verified = True
-    finally:
-        cleanup_context(ctx, tolerate_errors=not verified)
-    print(ctx.run_dir)
-
-
 def inspect_labels(ctx: RunContext, resource: PlannedResource) -> dict[str, str] | None:
     docker = require_docker()
     if not docker_resource_present(ctx, resource.kind, resource.name):
@@ -8955,13 +8008,6 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def nonnegative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be nonnegative")
-    return parsed
-
-
 def bounded_int(minimum: int, maximum: int):
     def parse(value: str) -> int:
         parsed = int(value)
@@ -8970,18 +8016,6 @@ def bounded_int(minimum: int, maximum: int):
         return parsed
 
     return parse
-
-
-def memory_value(value: str) -> str:
-    if not MEMORY_VALUE.fullmatch(value):
-        raise argparse.ArgumentTypeError("use a Docker byte value such as 64m or 3g")
-    return value.lower()
-
-
-def cpu_value(value: str) -> str:
-    if not CPU_VALUE.fullmatch(value) or float(value) <= 0:
-        raise argparse.ArgumentTypeError("use a positive Docker CPU value such as 1 or 1.5")
-    return value
 
 
 def add_execution(parser: argparse.ArgumentParser) -> None:
@@ -8996,15 +8030,6 @@ def add_execution(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_EVIDENCE_ROOT,
         help=f"parent for single-use run directories (default: {DEFAULT_EVIDENCE_ROOT})",
     )
-
-
-def add_faults(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--seed", type=bounded_int(0, 2**64 - 1), default=1)
-    parser.add_argument("--mtu", type=bounded_int(64, 65_535), default=1_200)
-    parser.add_argument("--bps", type=positive_int, default=1_000_000)
-    parser.add_argument("--loss-per-mille", type=bounded_int(0, 900), default=0)
-    parser.add_argument("--reorder-ticks", type=bounded_int(0, 65_535), default=0)
-    parser.add_argument("--tick-ms", type=bounded_int(1, 65_535), default=100)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -9023,52 +8048,6 @@ def parser() -> argparse.ArgumentParser:
     )
     build.add_argument("--timeout", type=positive_int, default=3_600)
     build.set_defaults(handler=run_build)
-
-    self_contained = subparsers.add_parser(
-        "self-contained", help="run deterministic transfer or Blob recovery in one container"
-    )
-    add_execution(self_contained)
-    add_faults(self_contained)
-    self_contained.add_argument("scenario", choices=["transfer", "blob-recovery"])
-    self_contained.add_argument("--items", type=bounded_int(1, 4_096), default=4)
-    self_contained.add_argument("--payload-bytes", type=positive_int, default=65_536)
-    self_contained.add_argument("--blob-bytes", type=positive_int, default=105_906_176)
-    self_contained.add_argument("--chunk-bytes", type=positive_int, default=65_536)
-    self_contained.add_argument("--restart-after-frames", type=nonnegative_int, default=256)
-    self_contained.add_argument("--max-pumps", type=positive_int, default=2_000_000)
-    self_contained.add_argument("--cpus", type=cpu_value, default="2")
-    self_contained.add_argument("--memory", type=memory_value, default="4g")
-    self_contained.add_argument("--timeout", type=positive_int, default=1_800)
-    self_contained.set_defaults(handler=run_self_contained)
-
-    two_node = subparsers.add_parser("two-node", help="run two real UDP node containers")
-    add_execution(two_node)
-    two_node.add_argument(
-        "--seed",
-        type=bounded_int(0, 2**64 - 1),
-        default=1,
-        help="public canary workload seed; never used for identity or capability material",
-    )
-    two_node.add_argument("--items", type=bounded_int(1, 2_048), default=4)
-    two_node.add_argument("--payload-bytes", type=positive_int, default=1_024)
-    two_node.add_argument("--duration-ms", type=positive_int, default=60_000)
-    two_node.add_argument("--max-pumps", type=positive_int, default=1_000_000)
-    two_node.add_argument("--responder-settle-ms", type=positive_int, default=1_000)
-    two_node.add_argument("--cpus", type=cpu_value, default="1")
-    two_node.add_argument("--memory", type=memory_value, default="512m")
-    two_node.set_defaults(handler=run_two_node)
-
-    resource = subparsers.add_parser("resource", help="capture cgroup-v2 usage for one logical node")
-    add_execution(resource)
-    add_faults(resource)
-    resource.add_argument("--items", type=positive_int, default=10_000)
-    resource.add_argument("--payload-bytes", type=positive_int, default=64)
-    resource.add_argument("--max-pumps", type=positive_int, default=100_000)
-    resource.add_argument("--cpus", type=cpu_value, default="1")
-    resource.add_argument("--memory", type=memory_value, default="64m")
-    resource.add_argument("--sample-interval", type=float, default=1.0)
-    resource.add_argument("--timeout", type=positive_int, default=1_200)
-    resource.set_defaults(handler=run_resource)
 
     nat = subparsers.add_parser("nat-up", help="create the five-unit controlled NAT topology")
     add_execution(nat)
@@ -9118,19 +8097,6 @@ def parser() -> argparse.ArgumentParser:
     selected_project.add_argument("--output", type=Path, required=True)
     selected_project.set_defaults(handler=run_selected_nat_project)
 
-    scale = subparsers.add_parser("scale", help="run deterministic process-sharded scale simulation")
-    add_execution(scale)
-    add_faults(scale)
-    scale.add_argument("--nodes", type=positive_int, default=100)
-    scale.add_argument("--shards", type=positive_int, default=4)
-    scale.add_argument("--items", type=bounded_int(1, 4_096), default=1)
-    scale.add_argument("--payload-bytes", type=positive_int, default=1_024)
-    scale.add_argument("--max-pumps", type=positive_int, default=100_000)
-    scale.add_argument("--cpus", type=cpu_value, default="4")
-    scale.add_argument("--memory", type=memory_value, default="12g")
-    scale.add_argument("--timeout", type=positive_int, default=3_600)
-    scale.set_defaults(handler=run_scale)
-
     cleanup = subparsers.add_parser("cleanup", help="remove only exact, owned resources from one run")
     cleanup.add_argument("--execute", action="store_true")
     cleanup.add_argument("run_dir", type=Path)
@@ -9139,12 +8105,6 @@ def parser() -> argparse.ArgumentParser:
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
-    if hasattr(args, "shards") and hasattr(args, "nodes") and args.shards > args.nodes:
-        raise LabError("shards cannot exceed nodes")
-    if hasattr(args, "sample_interval") and (
-        not math.isfinite(args.sample_interval) or args.sample_interval <= 0
-    ):
-        raise LabError("sample interval must be finite and positive")
     if hasattr(args, "loss_percent") and args.shape_bps == 0 and args.loss_percent != 0:
         raise LabError("--loss-percent requires nonzero --shape-bps")
 

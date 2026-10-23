@@ -39,24 +39,14 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(specs), 4)
         self.assertTrue(all(spec.name.startswith("aster-lab-") for spec in specs))
 
-    def test_transfer_can_disable_restart_but_blob_cannot(self):
-        transfer = orchestrate.parser().parse_args(
-            ["self-contained", "transfer", "--restart-after-frames", "0"]
-        )
-        self.assertEqual(transfer.restart_after_frames, 0)
-        blob = orchestrate.parser().parse_args(
-            ["self-contained", "blob-recovery", "--restart-after-frames", "0"]
-        )
-        with self.assertRaises(orchestrate.LabError):
-            orchestrate.run_self_contained(blob)
 
     def test_run_command_is_pull_never_and_minimum_capability(self):
         with tempfile.TemporaryDirectory() as temporary:
             args = orchestrate.container_run_args(
                 self.context(Path(temporary)),
-                name="aster-lab-transfer",
-                role="transfer",
-                command=["transfer", "--root", "/output/run"],
+                name="aster-lab-infra",
+                role="infra",
+                command=["infra", "--rendezvous-bind", "0.0.0.0:4476"],
             )
         self.assertIn("--pull=never", args)
         self.assertIn("--cap-drop=ALL", args)
@@ -156,18 +146,6 @@ curl\t8.0
 """
             )
 
-    def test_public_provision_manifest_parser_never_requires_secret_paths(self):
-        manifest = """ASTER_LAB_NODE_MANIFEST\tversion=1\ttopic=lab.live-ip\tscope=lab/live-ip\tnodes=2
-index\tserial\tnode_id
-0\t1\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-1\t2\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-"""
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "manifest.tsv"
-            path.write_text(manifest, encoding="utf-8")
-            records = orchestrate.parse_provision_manifest(path, 2)
-        self.assertEqual(records[0]["identity"], "a" * 64)
-        self.assertNotIn("credential", records[0])
 
     def test_reopened_runner_continues_command_sequence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -294,9 +272,9 @@ index\tserial\tnode_id
             with self.assertRaises(orchestrate.LabError):
                 orchestrate.container_run_args(
                     context,
-                    name="aster-lab-transfer",
-                    role="transfer",
-                    command=["transfer", "--root", "/output/run"],
+                    name="aster-lab-infra",
+                    role="infra",
+                    command=["infra", "--rendezvous-bind", "0.0.0.0:4476"],
                 )
 
     def test_container_configuration_binds_privilege_and_exact_network_attachment(self):
@@ -539,7 +517,7 @@ index\tserial\tnode_id
             process.wait.return_value = 0
             process.returncode = 0
             with mock.patch.object(orchestrate.subprocess, "Popen", return_value=process):
-                running = runner.start(["docker", "exec", "aster-lab-resource", "workload"])
+                running = runner.start(["docker", "exec", "aster-lab-node-a", "workload"])
                 self.assertEqual(
                     (root / "command-0001.stdout").stat().st_mode & 0o777, 0o600
                 )
@@ -568,95 +546,6 @@ index\tserial\tnode_id
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(path.read_bytes(), b"")
 
-    def test_terminal_resource_sample_does_not_require_process_rss(self):
-        sample = {
-            "memory.current": "1",
-            "memory.max": str(64 * 1024 * 1024),
-            "memory.peak": "2",
-            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
-            "memory.stat": "anon 1",
-            "memory.swap.current": "0",
-            "memory.swap.max": "0",
-            "cpu.stat": "usage_usec 1",
-            "cpu.pressure_available": True,
-            "cpu.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0",
-            "io.stat": "8:0 rbytes=1 wbytes=2",
-            "pids.current": "1",
-            "pids.events": "max 0",
-            "docker_stats": {"MemUsage": "1MiB / 64MiB"},
-        }
-        orchestrate.validate_resource_sample(
-            sample, 64 * 1024 * 1024, require_process=False
-        )
-
-    def test_metrics_cross_check_is_type_strict(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            metrics_root = root / "outputs" / "scale" / "run"
-            metrics_root.mkdir(parents=True)
-            (metrics_root / "metrics.json").write_text(
-                json.dumps(
-                    {
-                        "schema": "aster-lab-metrics/v1",
-                        "converged": True,
-                        "nodes": True,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaises(orchestrate.LabError):
-                orchestrate.scenario_metrics(
-                    self.context(root), "outputs/scale/run", {"nodes": 1}
-                )
-
-    def test_resource_sample_rejects_oom_and_accepts_complete_values(self):
-        sample = {
-            "memory.current": "1",
-            "memory.max": str(64 * 1024 * 1024),
-            "memory.peak": "2",
-            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
-            "memory.stat": "anon 1",
-            "memory.swap.current": "0",
-            "memory.swap.max": "0",
-            "cpu.stat": "usage_usec 1",
-            "cpu.pressure_available": True,
-            "cpu.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0",
-            "io.stat": "8:0 rbytes=1 wbytes=2 rios=1 wios=1",
-            "pids.current": "1",
-            "pids.events": "max 0",
-            "smaps_rollup": "Rss: 1 kB",
-            "status": "Name:\taster-lab",
-            "docker_stats": {"MemUsage": "1MiB / 64MiB"},
-        }
-        orchestrate.validate_resource_sample(sample, 64 * 1024 * 1024)
-        sample["memory.events"] = "oom 1\noom_kill 0"
-        with self.assertRaises(orchestrate.LabError):
-            orchestrate.validate_resource_sample(sample, 64 * 1024 * 1024)
-
-    def test_resource_sample_accepts_explicitly_unavailable_cpu_pressure(self):
-        sample = {
-            "memory.current": "1",
-            "memory.max": str(64 * 1024 * 1024),
-            "memory.peak": "2",
-            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
-            "memory.stat": "anon 1",
-            "memory.swap.current": "0",
-            "memory.swap.max": "0",
-            "cpu.stat": "usage_usec 1",
-            "cpu.pressure_available": False,
-            "cpu.pressure": None,
-            "io.stat": "8:0 rbytes=1 wbytes=2 rios=1 wios=1",
-            "pids.current": "1",
-            "pids.events": "max 0",
-            "smaps_rollup": "Rss: 1 kB",
-            "status": "Name:\taster-lab",
-            "docker_stats": {"MemUsage": "1MiB / 64MiB"},
-        }
-        orchestrate.validate_resource_sample(sample, 64 * 1024 * 1024)
-
-    def test_resource_sample_rejects_empty_io_stat(self):
-        with self.assertRaises(orchestrate.LabError):
-            orchestrate.parse_io_stat("")
 
     def test_qdisc_validation_binds_requested_netem_parameters(self):
         value = json.dumps(
@@ -1675,7 +1564,7 @@ index\tserial\tnode_id
                 )
 
         destroyed = (
-            "SELECTED_NAT_CANARY_DESTROY status=pass version=1 "
+            "SELECTED_NAT_CANARY_DESTROY status=pass version=2 publication_journals_destroyed=2 "
             "artifact_destroyed=true global_secret_destruction=false "
             "target=private/canary.bin previous_bytes=32 previous_mode=0600 "
             f"owner_uid={os.getuid()} overwrite=zero sync=file+directory unlinked=true "

@@ -41,6 +41,9 @@ Publish a local file as a Blob. See
 Read a Blob to a new local file. See
 .BR asterctl-blob-read (1)
 .TP
+.BI client-status " --journal PATH --client-id ID"
+Observe current Event ownership without recovery or takeover.
+.TP
 .B query
 Query stored Events. See
 .BR asterctl-query (1)
@@ -103,8 +106,14 @@ Read the API token from PATH.
 Either this option or
 .B \-\-token
 is required to run a command; they cannot be used together.
+.SH NUMBERED PUBLICATION
+Use publication-init with \-\-journal PATH and \-\-client\-id ID once.
+Publish requires the same journal and stable identity. Recover uncertain work
+with publication-recover and publication-retry. Acknowledge applied results
+with publication-ack. Retry, acknowledgement, and explicit publication-abandon
+take \-\-sequence N. Initialization is local and requires no token.
 .SH OPERATION KEYS
-Publish, blob-publish, and subscribe require
+Blob-publish and subscribe require
 .BR "\-\-operation\-key KEY|auto" .
 Use an explicit key or auto to generate one.
 For retries, use the actual key from the previous attempt and the same request.

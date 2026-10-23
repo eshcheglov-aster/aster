@@ -27,18 +27,19 @@ pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
     AggregateStoreUsage, BlobStoreError, ControlPolicySnapshot, ControlTransferId,
     CustodyObjectKey, CustodyQuota, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
-    EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
-    EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
-    EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
-    EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
-    Store, StoreError, StoreLimits, StoredEvent, StoredEventTransfer,
+    EventGapScanPlan, EventQueryFilter, EventReplicationPolicySnapshot, EventSemanticId,
+    EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
+    EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome, EventSubscriptionSpec,
+    MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN, Store, StoreError,
+    StoreLimits, StoredEvent, StoredEventTransfer,
 };
 pub use aster_redb_store::{
-    CommittedEventContent, CommittedEventReceipt, EventClientId, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits,
-    EventOperationSequence, EventOperationStats, EventPublicationSession, EventRecoverySnapshot,
-    EventResultAcknowledgement, NumberedEventOperationError, NumberedEventOperationStats,
-    NumberedEventPublishOutcome, NumberedEventResult,
+    CommittedEventContent, CommittedEventReceipt, EventClientContext, EventClientDisposition,
+    EventClientId, EventClientStatus, EventOperationAbandonment, EventOperationAuditState,
+    EventOperationAuditStatus, EventOperationLimits, EventOperationSequence, EventOperationStats,
+    EventPublicationSession, EventRecoverySnapshot, EventResultAcknowledgement,
+    NumberedEventOperationError, NumberedEventOperationStats, NumberedEventPublishOutcome,
+    NumberedEventResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -47,17 +48,24 @@ use crate::{
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, EVENT_OPERATION_CONFLICT, EVENT_OPERATION_RETIRED,
-        EventEmissionPolicy, NodeCustodyClock, STORE_FILE, SelectedEventPublish,
+        EventEmissionPolicy, NodeCustodyClock, STORE_FILE, SelectedNumberedEventPublish,
         StartupEventVerification, absolute_path_from, absolute_state_path,
         cache_accepted_stored_event, drive_custody_maintenance, drive_custody_maintenance_observed,
         ensure_principal_active, ensure_state_accepts_normal_operation, event_is_inactive,
         open_startup_event_verifier_and_cache,
         prune_authenticated_event_route_cache_to_sender_projection,
-        publish_selected_event_group_once, publish_selected_event_once,
-        publish_selected_event_once_observed, refresh_application_policy,
+        publish_selected_numbered_event_group, refresh_application_policy,
         verify_content_stored_claim, verify_stored_claim,
     },
 };
+
+#[cfg(test)]
+use crate::runtime::{
+    SelectedEventPublish, publish_selected_event_group_once, publish_selected_event_once,
+    publish_selected_event_once_observed,
+};
+#[cfg(test)]
+use aster_redb_store::EventOperationKey;
 
 mod blob;
 #[cfg(test)]
@@ -262,7 +270,9 @@ impl fmt::Display for EventId {
 /// with different content fails closed. Resolution still requires the caller
 /// to remain authorized by current mission policy. [`EventPublishOptions`]
 /// supplies the additive finite-TTL path without changing this durable request.
+/// Historical unit-test fixture only; shipped node APIs publish numbered requests.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct EventPublishRequest {
     pub operation_key: Vec<u8>,
     pub predecessor: Option<EventId>,
@@ -321,8 +331,14 @@ impl EventPublicationGroupDiagnostic {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct EventPublicationGroupResult {
     pub(crate) results: Vec<Result<EventPublishResult, ApplicationError>>,
+    pub(crate) diagnostic: EventPublicationGroupDiagnostic,
+}
+
+pub(crate) struct NumberedEventPublicationGroupResult {
+    pub(crate) results: Vec<Result<NumberedEventPublishOutcome, ApplicationError>>,
     pub(crate) diagnostic: EventPublicationGroupDiagnostic,
 }
 
@@ -498,6 +514,7 @@ impl fmt::Display for EventSubscriptionId {
 /// independently permit both route verification and content opening.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventSubscriptionRequest {
+    pub client: EventClientContext,
     pub operation_key: Vec<u8>,
     pub topic: Topic,
     pub scope: Scope,
@@ -507,6 +524,7 @@ pub struct EventSubscriptionRequest {
 /// Snapshot of one local Consume subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventSubscriptionSnapshot {
+    pub owner: EventClientId,
     pub id: EventSubscriptionId,
     pub operation_key: Vec<u8>,
     pub topic: Topic,
@@ -526,8 +544,9 @@ pub struct EventSubscription {
 /// `scan_limit` bounds all pending and accepted rows freshly source-verified,
 /// not only matching rows returned. An empty page can therefore report
 /// `has_more=true`; poll again to continue from the durable internal cursor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventPollRequest {
+    pub client: EventClientContext,
     pub subscription: EventSubscriptionId,
     pub delivery_limit: usize,
     pub scan_limit: usize,
@@ -699,8 +718,18 @@ pub struct EventOperationCapacity {
 }
 
 impl EventOperationCapacity {
-    pub fn new(stats: EventOperationStats, limits: EventOperationLimits) -> Self {
-        Self::for_ledgers(stats, NumberedEventOperationStats::default(), limits)
+    /// Capacity of an explicitly inspected historical opaque-key ledger.
+    /// Normal node status uses `for_ledgers`, including an empty numbered store.
+    pub fn from_legacy_inspection(
+        stats: EventOperationStats,
+        limits: EventOperationLimits,
+    ) -> Self {
+        Self::calculate(
+            stats,
+            NumberedEventOperationStats::default(),
+            limits,
+            EventOperationLedgerMode::Legacy,
+        )
     }
 
     pub fn for_ledgers(
@@ -708,15 +737,28 @@ impl EventOperationCapacity {
         numbered_stats: NumberedEventOperationStats,
         limits: EventOperationLimits,
     ) -> Self {
+        #[cfg(test)]
+        if stats != EventOperationStats::default() {
+            return Self::from_legacy_inspection(stats, limits);
+        }
+        Self::calculate(
+            stats,
+            numbered_stats,
+            limits,
+            EventOperationLedgerMode::Numbered,
+        )
+    }
+
+    fn calculate(
+        stats: EventOperationStats,
+        numbered_stats: NumberedEventOperationStats,
+        limits: EventOperationLimits,
+        mode: EventOperationLedgerMode,
+    ) -> Self {
         const LEGACY_ACTIVE_BYTES: u64 = 162;
         const NUMBERED_RESULT_BYTES: u64 = 292;
         // EventOperationLimits construction checked both reserve arithmetic
         // and subtraction. Retained usage may exceed a lower reopened limit.
-        let mode = if numbered_stats != NumberedEventOperationStats::default() {
-            EventOperationLedgerMode::Numbered
-        } else {
-            EventOperationLedgerMode::Legacy
-        };
         let rows = match mode {
             EventOperationLedgerMode::Legacy => stats.records_total,
             EventOperationLedgerMode::Numbered => numbered_stats
@@ -835,6 +877,7 @@ impl SelectedEventHandle {
         self.mission_authority
     }
 
+    #[cfg(test)]
     pub async fn publish(
         &self,
         request: EventPublishRequest,
@@ -844,6 +887,7 @@ impl SelectedEventHandle {
     }
 
     /// Publishes with an explicit durable or finite-TTL custody policy.
+    #[cfg(test)]
     pub async fn publish_with_options(
         &self,
         request: EventPublishRequest,
@@ -970,7 +1014,38 @@ impl SelectedEventHandle {
         .await
     }
 
-    /// Lists local Consume subscriptions without polling them.
+    /// Observes client registration and ownership without claiming a session.
+    pub async fn client_status(
+        &self,
+        client: EventClientId,
+        observed_session: Option<EventPublicationSession>,
+    ) -> Result<EventClientStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::ClientStatus {
+                client,
+                observed_session,
+                response,
+            },
+            received,
+            "client_status",
+        )
+        .await
+    }
+
+    pub async fn require_client_context(
+        &self,
+        client: EventClientContext,
+    ) -> Result<(), ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::RequireClientContext { client, response },
+            received,
+            "client_status",
+        )
+        .await
+    }
+
     pub async fn list_subscriptions(
         &self,
     ) -> Result<Vec<EventSubscriptionSnapshot>, ApplicationError> {
@@ -1011,12 +1086,14 @@ impl SelectedEventHandle {
 
     pub async fn acknowledge(
         &self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         event: EventId,
     ) -> Result<EventAcknowledgement, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
             SelectedEventCommand::Acknowledge {
+                client,
                 subscription,
                 event,
                 response,
@@ -1029,11 +1106,13 @@ impl SelectedEventHandle {
 
     pub async fn unsubscribe(
         &self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
     ) -> Result<EventUnsubscribe, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
             SelectedEventCommand::Unsubscribe {
+                client,
                 subscription,
                 response,
             },
@@ -1085,9 +1164,19 @@ pub(crate) fn actor_unavailable(operation: &'static str) -> ApplicationError {
 }
 
 pub(crate) enum SelectedEventCommand {
+    ClientStatus {
+        client: EventClientId,
+        observed_session: Option<EventPublicationSession>,
+        response: oneshot::Sender<Result<EventClientStatus, ApplicationError>>,
+    },
+    RequireClientContext {
+        client: EventClientContext,
+        response: oneshot::Sender<Result<(), ApplicationError>>,
+    },
     ListSubscriptions {
         response: oneshot::Sender<Result<Vec<EventSubscriptionSnapshot>, ApplicationError>>,
     },
+    #[cfg(test)]
     Publish {
         request: EventPublishRequest,
         options: EventPublishOptions,
@@ -1135,11 +1224,13 @@ pub(crate) enum SelectedEventCommand {
         response: oneshot::Sender<Result<EventDeliveryPage, ApplicationError>>,
     },
     Acknowledge {
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         event: EventId,
         response: oneshot::Sender<Result<EventAcknowledgement, ApplicationError>>,
     },
     Unsubscribe {
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         response: oneshot::Sender<Result<EventUnsubscribe, ApplicationError>>,
     },
@@ -1159,6 +1250,7 @@ impl SelectedEventCommand {
 
     pub(crate) fn reject(self) {
         match self {
+            #[cfg(test)]
             Self::Publish { response, .. } => {
                 _ = response.send(Err(actor_unavailable("publish")));
             }
@@ -1191,6 +1283,12 @@ impl SelectedEventCommand {
             Self::Gaps { response, .. } => _ = response.send(Err(actor_unavailable("gaps"))),
             Self::ListSubscriptions { response } => {
                 _ = response.send(Err(actor_unavailable("list_subscriptions")))
+            }
+            Self::ClientStatus { response, .. } => {
+                _ = response.send(Err(actor_unavailable("client_status")))
+            }
+            Self::RequireClientContext { response, .. } => {
+                _ = response.send(Err(actor_unavailable("client_status")))
             }
             Self::Status { response } => _ = response.send(Err(actor_unavailable("status"))),
         }
@@ -1365,10 +1463,18 @@ impl SelectedEventNode {
         let state = absolute_state_path(state).map_err(|error| application_error("open", error))?;
         ensure_state_accepts_normal_operation(&state)
             .map_err(|error| application_error("open", error))?;
+        Store::require_numbered_publication_compatible(state.join(STORE_FILE))
+            .map_err(|error| application_error("open", error.into()))?;
         let mission = load_mission()?;
         fs::create_dir_all(&state).map_err(|error| application_error("open", error.into()))?;
-        let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
-            .map_err(|error| application_error("open", error.into()))?;
+        let store = Store::open_numbered_for_mission(
+            state.join(STORE_FILE),
+            aster_redb_store::StoreLimits::default(),
+            aster_redb_store::BlobDepotLimits::DEFAULT,
+            aster_redb_store::EventOperationLimits::DEFAULT,
+            mission.mission_authority_id(),
+        )
+        .map_err(|error| application_error("open", error.into()))?;
         store
             .require_process_exclusive_lock()
             .map_err(|error| application_error("open", error.into()))?;
@@ -1491,6 +1597,7 @@ impl SelectedEventNode {
         request: EventSubscriptionRequest,
     ) -> Result<EventSubscription, ApplicationError> {
         let EventSubscriptionRequest {
+            client,
             operation_key,
             topic,
             scope,
@@ -1515,6 +1622,7 @@ impl SelectedEventNode {
         let outcome = self
             .store
             .create_event_subscription_with_policy(
+                &client,
                 &policy,
                 &key,
                 EventSubscriptionSpec {
@@ -1531,13 +1639,33 @@ impl SelectedEventNode {
         })
     }
 
-    /// Lists all local Consume subscriptions in raw subscription-ID order.
+    /// Observes client registration and ownership without changing recovery state.
+    pub fn client_status(
+        &self,
+        client: &EventClientId,
+        observed_session: Option<EventPublicationSession>,
+    ) -> Result<EventClientStatus, ApplicationError> {
+        self.store
+            .event_client_status(client, observed_session)
+            .map_err(|error| application_error("client_status", error.into()))
+    }
+
+    pub fn require_client_context(
+        &self,
+        client: &EventClientContext,
+    ) -> Result<(), ApplicationError> {
+        self.store
+            .require_event_client_context(client)
+            .map_err(|error| application_error("client_status", error.into()))
+    }
+
     pub fn list_subscriptions(&self) -> Result<Vec<EventSubscriptionSnapshot>, ApplicationError> {
         self.store
             .list_event_subscriptions()
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| EventSubscriptionSnapshot {
+                        owner: row.owner,
                         id: EventSubscriptionId::from_store(row.id),
                         operation_key: row.operation_key.as_bytes().to_vec(),
                         topic: row.spec.topic,
@@ -1560,6 +1688,7 @@ impl SelectedEventNode {
         &mut self,
         request: EventPollRequest,
     ) -> Result<EventDeliveryPage, ApplicationError> {
+        self.require_client_context(&request.client)?;
         self.maintain_custody_for("poll")?;
         let request = request.validate()?;
         for _ in 0..MAX_SELECTED_EVENT_PLAN_RETRIES {
@@ -1567,6 +1696,7 @@ impl SelectedEventNode {
             let plan = self
                 .store
                 .prepare_event_subscription_poll_with_policy(
+                    &request.client,
                     &policy,
                     request.subscription.into_store(),
                     request.delivery_limit,
@@ -1656,6 +1786,7 @@ impl SelectedEventNode {
     /// Idempotently acknowledges one semantic Event delivery.
     pub fn acknowledge(
         &mut self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         event: EventId,
     ) -> Result<EventAcknowledgement, ApplicationError> {
@@ -1663,6 +1794,7 @@ impl SelectedEventNode {
         match self
             .store
             .acknowledge_event_delivery_with_policy(
+                &client,
                 &policy,
                 subscription.into_store(),
                 event.into_store(),
@@ -1679,12 +1811,13 @@ impl SelectedEventNode {
     /// Idempotently withdraws one durable receive selector and its delivery ledger.
     pub fn unsubscribe(
         &mut self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
     ) -> Result<EventUnsubscribe, ApplicationError> {
         let policy = self.current_policy("unsubscribe")?;
         let EventSubscriptionRemoveOutcome { removed, .. } = self
             .store
-            .remove_event_subscription_with_policy(&policy, subscription.into_store())
+            .remove_event_subscription_with_policy(&client, &policy, subscription.into_store())
             .map_err(|error| application_error("unsubscribe", error.into()))?;
         Ok(if removed {
             EventUnsubscribe::Removed
@@ -1752,6 +1885,7 @@ impl SelectedEventNode {
     }
 
     /// Durably publishes one arbitrary selected Event exactly once per operation key.
+    #[cfg(test)]
     pub fn publish(
         &mut self,
         request: EventPublishRequest,
@@ -1760,6 +1894,7 @@ impl SelectedEventNode {
     }
 
     /// Durably publishes with an explicit finite or durable custody lifetime.
+    #[cfg(test)]
     pub fn publish_with_options(
         &mut self,
         request: EventPublishRequest,
@@ -1769,6 +1904,7 @@ impl SelectedEventNode {
         self.publish_after_maintenance(request, options)
     }
 
+    #[cfg(test)]
     fn publish_after_maintenance(
         &mut self,
         request: EventPublishRequest,
@@ -1834,6 +1970,7 @@ impl SelectedEventNode {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_group_with_options(
         &mut self,
         publications: Vec<(EventPublishRequest, EventPublishOptions)>,
@@ -1986,6 +2123,7 @@ impl SelectedEventNode {
         }
     }
 
+    #[cfg(test)]
     fn publish_singleton_after_maintenance_observed(
         &mut self,
         request: EventPublishRequest,
@@ -2041,6 +2179,7 @@ impl SelectedEventNode {
         (result, attempt.writer_commits)
     }
 
+    #[cfg(test)]
     fn finish_published_event(
         &mut self,
         stored: StoredEvent,
@@ -2102,6 +2241,150 @@ impl SelectedEventNode {
         self.store
             .acknowledge_event_publication_result(client_id, session, sequence)
             .map_err(|error| application_error("acknowledge_publication_result", error.into()))
+    }
+
+    pub(crate) fn publish_numbered_group_with_options(
+        &mut self,
+        publications: Vec<(NumberedEventPublishRequest, EventPublishOptions)>,
+    ) -> NumberedEventPublicationGroupResult {
+        let mut diagnostic = EventPublicationGroupDiagnostic {
+            collected: publications.len() as u64,
+            ..Default::default()
+        };
+        let maintenance = drive_custody_maintenance_observed(&self.store, &self.custody_clock, &[]);
+        diagnostic.custody_writer_commits = maintenance.writer_commits;
+        if let Err(error) = maintenance.result {
+            diagnostic.failures = diagnostic.collected;
+            let error = application_error("publish_numbered", error);
+            return NumberedEventPublicationGroupResult {
+                results: publications.into_iter().map(|_| Err(error)).collect(),
+                diagnostic,
+            };
+        }
+        let mut results = Vec::with_capacity(publications.len());
+        let mut start = 0;
+        while start < publications.len() {
+            let first = &publications[start];
+            let finite = first.1.ttl_ms().is_some();
+            let mut end = start + 1;
+            if first.0.priority != Priority::Flash {
+                while end < publications.len()
+                    && publications[end].0.priority != Priority::Flash
+                    && publications[end].0.topic == first.0.topic
+                    && publications[end].0.scope == first.0.scope
+                    && publications[end].1.ttl_ms().is_some() == finite
+                {
+                    end += 1;
+                }
+            }
+            let cohort = &publications[start..end];
+            diagnostic.cohorts += 1;
+            diagnostic.max_cohort_size = diagnostic.max_cohort_size.max(cohort.len() as u64);
+            let policy = self.current_policy("publish_numbered");
+            let sample = if finite {
+                self.custody_clock.sample().ok()
+            } else {
+                None
+            };
+            let grouped = if cohort.len() > 1 && (!finite || sample.is_some()) {
+                if let Ok(policy) = policy {
+                    let selected = cohort
+                        .iter()
+                        .map(|(request, options)| SelectedNumberedEventPublish {
+                            client: &request.client_id,
+                            session: request.session,
+                            sequence: request.sequence,
+                            predecessor: request.predecessor.map(EventId::into_store),
+                            topic: &request.topic,
+                            scope: &request.scope,
+                            priority: request.priority,
+                            ttl_ms: options.ttl_ms(),
+                            custody_sample: sample,
+                            logical_key: &request.logical_key,
+                            payload: &request.payload,
+                            tombstone: request.tombstone,
+                        })
+                        .collect::<Vec<_>>();
+                    publish_selected_numbered_event_group(
+                        &self.store,
+                        &policy,
+                        &mut self.verifier,
+                        &selected,
+                        &mut diagnostic.event_writer_commits,
+                    )
+                    .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let outcomes = if let Some(outcomes) = grouped {
+                outcomes.into_iter().map(Ok).collect::<Vec<_>>()
+            } else {
+                diagnostic.singleton_fallbacks += cohort.len() as u64;
+                cohort
+                    .iter()
+                    .map(|(request, options)| {
+                        (|| {
+                            if options.ttl_ms().is_some()
+                                && !self.custody_clock.supports_finite_ttl()
+                            {
+                                return Err(ApplicationError::new(
+                                    ApplicationErrorKind::RequestRejected,
+                                    "publish_numbered",
+                                ));
+                            }
+                            let sample = self
+                                .custody_clock
+                                .sample()
+                                .map_err(|error| application_error("publish_numbered", error))?;
+                            let policy = self.current_policy("publish_numbered")?;
+                            let (outcome, commits) =
+                                crate::runtime::publish_selected_numbered_event_once_observed(
+                                    &self.store,
+                                    &policy,
+                                    &mut self.verifier,
+                                    request.clone(),
+                                    *options,
+                                    Some(sample),
+                                );
+                            diagnostic.event_writer_commits += commits;
+                            outcome.map_err(|error| application_error("publish_numbered", error))
+                        })()
+                    })
+                    .collect()
+            };
+            for outcome in outcomes {
+                match &outcome {
+                    Ok(outcome) if outcome.inserted => diagnostic.accepted_new += 1,
+                    Ok(_) => diagnostic.exact_retries += 1,
+                    Err(_) => diagnostic.failures += 1,
+                }
+                let outcome = outcome.and_then(|outcome| {
+                    let policy = self.current_policy("publish_numbered")?;
+                    if let Some(StoredEventTransfer::Accepted(stored)) = self
+                        .store
+                        .get_transfer_with_policy(&policy, outcome.result.receipt.transfer_id)
+                        .map_err(|error| application_error("publish_numbered", error.into()))?
+                    {
+                        cache_accepted_stored_event(
+                            &self.event_route_cache,
+                            &mut self.verifier,
+                            &stored,
+                        )
+                        .map_err(|error| application_error("publish_numbered", error))?;
+                    }
+                    Ok(outcome)
+                });
+                results.push(outcome);
+            }
+            start = end;
+        }
+        NumberedEventPublicationGroupResult {
+            results,
+            diagnostic,
+        }
     }
 
     pub fn publish_numbered(
@@ -2579,6 +2862,9 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
             | NumberedEventOperationError::InvalidSequence
             | NumberedEventOperationError::ClientNotFound
             | NumberedEventOperationError::ResultNotFound => ApplicationErrorKind::InvalidRequest,
+            NumberedEventOperationError::SubscriptionOwnerMismatch => {
+                ApplicationErrorKind::RequestRejected
+            }
             NumberedEventOperationError::SessionFenced => ApplicationErrorKind::SessionFenced,
             NumberedEventOperationError::IntentConflict => ApplicationErrorKind::Conflict,
             NumberedEventOperationError::SequenceRetired => ApplicationErrorKind::SequenceRetired,
@@ -3654,6 +3940,149 @@ mod tests {
         }
     }
 
+    fn random_publication_claim() -> [u8; 32] {
+        let mut claim = [0; 32];
+        getrandom::fill(&mut claim).expect("random publication claim");
+        claim
+    }
+
+    #[test]
+    fn numbered_publication_group_commits_contiguous_results_in_one_writer() {
+        let root = TestRoot::new("numbered-publication-group");
+        let mut node = selected_node(&root);
+        let client = EventClientId::new(b"group-client".to_vec()).unwrap();
+        let recovery = node
+            .begin_publication_session(&client, 0, &random_publication_claim())
+            .unwrap();
+        node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .unwrap();
+        let publications = vec![
+            (
+                numbered_request(&client, recovery.session, 1, b"first"),
+                EventPublishOptions::durable(),
+            ),
+            (
+                numbered_request(&client, recovery.session, 2, b"second"),
+                EventPublishOptions::durable(),
+            ),
+        ];
+        let group = node.publish_numbered_group_with_options(publications.clone());
+        assert_eq!(group.diagnostic.event_writer_commits, 1);
+        assert_eq!(group.diagnostic.accepted_new, 2);
+        assert_eq!(group.diagnostic.singleton_fallbacks, 0);
+        let original = group
+            .results
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert!(original.iter().all(|outcome| outcome.inserted));
+        assert_eq!(original[0].result.sequence.get(), 1);
+        assert_eq!(original[1].result.sequence.get(), 2);
+        let retry = node.publish_numbered_group_with_options(publications);
+        assert_eq!(retry.diagnostic.exact_retries, 2);
+        assert_eq!(retry.diagnostic.event_writer_commits, 0);
+        for (retry, original) in retry.results.into_iter().zip(original) {
+            let retry = retry.unwrap();
+            assert!(!retry.inserted);
+            assert_eq!(retry.result, original.result);
+        }
+    }
+
+    #[test]
+    fn numbered_group_rolls_back_before_ordered_singleton_failure_isolation() {
+        let root = TestRoot::new("numbered-group-gap");
+        let mut node = selected_node(&root);
+        let client = EventClientId::new(b"gap-client".to_vec()).unwrap();
+        let recovery = node
+            .begin_publication_session(&client, 0, &random_publication_claim())
+            .unwrap();
+        node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .unwrap();
+        let group = node.publish_numbered_group_with_options(vec![
+            (
+                numbered_request(&client, recovery.session, 1, b"first"),
+                EventPublishOptions::durable(),
+            ),
+            (
+                numbered_request(&client, recovery.session, 3, b"gap"),
+                EventPublishOptions::durable(),
+            ),
+        ]);
+        assert!(
+            group.results[0].as_ref().unwrap().inserted,
+            "failed shared transaction must not retain first Event"
+        );
+        assert_eq!(
+            group.results[1].as_ref().unwrap_err().kind(),
+            ApplicationErrorKind::SequenceGap
+        );
+        assert_eq!(group.diagnostic.singleton_fallbacks, 2);
+        let next = node
+            .publish_numbered(
+                numbered_request(&client, recovery.session, 2, b"repair"),
+                EventPublishOptions::durable(),
+            )
+            .unwrap();
+        assert!(next.inserted);
+        assert_eq!(next.result.sequence.get(), 2);
+        let page = node.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[1].event_sequence, 2);
+    }
+
+    #[test]
+    fn numbered_group_fences_stale_client_without_blocking_independent_client() {
+        let root = TestRoot::new("numbered-group-fenced");
+        let mut node = selected_node(&root);
+        let a = EventClientId::new(b"client-a".to_vec()).unwrap();
+        let b = EventClientId::new(b"client-b".to_vec()).unwrap();
+        let old_a = node
+            .begin_publication_session(&a, 0, &random_publication_claim())
+            .unwrap();
+        node.complete_publication_recovery(&a, old_a.session, old_a.snapshot_revision)
+            .unwrap();
+        let current_a = node
+            .begin_publication_session(&a, old_a.session.get(), &random_publication_claim())
+            .unwrap();
+        node.complete_publication_recovery(&a, current_a.session, current_a.snapshot_revision)
+            .unwrap();
+        let current_b = node
+            .begin_publication_session(&b, 0, &random_publication_claim())
+            .unwrap();
+        node.complete_publication_recovery(&b, current_b.session, current_b.snapshot_revision)
+            .unwrap();
+        let group = node.publish_numbered_group_with_options(vec![
+            (
+                numbered_request(&a, old_a.session, 1, b"stale"),
+                EventPublishOptions::durable(),
+            ),
+            (
+                numbered_request(&b, current_b.session, 1, b"independent"),
+                EventPublishOptions::durable(),
+            ),
+        ]);
+        assert_eq!(
+            group.results[0].as_ref().unwrap_err().kind(),
+            ApplicationErrorKind::SessionFenced
+        );
+        assert!(group.results[1].as_ref().unwrap().inserted);
+        assert_eq!(group.diagnostic.accepted_new, 1);
+        assert_eq!(group.diagnostic.failures, 1);
+        assert_eq!(group.diagnostic.event_writer_commits, 1);
+        let page = node.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].event_sequence, 1);
+        assert_eq!(page.items[0].payload, b"independent");
+        assert!(
+            node.publish_numbered(
+                numbered_request(&a, current_a.session, 1, b"current"),
+                EventPublishOptions::durable()
+            )
+            .unwrap()
+            .inserted
+        );
+    }
+
     #[test]
     fn numbered_publication_rejects_unprovisioned_topic_after_recovery() {
         let root = TestRoot::new("numbered-unprovisioned-topic");
@@ -3925,8 +4354,48 @@ mod tests {
         .expect("capacity reused after acknowledgement");
     }
 
-    fn subscription_request(operation: &[u8], topic: &str) -> EventSubscriptionRequest {
+    fn publish_owned_fixture(
+        node: &mut SelectedEventNode,
+        sequence: u64,
+        request: EventPublishRequest,
+        options: EventPublishOptions,
+    ) -> Result<EventPublishResult, ApplicationError> {
+        let context = node.store.test_event_client_context().unwrap();
+        let outcome = node.publish_numbered(
+            NumberedEventPublishRequest {
+                client_id: context.client_id,
+                session: context.session,
+                sequence: EventOperationSequence::new(sequence).unwrap(),
+                predecessor: None,
+                topic: request.topic,
+                scope: request.scope,
+                priority: request.priority,
+                logical_key: request.logical_key,
+                payload: request.payload,
+                tombstone: request.tombstone,
+            },
+            options,
+        )?;
+        let receipt = outcome.result.receipt;
+        Ok(EventPublishResult {
+            id: EventId::from_store(receipt.semantic_id),
+            publisher: node.identity(),
+            publisher_counter: sequence,
+            event_sequence: 1,
+            priority: request.priority,
+            ttl_ms: options.ttl_ms(),
+            acceptance_marker: receipt.acceptance_marker,
+            inserted: outcome.inserted,
+        })
+    }
+
+    fn subscription_request(
+        node: &SelectedEventNode,
+        operation: &[u8],
+        topic: &str,
+    ) -> EventSubscriptionRequest {
         EventSubscriptionRequest {
+            client: node.store.test_event_client_context().unwrap(),
             operation_key: operation.to_vec(),
             topic: Topic::new(topic).expect("topic"),
             scope: Scope::new("mission/apps").expect("scope"),
@@ -4296,18 +4765,24 @@ mod tests {
         let mut poll_node = selected_node(&poll_root);
         let poll_clock_id = [0x9b; 16];
         poll_node.custody_clock = NodeCustodyClock::injected(poll_clock_id, 0, 0);
-        poll_node
-            .publish_with_options(
-                request(b"ops/finite", "ops.alpha", b"asset-ttl", b"brief"),
-                EventPublishOptions::finite_ttl_ms(10).expect("positive TTL"),
-            )
-            .expect("publish finite poll Event");
+        publish_owned_fixture(
+            &mut poll_node,
+            1,
+            request(b"ops/finite", "ops.alpha", b"asset-ttl", b"brief"),
+            EventPublishOptions::finite_ttl_ms(10).expect("positive TTL"),
+        )
+        .expect("publish finite poll Event");
         let subscription = poll_node
-            .subscribe(subscription_request(b"subscriptions/finite", "ops.alpha"))
+            .subscribe(subscription_request(
+                &poll_node,
+                b"subscriptions/finite",
+                "ops.alpha",
+            ))
             .expect("subscribe finite Event");
         poll_node.custody_clock = NodeCustodyClock::injected(poll_clock_id, 9, 1);
         let polled = poll_node
             .poll(EventPollRequest {
+                client: poll_node.store.test_event_client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -4636,28 +5111,28 @@ mod tests {
     fn finite_retirement_waits_for_lease_and_operation_fence_survives_reopen() {
         let root = TestRoot::new("finite-retirement-fence");
         let clock_id = [0x8b; 16];
-        let publication = request(
-            b"ops/finite-retired",
-            "ops.alpha",
-            b"asset-retired",
-            b"short-lived",
-        );
+        let client = EventClientId::new(b"finite-lease-fixture".to_vec()).unwrap();
+        let mut session = EventPublicationSession::new(1).unwrap();
+        let mut publication = numbered_request(&client, session, 1, b"short-lived");
+        let original_receipt;
         let options = EventPublishOptions::finite_ttl_ms(10).expect("positive TTL");
         {
             let mut node = selected_node(&root);
             node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
-            node.publish_with_options(publication.clone(), options)
-                .expect("publish finite Event");
-            let operation =
-                EventOperationKey::new(publication.operation_key.clone()).expect("operation key");
-            let aster_redb_store::EventOperationResolution::Live(stored) = node
-                .store
-                .event_operation_resolution(&operation)
-                .expect("resolve operation")
-                .expect("operation exists")
-            else {
-                panic!("fresh finite operation is not live");
-            };
+            let recovery = node
+                .begin_publication_session(&client, 0, &random_publication_claim())
+                .unwrap();
+            node.complete_publication_recovery(
+                &client,
+                recovery.session,
+                recovery.snapshot_revision,
+            )
+            .unwrap();
+            session = recovery.session;
+            publication.session = session;
+            let outcome = node.publish_numbered(publication.clone(), options).unwrap();
+            original_receipt = outcome.result.receipt;
+            let transfer_id = original_receipt.transfer_id;
             let revision = node
                 .store
                 .custody_policy_revision()
@@ -4666,7 +5141,7 @@ mod tests {
                 .store
                 .begin_custody_send(
                     [0x37; 32],
-                    CustodyObjectKey::event(stored.transfer_id),
+                    CustodyObjectKey::event(transfer_id),
                     aster_redb_store::CustodyPeerSelectorRevision::new(0),
                     Some(CustodySample {
                         clock_id,
@@ -4697,16 +5172,18 @@ mod tests {
                 "expired bytes held by a lease must remain application-invisible"
             );
 
+            let retired = node.publish_numbered(publication.clone(), options).unwrap();
+            assert_eq!(retired.result.receipt, original_receipt);
             assert_eq!(
-                node.publish_with_options(publication.clone(), options)
-                    .expect_err("exact retry while the lease retains bytes")
-                    .kind(),
-                ApplicationErrorKind::ExpiredOrRetired,
+                retired.result.content,
+                aster_redb_store::CommittedEventContent::Retired(
+                    aster_redb_store::CustodyRetirementReason::Expired
+                )
             );
             let mut changed_held = publication.clone();
             changed_held.payload = b"changed-while-held".to_vec();
             assert_eq!(
-                node.publish_with_options(changed_held, options)
+                node.publish_numbered(changed_held, options)
                     .expect_err("changed retry while the lease retains bytes")
                     .kind(),
                 ApplicationErrorKind::Conflict
@@ -4715,23 +5192,13 @@ mod tests {
                 .release_transfer_lease(lease.id)
                 .expect("release held lease");
             node.maintain_custody().expect("finalize retirement");
-            assert_eq!(
-                node.store
-                    .event_operation_resolution(&operation)
-                    .expect("compact resolution"),
-                Some(
-                    aster_redb_store::EventOperationResolution::RetiredOperation {
-                        reason: aster_redb_store::CustodyRetirementReason::Expired,
-                    }
-                )
-            );
             let retired = node.store.event_stats().expect("retired Event stats");
             assert_eq!(retired.events, 0);
             assert_eq!(retired.retiring_events, 0);
             assert_eq!(retired.total_sealed_bytes, 0);
             assert!(
                 node.store
-                    .get_transfer(stored.transfer_id)
+                    .get_transfer(transfer_id)
                     .expect("retired transfer lookup")
                     .is_none()
             );
@@ -4743,29 +5210,45 @@ mod tests {
         )
         .expect("reopen retired node");
         reopened.custody_clock = NodeCustodyClock::injected(clock_id, 11, 0);
+        let recovery = reopened
+            .begin_publication_session(&client, session.get(), &random_publication_claim())
+            .unwrap();
+        reopened
+            .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .unwrap();
+        publication.session = recovery.session;
         let exact = reopened
-            .publish_with_options(publication.clone(), options)
-            .expect_err("exact retired retry must remain fenced");
-        assert_eq!(exact.kind(), ApplicationErrorKind::ExpiredOrRetired);
-
+            .publish_numbered(publication.clone(), options)
+            .unwrap();
+        assert_eq!(exact.result.receipt, original_receipt);
+        assert_eq!(
+            exact.result.content,
+            aster_redb_store::CommittedEventContent::Retired(
+                aster_redb_store::CustodyRetirementReason::Expired
+            )
+        );
         let mut changed = publication;
         changed.payload = b"changed-after-retirement".to_vec();
         let changed_error = reopened
-            .publish_with_options(changed, options)
+            .publish_numbered(changed, options)
             .expect_err("changed retired operation must remain fenced");
         assert_eq!(changed_error.kind(), ApplicationErrorKind::Conflict);
 
         let next = reopened
-            .publish(request(
-                b"ops/after-retired",
-                "ops.alpha",
-                b"asset-next",
-                b"next",
-            ))
-            .expect("publish after retired retries");
+            .publish_numbered(
+                numbered_request(&client, recovery.session, 2, b"next"),
+                EventPublishOptions::durable(),
+            )
+            .unwrap();
+        let page = reopened.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 1);
         assert_eq!(
-            next.publisher_counter, 2,
-            "retired retries must not consume a new source dot"
+            page.items[0].id,
+            EventId::from_store(next.result.receipt.semantic_id)
+        );
+        assert_eq!(
+            page.items[0].publisher_counter, 2,
+            "retired retries must not consume a source dot"
         );
     }
 
@@ -4774,40 +5257,62 @@ mod tests {
         let root = TestRoot::new("subscription-retry");
         let (subscription_id, event_id) = {
             let mut node = selected_node(&root);
-            let published = node
-                .publish(request(
-                    b"ops/subscribed",
-                    "ops.alpha",
-                    b"asset-7",
-                    b"ready",
-                ))
-                .expect("publish");
+            let client = EventClientId::new(b"subscription-fixture".to_vec()).unwrap();
+            let recovery = node
+                .begin_publication_session(&client, 0, &random_publication_claim())
+                .unwrap();
+            node.complete_publication_recovery(
+                &client,
+                recovery.session,
+                recovery.snapshot_revision,
+            )
+            .unwrap();
+            let outcome = node
+                .publish_numbered(
+                    numbered_request(&client, recovery.session, 1, b"ready"),
+                    EventPublishOptions::durable(),
+                )
+                .unwrap();
+            let event_id = EventId::from_store(outcome.result.receipt.semantic_id);
             let subscription = node
-                .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
+                .subscribe(subscription_request(
+                    &node,
+                    b"subscriptions/alpha",
+                    "ops.alpha",
+                ))
                 .expect("subscribe");
             assert!(subscription.inserted);
             let replayed = node
-                .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
+                .subscribe(subscription_request(
+                    &node,
+                    b"subscriptions/alpha",
+                    "ops.alpha",
+                ))
                 .expect("replay subscribe");
             assert!(!replayed.inserted);
             assert_eq!(replayed.id, subscription.id);
             let conflict = node
-                .subscribe(subscription_request(b"subscriptions/alpha", "ops.beta"))
+                .subscribe(subscription_request(
+                    &node,
+                    b"subscriptions/alpha",
+                    "ops.beta",
+                ))
                 .expect_err("subscription operation mismatch must fail");
             assert_eq!(conflict.kind(), ApplicationErrorKind::Conflict);
 
             let first = node
                 .poll(EventPollRequest {
+                    client: node.store.test_event_client_context().unwrap(),
                     subscription: subscription.id,
                     delivery_limit: 8,
                     scan_limit: 8,
                 })
                 .expect("first poll");
             assert_eq!(first.deliveries.len(), 1);
-            assert_eq!(first.deliveries[0].event.id, published.id);
+            assert_eq!(first.deliveries[0].event.id, event_id);
             assert_eq!(first.deliveries[0].attempt, 1);
             assert!(!first.has_more);
-            (subscription.id, published.id)
+            (subscription.id, event_id)
         };
 
         let mut reopened = SelectedEventNode::open_unprotected_reference(
@@ -4817,6 +5322,7 @@ mod tests {
         .expect("reopen selected Event node");
         let repeated = reopened
             .poll(EventPollRequest {
+                client: reopened.store.test_event_client_context().unwrap(),
                 subscription: subscription_id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -4828,19 +5334,28 @@ mod tests {
 
         assert_eq!(
             reopened
-                .acknowledge(subscription_id, event_id)
+                .acknowledge(
+                    reopened.store.test_event_client_context().unwrap(),
+                    subscription_id,
+                    event_id
+                )
                 .expect("acknowledge"),
             EventAcknowledgement::Acknowledged
         );
         assert_eq!(
             reopened
-                .acknowledge(subscription_id, event_id)
+                .acknowledge(
+                    reopened.store.test_event_client_context().unwrap(),
+                    subscription_id,
+                    event_id
+                )
                 .expect("idempotent acknowledge"),
             EventAcknowledgement::AlreadyAcknowledged
         );
         assert!(
             reopened
                 .poll(EventPollRequest {
+                    client: reopened.store.test_event_client_context().unwrap(),
                     subscription: subscription_id,
                     delivery_limit: 8,
                     scan_limit: 8,
@@ -4855,22 +5370,31 @@ mod tests {
     fn subscription_scan_advances_over_verified_nonmatching_events() {
         let root = TestRoot::new("subscription-selective-scan");
         let mut node = selected_node(&root);
-        node.publish(request(
-            b"ops/alpha-first",
-            "ops.alpha",
-            b"asset-7",
-            b"alpha",
-        ))
+        publish_owned_fixture(
+            &mut node,
+            1,
+            request(b"ops/alpha-first", "ops.alpha", b"asset-7", b"alpha"),
+            EventPublishOptions::durable(),
+        )
         .expect("publish alpha");
-        let beta = node
-            .publish(request(b"ops/beta-second", "ops.beta", b"asset-8", b"beta"))
-            .expect("publish beta");
+        let beta = publish_owned_fixture(
+            &mut node,
+            2,
+            request(b"ops/beta-second", "ops.beta", b"asset-8", b"beta"),
+            EventPublishOptions::durable(),
+        )
+        .expect("publish beta");
         let subscription = node
-            .subscribe(subscription_request(b"subscriptions/beta", "ops.beta"))
+            .subscribe(subscription_request(
+                &node,
+                b"subscriptions/beta",
+                "ops.beta",
+            ))
             .expect("subscribe beta");
 
         let first = node
             .poll(EventPollRequest {
+                client: node.store.test_event_client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 1,
                 scan_limit: 1,
@@ -4881,6 +5405,7 @@ mod tests {
 
         let second = node
             .poll(EventPollRequest {
+                client: node.store.test_event_client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 1,
                 scan_limit: 1,
@@ -4914,23 +5439,40 @@ mod tests {
 
     #[test]
     fn public_facade_restart_reuses_the_exact_durable_operation() {
-        let root = TestRoot::new("restart-operation");
-        let request = request(b"ops/restart", "ops.alpha", b"asset", b"ready");
+        use crate::publication_journal::{Intent, Journal};
+        let root = TestRoot::new("restart-numbered-publication");
+        let path = root.path().join("application.redb");
+        Journal::initialize(&path, b"restart-fixture").unwrap();
+        let intent = Intent {
+            predecessor: None,
+            topic: "ops.alpha".to_owned(),
+            scope: "mission/apps".to_owned(),
+            priority: Priority::Priority as u8,
+            logical_key: b"asset".to_vec(),
+            payload: b"ready".to_vec(),
+            tombstone: false,
+            ttl_ms: None,
+        };
         let first = {
             let mut node = selected_node(&root);
-            node.publish(request.clone()).expect("initial publication")
+            let mut journal = Journal::open(&path, b"restart-fixture").unwrap();
+            journal.recover_stopped(&mut node).unwrap();
+            journal.publish_stopped(&mut node, intent.clone()).unwrap()
         };
         let mut reopened = SelectedEventNode::open_unprotected_reference(
             root.path(),
             root.path().join("mission.unprotected-reference.bundle"),
         )
-        .expect("reopen selected Event node");
-        let retried = reopened.publish(request).expect("restart retry");
+        .unwrap();
+        let mut journal = Journal::open(&path, b"restart-fixture").unwrap();
+        journal.recover_stopped(&mut reopened).unwrap();
+        let retried = journal.publish_stopped(&mut reopened, intent).unwrap();
         assert!(!retried.inserted);
-        assert_eq!(retried.id, first.id);
-        assert_eq!(retried.publisher_counter, first.publisher_counter);
-        assert_eq!(retried.event_sequence, first.event_sequence);
-        assert_eq!(retried.acceptance_marker, first.acceptance_marker);
+        assert_eq!(retried.result.receipt, first.result.receipt);
+        let page = reopened.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].publisher_counter, 1);
+        assert_eq!(page.items[0].event_sequence, 1);
     }
 
     #[test]
@@ -4961,6 +5503,7 @@ mod tests {
         let mut node = selected_node(&root);
         let denied_subscription = node
             .subscribe(subscription_request(
+                &node,
                 b"subscriptions/denied",
                 "ops.unprovisioned",
             ))
@@ -4985,9 +5528,13 @@ mod tests {
             assert!(!rendered.contains("ops.unprovisioned"));
             assert!(!rendered.contains("transfer"));
         }
-        let accepted = node
-            .publish(request(b"ops/accepted", "ops.alpha", b"asset", b"accepted"))
-            .expect("authorized Event");
+        let accepted = publish_owned_fixture(
+            &mut node,
+            1,
+            request(b"ops/accepted", "ops.alpha", b"asset", b"accepted"),
+            EventPublishOptions::durable(),
+        )
+        .expect("authorized Event");
         assert_eq!(accepted.publisher_counter, 1);
         assert_eq!(accepted.event_sequence, 1);
         assert_eq!(accepted.acceptance_marker, 1);

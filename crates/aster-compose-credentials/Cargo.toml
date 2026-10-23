@@ -32,5 +32,9 @@ sha2.workspace = true
 zeroize.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+aho-corasick.workspace = true
+memchr.workspace = true
+
 [lints]
 workspace = true

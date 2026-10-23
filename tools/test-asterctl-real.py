@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -66,70 +67,80 @@ class RealAgentTest(unittest.TestCase):
                     self.assertTrue(cli("status").stdout)
                     self.assertEqual(cli("subscriptions").stdout, b"")
                     self.assertEqual(json.loads(cli("subscriptions", "--json").stdout), [])
-                    publish = ["--json", "publish", "--topic", "chat.events",
-                               "--scope", "mission/team/alpha", "--operation-key", "cli-smoke-publish",
-                               "--ttl-ms", "60000", "asterctl upstream smoke"]
+                    publication = ["--journal", str(root / "publication.redb"), "--client-id", "cli-smoke-source"]
+                    cli("publication-init", *publication)
+                    publish = ["--json", "publish", *publication, "--topic", "chat.events",
+                               "--scope", "mission/team/alpha"]
+                    finite = sys.platform == "linux"
+                    if finite:
+                        publish += ["--ttl-ms", "60000"]
+                    publish += ["asterctl upstream smoke"]
                     first = json.loads(cli(*publish).stdout)
-                    replay = json.loads(cli(*publish).stdout)
+                    replay = json.loads(cli("--json", "publication-retry", *publication, "--sequence", "1").stdout)
                     self.assertTrue(first["inserted"])
-                    self.assertFalse(replay["inserted"])
-                    self.assertEqual(first["id"], replay["id"])
-                    self.assertEqual(first["ttlMs"], "60000")
-                    self.assertEqual(first["operation_key"], "cli-smoke-publish")
-                    blob_payload = bytes(range(256)) * 257 + b"multi-page-tail"
-                    blob_source = root / "durable-blob.bin"
-                    blob_source.write_bytes(blob_payload)
-                    durable_blob = ["--json", "blob-publish", "--file", str(blob_source),
-                                    "--topic", "chat.events", "--scope", "mission/team/alpha",
-                                    "--operation-key", "cli-smoke-blob-durable"]
-                    durable_first = json.loads(cli(*durable_blob).stdout)
-                    durable_retry = json.loads(cli(*durable_blob).stdout)
-                    self.assertTrue(durable_first["inserted"])
-                    self.assertFalse(durable_retry["inserted"])
-                    self.assertEqual(durable_first["id"], durable_retry["id"])
-                    self.assertNotIn("ttlMs", durable_first)
-                    durable_output = root / "durable-output.bin"
-                    durable_read = json.loads(cli(
-                        "--json", "blob-read", "--id", durable_first["id"],
-                        "--topic", "chat.events", "--scope", "mission/team/alpha",
-                        "--output", str(durable_output)).stdout)
-                    self.assertEqual(durable_output.read_bytes(), blob_payload)
-                    self.assertEqual(durable_read["id"], durable_first["id"])
-                    self.assertNotIn("ttlMs", durable_read)
+                    self.assertEqual(first["result"], replay)
+                    self.assertEqual(first["result"]["operationSequence"], "1")
+                    if sys.platform == "linux":
+                        blob_payload = bytes(range(256)) * 257 + b"multi-page-tail"
+                        blob_source = root / "durable-blob.bin"
+                        blob_source.write_bytes(blob_payload)
+                        durable_blob = ["--json", "blob-publish", "--file", str(blob_source),
+                                        "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                        "--operation-key", "cli-smoke-blob-durable"]
+                        durable_first = json.loads(cli(*durable_blob).stdout)
+                        durable_retry = json.loads(cli(*durable_blob).stdout)
+                        self.assertTrue(durable_first["inserted"])
+                        self.assertFalse(durable_retry["inserted"])
+                        self.assertEqual(durable_first["id"], durable_retry["id"])
+                        self.assertNotIn("ttlMs", durable_first)
+                        durable_output = root / "durable-output.bin"
+                        durable_read = json.loads(cli(
+                            "--json", "blob-read", "--id", durable_first["id"],
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--output", str(durable_output)).stdout)
+                        self.assertEqual(durable_output.read_bytes(), blob_payload)
+                        self.assertEqual(durable_read["id"], durable_first["id"])
+                        self.assertNotIn("ttlMs", durable_read)
 
-                    finite_source = root / "finite-blob.bin"
-                    finite_source.write_bytes(blob_payload + b"finite")
-                    finite_blob = json.loads(cli(
-                        "--json", "blob-publish", "--file", str(finite_source),
-                        "--topic", "chat.events", "--scope", "mission/team/alpha",
-                        "--operation-key", "cli-smoke-blob-finite", "--ttl-ms", "60000").stdout)
-                    self.assertEqual(finite_blob["ttlMs"], "60000")
-                    finite_output = root / "finite-output.bin"
-                    finite_read = json.loads(cli(
-                        "--json", "blob-read", "--id", finite_blob["id"],
-                        "--topic", "chat.events", "--scope", "mission/team/alpha",
-                        "--output", str(finite_output)).stdout)
-                    self.assertEqual(finite_output.read_bytes(), blob_payload + b"finite")
-                    self.assertEqual(finite_read["ttlMs"], "60000")
+                        finite_source = root / "finite-blob.bin"
+                        finite_source.write_bytes(blob_payload + b"finite")
+                        finite_blob = json.loads(cli(
+                            "--json", "blob-publish", "--file", str(finite_source),
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--operation-key", "cli-smoke-blob-finite", "--ttl-ms", "60000").stdout)
+                        self.assertEqual(finite_blob["ttlMs"], "60000")
+                        finite_output = root / "finite-output.bin"
+                        finite_read = json.loads(cli(
+                            "--json", "blob-read", "--id", finite_blob["id"],
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--output", str(finite_output)).stdout)
+                        self.assertEqual(finite_output.read_bytes(), blob_payload + b"finite")
+                        self.assertEqual(finite_read["ttlMs"], "60000")
 
-                    no_clobber = root / "existing-output.bin"
-                    no_clobber.write_bytes(b"sentinel")
-                    refused = cli("blob-read", "--id", durable_first["id"],
-                                  "--topic", "chat.events", "--scope", "mission/team/alpha",
-                                  "--output", str(no_clobber), success=False)
-                    self.assertNotEqual(refused.returncode, 0)
-                    self.assertEqual(no_clobber.read_bytes(), b"sentinel")
-                    zero_ttl = cli("blob-publish", "--file", str(blob_source),
-                                   "--topic", "chat.events", "--scope", "mission/team/alpha",
-                                   "--operation-key", "cli-smoke-blob-zero", "--ttl-ms", "0",
-                                   success=False)
-                    self.assertNotEqual(zero_ttl.returncode, 0)
-                    self.assertIn(b"TTL must be an integer from 1", zero_ttl.stderr)
+                        no_clobber = root / "existing-output.bin"
+                        no_clobber.write_bytes(b"sentinel")
+                        refused = cli("blob-read", "--id", durable_first["id"],
+                                      "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                      "--output", str(no_clobber), success=False)
+                        self.assertNotEqual(refused.returncode, 0)
+                        self.assertEqual(no_clobber.read_bytes(), b"sentinel")
+                        zero_ttl = cli("blob-publish", "--file", str(blob_source),
+                                       "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                       "--operation-key", "cli-smoke-blob-zero", "--ttl-ms", "0",
+                                       success=False)
+                        self.assertNotEqual(zero_ttl.returncode, 0)
+                        self.assertIn(b"TTL must be an integer from 1", zero_ttl.stderr)
                     events = json.loads(cli("--json", "query", "--topic", "chat.events",
                                             "--scope", "mission/team/*", "--limit", "1").stdout)
                     self.assertEqual(len(events), 1)
+                    self.assertEqual(first["result"]["receipt"]["eventId"], events[0]["id"])
+                    if finite:
+                        self.assertEqual(events[0]["ttlMs"], "60000")
+                    else:
+                        self.assertNotIn("ttlMs", events[0])
                     self.assertEqual(base64.b64decode(events[0]["payload"]), b"asterctl upstream smoke")
-                    subscription = ["--json", "subscribe", "--scope", "mission/team/alpha",
+                    cli("publication-ack", *publication, "--sequence", "1")
+                    subscription = ["--json", "subscribe", *publication, "--scope", "mission/team/alpha",
                                     "--operation-key", "cli-smoke-subscribe", "chat.events"]
                     created = json.loads(cli(*subscription).stdout)
                     repeated = json.loads(cli(*subscription).stdout)
@@ -139,7 +150,7 @@ class RealAgentTest(unittest.TestCase):
                     self.assertEqual(len(base64.b64decode(created["subscriptionId"])), 32)
                     self.assertEqual(created["operation_key"], "cli-smoke-subscribe")
                     descendant = json.loads(cli(
-                        "subscribe", "chat.events", "--scope=mission/team/alpha/*",
+                        "subscribe", *publication, "chat.events", "--scope=mission/team/alpha/*",
                         "--operation-key=cli-smoke-descendant", "--json").stdout)
                     listed = json.loads(cli("subscriptions", "--json").stdout)
                     expected = [
@@ -160,22 +171,22 @@ class RealAgentTest(unittest.TestCase):
                     self.assertIn('"cli-smoke-descendant"', text)
                     for row in expected:
                         self.assertIn(row["subscriptionId"], text)
-                    removed = cli("unsubscribe", created["subscriptionId"])
+                    removed = cli("unsubscribe", *publication, created["subscriptionId"])
                     self.assertEqual(removed.stdout, b"Subscription removed\n")
                     remaining = json.loads(cli("subscriptions", "--json").stdout)
                     self.assertEqual(remaining, [row for row in expected
                                                 if row["subscriptionId"] != created["subscriptionId"]])
-                    self.assertEqual(json.loads(cli("unsubscribe", created["subscriptionId"],
+                    self.assertEqual(json.loads(cli("unsubscribe", *publication, created["subscriptionId"],
                                                     "--json").stdout), {"alreadyAbsent": True})
-                    self.assertEqual(json.loads(cli("unsubscribe", descendant["subscriptionId"],
+                    self.assertEqual(json.loads(cli("unsubscribe", *publication, descendant["subscriptionId"],
                                                     "--json").stdout), {"alreadyAbsent": False})
-                    self.assertEqual(cli("unsubscribe", descendant["subscriptionId"]).stdout,
+                    self.assertEqual(cli("unsubscribe", *publication, descendant["subscriptionId"]).stdout,
                                      b"Subscription already absent\n")
                     self.assertEqual(json.loads(cli("subscriptions", "--json").stdout), [])
                     # Replace only the temporary fixture token file, not the agent's in-memory token.
                     Path(config["credentials"]["client_token_file"]).write_text("incorrect-test-token-" * 3)
                     for arguments in (("status",), ("subscriptions",),
-                                      ("unsubscribe", created["subscriptionId"])):
+                                      ("unsubscribe", *publication, created["subscriptionId"])):
                         denied = cli(*arguments, success=False)
                         self.assertEqual(denied.returncode, 1)
                         self.assertEqual(denied.stdout, b"")

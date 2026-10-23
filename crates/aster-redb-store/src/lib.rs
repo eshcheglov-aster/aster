@@ -18,10 +18,10 @@
 //! [`StoreLimits`] bound aggregate redb rows and charged logical payload bytes
 //! across the accounted namespaces. Charged bytes are physical accounted bytes
 //! plus the exact future retirement-growth reserve for active Blob operations.
-//! Permanent schema-v3 Event operations are
-//! excluded from that ordinary quota and bounded by [`EventOperationLimits`],
-//! while legacy Event-operation rows remain ordinary-accounted until atomic
-//! migration makes v3 authoritative. Both quotas remain part of deployment's
+//! Numbered Event client and sparse-result rows are separately bounded by
+//! [`EventOperationLimits`]. Normal nodes refuse nonempty legacy Event publication
+//! ledgers before repair or migration; inspection and writer fixtures remain
+//! available for historical evidence. Both quotas remain part of deployment's
 //! total logical state-allocation calculation. Selector/delivery/custody ledgers
 //! have separate caps, while accepted-dot and causal-frontier aggregate
 //! retirement remains an explicit open boundary. [`BlobDepotLimits`] separately
@@ -292,10 +292,10 @@ const RECORD_METADATA_VERSION: u8 = 1;
 const RECORD_OPERATION_VERSION: u8 = 1;
 const RECORD_PUBLICATION_INTENT_DOMAIN: &[u8] = b"aster/record-publication-intent/v1";
 const RECORD_RESOLUTION_INTENT_DOMAIN: &[u8] = b"aster/record-resolution-intent/v1";
-const EVENT_SUBSCRIPTION_VERSION: u8 = 1;
+const EVENT_SUBSCRIPTION_VERSION: u8 = 2;
 const EVENT_PENDING_DELIVERY_VERSION: u8 = 1;
 const EVENT_ACKNOWLEDGEMENT_VERSION: u8 = 1;
-const EVENT_SUBSCRIPTION_ID_DOMAIN: &[u8] = b"aster/event-subscription-id/v1";
+const EVENT_SUBSCRIPTION_ID_DOMAIN: &[u8] = b"aster/client-event-subscription-id/v2";
 const LEGACY_CONTROL_METADATA_VERSION: u8 = 1;
 const CONTROL_METADATA_VERSION: u8 = 2;
 const CONTROL_RESERVATION_VERSION: u8 = 1;
@@ -1287,7 +1287,9 @@ impl EventPublicationIntent {
     }
 }
 
+/// Historical opaque-key writer fixture; unavailable in normal store builds.
 /// Exact borrowed inputs for one atomic idempotent Event commit.
+#[cfg(any(test, feature = "test-utils"))]
 pub struct EventOperationRequest<'a> {
     operation: &'a EventOperationKey,
     intent: &'a EventPublicationIntent,
@@ -1347,6 +1349,7 @@ impl LocalCustodyCheckpoint {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl<'a> EventOperationRequest<'a> {
     /// Binds an operation key, stable intent, exact plaintext, and optional
     /// authenticated reaction predecessor.
@@ -1800,6 +1803,8 @@ pub enum EventSubscriptionMode {
 /// One local Consume subscription, excluding delivery progress.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventSubscriptionSnapshot {
+    /// Stable owning application client, independent of session rollover.
+    pub owner: EventClientId,
     /// Stable subscription identity.
     pub id: EventSubscriptionId,
     /// Exact application operation key.
@@ -1971,6 +1976,7 @@ pub struct EventPendingDeliveryCandidate {
 /// policy, cursor, pending attempts, and the exact structural selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventSubscriptionPollPlan {
+    context: EventClientContext,
     subscription: EventSubscriptionId,
     spec: EventSubscriptionSpec,
     expected_discovered_through: u64,
@@ -2941,6 +2947,7 @@ impl EventOnceCommitAttempt {
 
 /// One already-reserved, source-verified ordinary Event operation prepared for
 /// an ordered durable group commit.
+#[cfg(any(test, feature = "test-utils"))]
 pub struct ReservedEventOnceCommit<'a> {
     request: &'a EventOperationRequest<'a>,
     reservation: &'a EventReservation,
@@ -2948,6 +2955,7 @@ pub struct ReservedEventOnceCommit<'a> {
     sealed: &'a [u8],
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl<'a> ReservedEventOnceCommit<'a> {
     /// Binds one operation request to its exact reservation and verified bytes.
     pub const fn new(
@@ -2967,11 +2975,13 @@ impl<'a> ReservedEventOnceCommit<'a> {
 
 /// Ordered outcomes and exact redb writer-commit count for one Event cohort.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct EventGroupCommitOutcome {
     outcomes: Vec<EventOnceOutcome>,
     writer_commits: u64,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl EventGroupCommitOutcome {
     /// Returns outcomes in the same order as the submitted cohort.
     pub fn outcomes(&self) -> &[EventOnceOutcome] {
@@ -2985,6 +2995,56 @@ impl EventGroupCommitOutcome {
 
     /// Consumes the group result and returns its ordered per-Event outcomes.
     pub fn into_outcomes(self) -> Vec<EventOnceOutcome> {
+        self.outcomes
+    }
+}
+
+/// One already-reserved, source-verified numbered Event operation prepared for
+/// an ordered durable group commit.
+pub struct ReservedNumberedEventCommit<'a> {
+    request: &'a NumberedEventOperationRequest<'a>,
+    reservation: &'a EventReservation,
+    event: &'a ContentVerifiedEventEnvelope,
+    sealed: &'a [u8],
+}
+
+impl<'a> ReservedNumberedEventCommit<'a> {
+    /// Binds one operation request to its exact reservation and verified bytes.
+    pub const fn new(
+        request: &'a NumberedEventOperationRequest<'a>,
+        reservation: &'a EventReservation,
+        event: &'a ContentVerifiedEventEnvelope,
+        sealed: &'a [u8],
+    ) -> Self {
+        Self {
+            request,
+            reservation,
+            event,
+            sealed,
+        }
+    }
+}
+
+/// Ordered outcomes and exact redb writer-commit count for one Event cohort.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NumberedEventGroupCommitOutcome {
+    outcomes: Vec<NumberedEventPublishOutcome>,
+    writer_commits: u64,
+}
+
+impl NumberedEventGroupCommitOutcome {
+    /// Returns outcomes in the same order as the submitted cohort.
+    pub fn outcomes(&self) -> &[NumberedEventPublishOutcome] {
+        &self.outcomes
+    }
+
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the group result and returns its ordered per-Event outcomes.
+    pub fn into_outcomes(self) -> Vec<NumberedEventPublishOutcome> {
         self.outcomes
     }
 }
@@ -4914,6 +4974,7 @@ struct PendingRecordOperation<'a> {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(test, feature = "test-utils"))]
 struct PendingOperation<'a> {
     key: &'a EventOperationKey,
     predecessor: Option<EventSemanticId>,
@@ -4922,6 +4983,7 @@ struct PendingOperation<'a> {
 
 #[derive(Clone, Copy)]
 enum PendingEventOperation<'a> {
+    #[cfg(any(test, feature = "test-utils"))]
     Legacy(PendingOperation<'a>),
     Numbered(numbered_event_operation::PendingNumberedEventOperation<'a>),
 }
@@ -4929,6 +4991,7 @@ enum PendingEventOperation<'a> {
 impl PendingEventOperation<'_> {
     const fn predecessor(self) -> Option<EventSemanticId> {
         match self {
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Legacy(operation) => operation.predecessor,
             Self::Numbered(operation) => operation.predecessor,
         }
@@ -4945,6 +5008,7 @@ struct PendingEventCustody {
 enum EventCommitResult {
     Retained(EventCommit),
     RetiredOperation {
+        #[cfg(any(test, feature = "test-utils"))]
         reason: CustodyRetirementReason,
     },
     Numbered {
@@ -4978,14 +5042,25 @@ pub struct NumberedEventPublishOutcome {
     pub inserted: bool,
 }
 
+/// One numbered publication attempt, including writer commits made before an error.
+pub struct NumberedEventCommitAttempt {
+    pub result: Result<NumberedEventPublishOutcome, StoreError>,
+    pub writer_commits: u64,
+}
+
 struct EventCommit {
+    #[cfg(any(test, feature = "test-utils"))]
     transfer_id: EventTransferId,
+    #[cfg(any(test, feature = "test-utils"))]
     semantic_id: EventSemanticId,
     apply: ApplyOutcome,
+    #[cfg(any(test, feature = "test-utils"))]
     operation_existing: bool,
+    #[cfg(any(test, feature = "test-utils"))]
     retirement: Option<CustodyRetirementReason>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn event_once_outcome(result: EventCommitResult) -> Result<EventOnceOutcome, StoreError> {
     let committed = match result {
         EventCommitResult::Retained(committed) => committed,
@@ -5091,6 +5166,7 @@ struct OperationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EventSubscriptionRecord {
+    owner: EventClientId,
     operation_key: EventSubscriptionKey,
     spec: EventSubscriptionSpec,
     discovered_through: u64,
@@ -5387,6 +5463,77 @@ fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreE
     validate_nonempty_store_backing(open_store_backing_file(path, false, false)?)
 }
 
+struct PublicationPreflightTemporary(Option<PathBuf>);
+
+impl Drop for PublicationPreflightTemporary {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn reject_legacy_publication_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    for definition in [
+        EVENT_OPERATIONS,
+        EVENT_OPERATION_WITNESSES,
+        event_operation::EVENT_OPERATION_LEDGER_V3,
+        event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
+    ] {
+        if names.contains(definition.name()) && read.open_table(definition)?.len()? != 0 {
+            return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+        }
+    }
+    reject_legacy_subscriptions_read(read)
+}
+
+fn reject_legacy_subscriptions_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if read.list_multimap_tables()?.any(|table| {
+        [
+            EVENT_SUBSCRIPTIONS.name(),
+            EVENT_SUBSCRIPTION_PENDING.name(),
+            EVENT_DELIVERY_ACKNOWLEDGEMENTS.name(),
+        ]
+        .contains(&table.name())
+    }) {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription schema has the wrong table kind",
+        ));
+    }
+    for definition in [EVENT_SUBSCRIPTION_PENDING, EVENT_DELIVERY_ACKNOWLEDGEMENTS] {
+        if !names.contains(EVENT_SUBSCRIPTIONS.name())
+            && names.contains(definition.name())
+            && read.open_table(definition)?.len()? != 0
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event delivery state has no owned subscription table",
+            ));
+        }
+    }
+    if names.contains(EVENT_SUBSCRIPTIONS.name()) {
+        let rows = read.open_table(EVENT_SUBSCRIPTIONS)?;
+        if rows.len()? > MAX_EVENT_SUBSCRIPTIONS {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscriptions exceed their safety cap",
+            ));
+        }
+        for row in rows.iter()? {
+            let (_, value) = row?;
+            let record = decode_event_subscription_record(value.value())?;
+            numbered_event_operation::require_owner_registered_read(read, &record.owner)?;
+        }
+    }
+    Ok(())
+}
+
 fn open_read_only_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
     validate_nonempty_store_backing(open_store_backing_file(path, false, true)?)
 }
@@ -5647,6 +5794,7 @@ impl Store {
             BlobLeaseLimits::default(),
             Some(binding.mission_authority),
             Some(expectation),
+            false,
         )?;
         debug_assert_eq!(store.mission_authority, Some(binding.mission_authority));
         Ok(store)
@@ -5775,9 +5923,128 @@ impl Store {
             blob_lease_limits,
             Some(mission_authority),
             None,
+            false,
         )?;
         debug_assert_eq!(store.mission_authority, Some(mission_authority));
         Ok(store)
+    }
+
+    /// Normal numbered-only node open. Read-only preflight precedes repair or migration,
+    /// and the exact acquired writer repeats the legacy-table refusal before any mutation.
+    pub fn open_numbered_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        Self::open_numbered_with_all_limits_and_blob_lease_limits_for_mission(
+            path,
+            limits,
+            blob_depot_limits,
+            operation_limits,
+            BlobLifecycleLimits::default(),
+            BlobLeaseLimits::default(),
+            mission_authority,
+        )
+    }
+
+    /// Opens a numbered-only store with explicit Blob lifecycle and lease limits.
+    pub fn open_numbered_with_all_limits_and_blob_lease_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
+        blob_lifecycle_limits: BlobLifecycleLimits,
+        blob_lease_limits: BlobLeaseLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        Self::require_numbered_publication_compatible(path)?;
+        Self::open_with_limits_internal(
+            path,
+            limits,
+            blob_depot_limits,
+            operation_limits,
+            blob_lifecycle_limits,
+            blob_lease_limits,
+            Some(mission_authority),
+            None,
+            true,
+        )
+    }
+
+    /// Refuses pre-numbered Event publication ledgers without modifying their bytes.
+    /// Call before a normal node open, schema migration, maintenance, identity or network startup.
+    /// Historical stores remain available to the explicit read-only inspection APIs.
+    pub fn require_numbered_publication_compatible(
+        path: impl AsRef<Path>,
+    ) -> Result<(), StoreError> {
+        Self::require_store_compatible(path, reject_legacy_publication_read)
+    }
+
+    fn require_store_compatible(
+        path: impl AsRef<Path>,
+        check: fn(&redb::ReadTransaction) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(StoreError::StorePath(error)),
+            Ok(_) => {}
+        }
+        let mut backing = open_read_only_store_backing(path)?;
+        match redb::Builder::new().open_read_only(path) {
+            Ok(database) => check(&database.begin_read()?)?,
+            Err(error) => {
+                let error = StoreError::from(error);
+                if !error.is_read_only_repair_required() {
+                    return Err(error);
+                }
+                // An unclean redb allocator cannot be inspected through a read-only
+                // handle. Repair an owner-only disposable copy, never the original,
+                // so crash recovery does not bypass the legacy refusal boundary.
+                let mut nonce = [0_u8; 16];
+                getrandom::fill(&mut nonce).map_err(|_| {
+                    StoreError::StoreBackingInvariant(
+                        "publication preflight random source unavailable",
+                    )
+                })?;
+                let suffix = nonce
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let temporary_path =
+                    std::env::temp_dir().join(format!("aster-publication-preflight-{suffix}.redb"));
+                let mut temporary = open_store_backing_file(&temporary_path, true, false)?;
+                let mut cleanup = PublicationPreflightTemporary(Some(temporary_path.clone()));
+                #[cfg(unix)]
+                {
+                    std::fs::remove_file(&temporary_path).map_err(StoreError::StorePath)?;
+                    cleanup.0 = None;
+                }
+                let copied = std::io::copy(
+                    &mut std::io::Read::take(&mut backing.file, backing.length.saturating_add(1)),
+                    &mut temporary.file,
+                )
+                .map_err(StoreError::StorePath)?;
+                if copied != backing.length {
+                    return Err(StoreError::StoreBackingInvariant(
+                        "publication preflight source length changed",
+                    ));
+                }
+                let database = redb::Builder::new().create_file(temporary.file)?;
+                check(&database.begin_read()?)?;
+                drop(database);
+                drop(cleanup);
+            }
+        }
+        if backing.identity != open_read_only_store_backing(path)?.identity {
+            return Err(StoreError::StoreBackingInvariant(
+                "publication preflight backing identity changed",
+            ));
+        }
+        Ok(())
     }
 
     /// Opens and audits an existing store without creating, repairing, or writing it.
@@ -5879,6 +6146,7 @@ impl Store {
             BlobLeaseLimits::default(),
             None,
             None,
+            false,
         )
     }
 
@@ -5892,8 +6160,10 @@ impl Store {
         blob_lease_limits: BlobLeaseLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
+        numbered_publication_only: bool,
     ) -> Result<Self, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
+        Self::require_store_compatible(&path, reject_legacy_subscriptions_read)?;
         if path.exists() {
             match reject_terminal_normal_open(&path) {
                 Ok(()) => match inspect_control_state_read_only(&path) {
@@ -5908,6 +6178,22 @@ impl Store {
         let (database, backing_identity) = open_or_create_store_database(&path)?;
 
         let write = database.begin_write()?;
+        if numbered_publication_only {
+            let names = write
+                .list_tables()?
+                .map(|table| table.name().to_owned())
+                .collect::<std::collections::BTreeSet<_>>();
+            for definition in [
+                EVENT_OPERATIONS,
+                EVENT_OPERATION_WITNESSES,
+                event_operation::EVENT_OPERATION_LEDGER_V3,
+                event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
+            ] {
+                if names.contains(definition.name()) && write.open_table(definition)?.len()? != 0 {
+                    return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+                }
+            }
+        }
         // Recheck under the exact writer transaction before opening any table.
         // This closes the gap between the read-only startup check and migration.
         enforce_live_write(&write)?;
@@ -6599,6 +6885,85 @@ impl Store {
         Ok(())
     }
 
+    /// Observes ownership without taking over or changing publication/recovery state.
+    pub fn event_client_status(
+        &self,
+        client: &EventClientId,
+        observed_session: Option<EventPublicationSession>,
+    ) -> Result<EventClientStatus, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let (current_session, disposition) =
+            numbered_event_operation::client_disposition_read(&read, client, observed_session)?;
+        if current_session.is_none() {
+            return Ok(EventClientStatus {
+                current_session: None,
+                disposition,
+                subscriptions: 0,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                ownership_metadata_bytes: 0,
+            });
+        }
+        let table = read.open_table(EVENT_SUBSCRIPTIONS)?;
+        if table.len()? > MAX_EVENT_SUBSCRIPTIONS {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscriptions exceed their safety cap",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut ownership_metadata_bytes = 0;
+        for row in table.iter()? {
+            let (id, value) = row?;
+            let record = decode_event_subscription_record(value.value())?;
+            numbered_event_operation::require_owner_registered_read(&read, &record.owner)?;
+            let subscription = parse_event_subscription_id(id.value())?;
+            if event_subscription_id(authority, &record.owner, &record.operation_key)
+                != subscription
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event subscription identifier differs from its owner and operation key",
+                ));
+            }
+            if &record.owner == client {
+                ids.insert(subscription);
+                ownership_metadata_bytes += 1 + record.owner.as_bytes().len() as u64;
+            }
+        }
+        let pending = read.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+        let acknowledgements = read.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        if pending.len()? > MAX_EVENT_PENDING_DELIVERIES
+            || acknowledgements.len()? > MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event delivery rows exceed their safety cap",
+            ));
+        }
+        let mut pending_deliveries = 0;
+        for row in pending.iter()? {
+            let (key, _) = row?;
+            if ids.contains(&parse_event_pending_delivery_key(key.value())?.0) {
+                pending_deliveries += 1;
+            }
+        }
+        let mut acknowledged_deliveries = 0;
+        for row in acknowledgements.iter()? {
+            let (key, _) = row?;
+            if ids.contains(&parse_event_acknowledgement_key(key.value())?.0) {
+                acknowledged_deliveries += 1;
+            }
+        }
+        Ok(EventClientStatus {
+            current_session,
+            disposition,
+            subscriptions: ids.len() as u64,
+            pending_deliveries,
+            acknowledged_deliveries,
+            ownership_metadata_bytes,
+        })
+    }
+
     /// Returns structurally audited Event subscription counts.
     pub fn event_subscription_stats(&self) -> Result<EventSubscriptionStats, StoreError> {
         self.require_bound_mission()?;
@@ -6659,7 +7024,8 @@ impl Store {
             let (key, value) = row?;
             let id = parse_event_subscription_id(key.value())?;
             let record = decode_event_subscription_record(value.value())?;
-            if event_subscription_id(authority, &record.operation_key) != id {
+            numbered_event_operation::require_owner_registered_read(&read, &record.owner)?;
+            if event_subscription_id(authority, &record.owner, &record.operation_key) != id {
                 return Err(StoreError::SemanticInvariant(
                     "Event subscription identifier differs from its operation key",
                 ));
@@ -6674,6 +7040,7 @@ impl Store {
             }
             if record.spec.mode == EventSubscriptionMode::Consume {
                 snapshot.push(EventSubscriptionSnapshot {
+                    owner: record.owner.clone(),
                     id,
                     operation_key: record.operation_key,
                     spec: record.spec,
@@ -6686,15 +7053,17 @@ impl Store {
     /// Idempotently creates one durable Consume or Carry Event selector.
     pub fn create_event_subscription_with_policy(
         &self,
+        context: &EventClientContext,
         policy: &ControlPolicySnapshot,
         key: &EventSubscriptionKey,
         spec: EventSubscriptionSpec,
     ) -> Result<EventSubscriptionCreateOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        let id = event_subscription_id(authority, key);
+        let id = event_subscription_id(authority, &context.client_id, key);
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        numbered_event_operation::require_client_context_write(&write, context)?;
         require_control_policy_write(&write, authority, policy)?;
         let existing = write
             .open_table(EVENT_SUBSCRIPTIONS)?
@@ -6726,6 +7095,7 @@ impl Store {
             });
         }
         let record = EventSubscriptionRecord {
+            owner: context.client_id.clone(),
             operation_key: key.clone(),
             spec,
             discovered_through: 0,
@@ -6781,6 +7151,7 @@ impl Store {
     /// `removed: false` without advancing the generation.
     pub fn remove_event_subscription_with_policy(
         &self,
+        context: &EventClientContext,
         policy: &ControlPolicySnapshot,
         id: EventSubscriptionId,
     ) -> Result<EventSubscriptionRemoveOutcome, StoreError> {
@@ -6788,6 +7159,7 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        numbered_event_operation::require_client_context_write(&write, context)?;
         require_control_policy_write(&write, authority, policy)?;
 
         let record = write
@@ -6798,7 +7170,10 @@ impl Store {
         let Some(record) = record else {
             return Ok(EventSubscriptionRemoveOutcome { id, removed: false });
         };
-        if event_subscription_id(authority, &record.operation_key) != id {
+        if record.owner != context.client_id {
+            return Err(NumberedEventOperationError::SubscriptionOwnerMismatch.into());
+        }
+        if event_subscription_id(authority, &record.owner, &record.operation_key) != id {
             return Err(StoreError::SemanticInvariant(
                 "Event subscription identifier differs from its operation key",
             ));
@@ -6941,6 +7316,7 @@ impl Store {
     /// candidates, and both groups are in acceptance-marker order.
     pub fn prepare_event_subscription_poll_with_policy(
         &self,
+        context: &EventClientContext,
         policy: &ControlPolicySnapshot,
         subscription: EventSubscriptionId,
         delivery_limit: usize,
@@ -6961,6 +7337,7 @@ impl Store {
             });
         }
         let read = self.database.begin_read()?;
+        numbered_event_operation::require_client_context_read(&read, context)?;
         require_control_policy_read(&read, authority, policy)?;
         let record = read
             .open_table(EVENT_SUBSCRIPTIONS)?
@@ -6968,6 +7345,9 @@ impl Store {
             .map(|value| decode_event_subscription_record(value.value()))
             .transpose()?
             .ok_or(StoreError::EventSubscriptionNotFound)?;
+        if record.owner != context.client_id {
+            return Err(NumberedEventOperationError::SubscriptionOwnerMismatch.into());
+        }
         if record.spec.mode != EventSubscriptionMode::Consume {
             return Err(StoreError::EventSubscriptionNotConsumable);
         }
@@ -7125,6 +7505,7 @@ impl Store {
             ));
         }
         Ok(EventSubscriptionPollPlan {
+            context: context.clone(),
             subscription,
             spec: record.spec,
             expected_discovered_through: record.discovered_through,
@@ -7161,6 +7542,7 @@ impl Store {
         }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        numbered_event_operation::require_client_context_write(&write, &plan.context)?;
         require_control_policy_write(&write, authority, policy)?;
         let mut subscription_record = write
             .open_table(EVENT_SUBSCRIPTIONS)?
@@ -7168,6 +7550,9 @@ impl Store {
             .map(|value| decode_event_subscription_record(value.value()))
             .transpose()?
             .ok_or(StoreError::EventSubscriptionNotFound)?;
+        if subscription_record.owner != plan.context.client_id {
+            return Err(NumberedEventOperationError::SubscriptionOwnerMismatch.into());
+        }
         if subscription_record.spec.mode != EventSubscriptionMode::Consume {
             return Err(StoreError::EventSubscriptionNotConsumable);
         }
@@ -7406,6 +7791,7 @@ impl Store {
     /// fail closed.
     pub fn acknowledge_event_delivery_with_policy(
         &self,
+        context: &EventClientContext,
         policy: &ControlPolicySnapshot,
         subscription: EventSubscriptionId,
         semantic_id: EventSemanticId,
@@ -7414,6 +7800,7 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        numbered_event_operation::require_client_context_write(&write, context)?;
         require_control_policy_write(&write, authority, policy)?;
         let record = write
             .open_table(EVENT_SUBSCRIPTIONS)?
@@ -7421,6 +7808,9 @@ impl Store {
             .map(|value| decode_event_subscription_record(value.value()))
             .transpose()?
             .ok_or(StoreError::EventSubscriptionNotFound)?;
+        if record.owner != context.client_id {
+            return Err(NumberedEventOperationError::SubscriptionOwnerMismatch.into());
+        }
         if record.spec.mode != EventSubscriptionMode::Consume {
             return Err(StoreError::EventSubscriptionNotConsumable);
         }
@@ -9887,7 +10277,9 @@ impl Store {
         .and_then(EventCommitResult::into_apply)
     }
 
+    /// Historical raw local-publication fixture; unavailable in normal store builds.
     /// Commits one locally sealed Event against its optimistic durable reservation.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event(
         &self,
         reservation: &EventReservation,
@@ -9906,7 +10298,9 @@ impl Store {
         .and_then(EventCommitResult::into_apply)
     }
 
+    /// Historical raw local-publication fixture; unavailable in normal store builds.
     /// Commits a reserved local Event only if its captured policy remains exact.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9935,6 +10329,7 @@ impl Store {
     /// Event and the reservation context must observe its authenticated dot.
     /// The operation row, source envelope, semantic ledgers, reconciliation
     /// item, and acceptance marker are committed in the same redb transaction.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once(
         &self,
         request: &EventOperationRequest<'_>,
@@ -9956,6 +10351,7 @@ impl Store {
     }
 
     /// Commits one idempotent local Event operation under an exact settled policy.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9976,6 +10372,7 @@ impl Store {
 
     /// Commits one idempotent local Event operation and reports every writer
     /// transaction, including one that commits before returning an error.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_policy_observed(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10011,6 +10408,7 @@ impl Store {
     /// Atomically commits one local finite Event operation and establishes its
     /// age-zero custody checkpoint. Source bytes, permanent operation/causal
     /// fences, quota accounting, and custody state share one redb commit.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_custody_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10034,6 +10432,7 @@ impl Store {
     /// Commits one finite local Event operation and reports every writer
     /// transaction, including a continuity transition or retirement fence
     /// committed before the returned error.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_custody_policy_observed(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10073,6 +10472,7 @@ impl Store {
     }
 
     /// Atomically commits an ordered cohort of durable ordinary Event operations.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_group_once_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10083,6 +10483,7 @@ impl Store {
 
     /// Atomically commits an ordered cohort of finite ordinary Event operations
     /// under one common commit-adjacent custody checkpoint.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_group_once_with_custody_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10100,6 +10501,7 @@ impl Store {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn commit_reserved_event_group_once_internal(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10176,6 +10578,111 @@ impl Store {
         })
     }
 
+    /// Atomically commits an ordered cohort of durable numbered Event operations.
+    pub fn commit_reserved_numbered_event_group_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_numbered_event_group_internal(policy, None, commits)
+    }
+
+    /// Atomically commits an ordered cohort of finite numbered Event operations
+    /// under one common commit-adjacent custody checkpoint.
+    pub fn commit_reserved_numbered_event_group_with_custody_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_numbered_event_group_internal(
+            policy,
+            Some(PendingEventCustody {
+                expected_policy: custody.policy_revision,
+                authenticated_age_ms: 0,
+                sample: Some(custody.sample),
+            }),
+            commits,
+        )
+    }
+
+    fn commit_reserved_numbered_event_group_internal(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: Option<PendingEventCustody>,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.require_live()?;
+        let first = commits.first().ok_or(StoreError::InvalidSemanticEvent(
+            "Event commit group is empty",
+        ))?;
+        let cohort = (
+            first.reservation.publisher,
+            &first.reservation.topic,
+            &first.reservation.scope,
+        );
+        let mut prepared = Vec::with_capacity(commits.len());
+        for item in commits {
+            if policy != &item.reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            if item.reservation.publisher != cohort.0
+                || &item.reservation.topic != cohort.1
+                || &item.reservation.scope != cohort.2
+            {
+                return Err(StoreError::InvalidSemanticEvent(
+                    "Event commit group crosses a publisher, topic, or scope boundary",
+                ));
+            }
+            let event = match custody {
+                Some(_) => PreparedEvent::from_verified_with_custody(
+                    item.event,
+                    item.sealed,
+                    EventOrigin::Local,
+                )?,
+                None => PreparedEvent::from_verified(item.event, item.sealed, EventOrigin::Local)?,
+            };
+            self.require_mission_authority(event.mission_authority)?;
+            let operation =
+                prepare_numbered_event_operation(item.request, item.event, &event.header)?;
+            prepared.push((event, operation, item.reservation));
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        let mut commit_required = false;
+        for (event, operation, reservation) in &prepared {
+            match self.stage_prepared_event(
+                &write,
+                event,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(*operation)),
+                EventAdmissionGuard::Control(policy),
+                custody,
+            )? {
+                PreparedEventStage::NoCommit(outcome) => {
+                    outcomes.push(numbered_event_outcome(outcome)?);
+                }
+                PreparedEventStage::Commit(outcome) => {
+                    commit_required = true;
+                    outcomes.push(numbered_event_outcome(outcome)?);
+                }
+                PreparedEventStage::CommitError(error) => return Err(error),
+            }
+        }
+        let writer_commits = if commit_required {
+            write.commit()?;
+            1
+        } else {
+            0
+        };
+        Ok(NumberedEventGroupCommitOutcome {
+            outcomes,
+            writer_commits,
+        })
+    }
+
     /// Atomically commits one numbered local Event and its recoverable result.
     pub fn commit_reserved_numbered_event_with_policy(
         &self,
@@ -10185,19 +10692,46 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<NumberedEventPublishOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_numbered_event_with_policy_observed(
+            policy,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .result
+    }
+
+    /// Reports durable writer commits even when the numbered attempt fails.
+    pub fn commit_reserved_numbered_event_with_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> NumberedEventCommitAttempt {
+        let mut writer_commits = 0;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+            numbered_event_outcome(self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(operation)),
+                EventAdmissionGuard::Control(policy),
+                None,
+                &mut writer_commits,
+            )?)
+        })();
+        NumberedEventCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
-        numbered_event_outcome(self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Numbered(operation)),
-            EventAdmissionGuard::Control(policy),
-            None,
-        )?)
     }
 
     /// Atomically commits one finite numbered Event, its age checkpoint, and result.
@@ -10210,28 +10744,58 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<NumberedEventPublishOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_numbered_event_with_custody_policy_observed(
+            policy,
+            custody,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .result
+    }
+
+    /// Reports durable writer commits even when the numbered attempt fails.
+    pub fn commit_reserved_numbered_event_with_custody_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> NumberedEventCommitAttempt {
+        let mut writer_commits = 0;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared =
+                PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+            numbered_event_outcome(self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(operation)),
+                EventAdmissionGuard::Control(policy),
+                Some(PendingEventCustody {
+                    expected_policy: custody.policy_revision,
+                    authenticated_age_ms: 0,
+                    sample: Some(custody.sample),
+                }),
+                &mut writer_commits,
+            )?)
+        })();
+        NumberedEventCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared =
-            PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
-        numbered_event_outcome(self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Numbered(operation)),
-            EventAdmissionGuard::Control(policy),
-            Some(PendingEventCustody {
-                expected_policy: custody.policy_revision,
-                authenticated_age_ms: 0,
-                sample: Some(custody.sample),
-            }),
-        )?)
     }
 
     /// Compares a request with its mission-bound commitment before resolving
     /// any Event bytes, in one read transaction. Commit rechecks authority.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn event_operation_resolution_for_request(
         &self,
         request: &EventOperationRequest<'_>,
@@ -11007,6 +11571,7 @@ impl Store {
                         }));
                     }
                 }
+                #[cfg(any(test, feature = "test-utils"))]
                 PendingEventOperation::Legacy(operation) => {
                     numbered_event_operation::legacy_operation_allowed_write(write)?;
                     let fingerprint = event_operation::event_operation_fingerprint(
@@ -11034,7 +11599,10 @@ impl Store {
                                     return Err(StoreError::EventOperationConflict);
                                 }
                                 return Ok(PreparedEventStage::NoCommit(
-                                    EventCommitResult::RetiredOperation { reason },
+                                    EventCommitResult::RetiredOperation {
+                                        #[cfg(any(test, feature = "test-utils"))]
+                                        reason,
+                                    },
                                 ));
                             }
                         };
@@ -11044,7 +11612,10 @@ impl Store {
                         match custody::event_custody_authority_write(write, transfer_id)? {
                             custody::EventCustodyAuthority::Retired { reason, .. } => {
                                 return Ok(PreparedEventStage::NoCommit(
-                                    EventCommitResult::RetiredOperation { reason },
+                                    EventCommitResult::RetiredOperation {
+                                        #[cfg(any(test, feature = "test-utils"))]
+                                        reason,
+                                    },
                                 ));
                             }
                             custody::EventCustodyAuthority::Live { .. } => {}
@@ -11055,12 +11626,16 @@ impl Store {
                         if let Some(stored) = load_event_from_write(write, transfer_id)? {
                             return Ok(PreparedEventStage::NoCommit(EventCommitResult::Retained(
                                 EventCommit {
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     transfer_id,
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     semantic_id: stored.semantic_id,
                                     apply: ApplyOutcome::Duplicate {
                                         acceptance_marker: stored.acceptance_marker,
                                     },
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     operation_existing: true,
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     retirement: None,
                                 },
                             )));
@@ -11073,10 +11648,14 @@ impl Store {
                             )?;
                         return Ok(PreparedEventStage::NoCommit(EventCommitResult::Retained(
                             EventCommit {
+                                #[cfg(any(test, feature = "test-utils"))]
                                 transfer_id,
+                                #[cfg(any(test, feature = "test-utils"))]
                                 semantic_id,
                                 apply: ApplyOutcome::Duplicate { acceptance_marker },
+                                #[cfg(any(test, feature = "test-utils"))]
                                 operation_existing: true,
+                                #[cfg(any(test, feature = "test-utils"))]
                                 retirement: Some(reason),
                             },
                         )));
@@ -11212,15 +11791,22 @@ impl Store {
                             result,
                             inserted: false,
                         },
-                        None => EventCommitResult::RetiredOperation { reason },
+                        None => EventCommitResult::RetiredOperation {
+                            #[cfg(any(test, feature = "test-utils"))]
+                            reason,
+                        },
                     }));
                 }
                 return Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
                     EventCommit {
+                        #[cfg(any(test, feature = "test-utils"))]
                         transfer_id: accepted,
+                        #[cfg(any(test, feature = "test-utils"))]
                         semantic_id,
                         apply: ApplyOutcome::Duplicate { acceptance_marker },
+                        #[cfg(any(test, feature = "test-utils"))]
                         operation_existing: false,
+                        #[cfg(any(test, feature = "test-utils"))]
                         retirement: Some(reason),
                     },
                 )));
@@ -11286,12 +11872,16 @@ impl Store {
             }
             return Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
                 EventCommit {
+                    #[cfg(any(test, feature = "test-utils"))]
                     transfer_id: accepted,
+                    #[cfg(any(test, feature = "test-utils"))]
                     semantic_id: prepared.semantic_id,
                     apply: ApplyOutcome::Duplicate {
                         acceptance_marker: stored.acceptance_marker,
                     },
+                    #[cfg(any(test, feature = "test-utils"))]
                     operation_existing: false,
+                    #[cfg(any(test, feature = "test-utils"))]
                     retirement: None,
                 },
             )));
@@ -11542,12 +12132,16 @@ impl Store {
         }
         Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
             EventCommit {
+                #[cfg(any(test, feature = "test-utils"))]
                 transfer_id: prepared.transfer_id,
+                #[cfg(any(test, feature = "test-utils"))]
                 semantic_id: prepared.semantic_id,
                 apply: ApplyOutcome::Inserted {
                     acceptance_marker: marker,
                 },
+                #[cfg(any(test, feature = "test-utils"))]
                 operation_existing: false,
+                #[cfg(any(test, feature = "test-utils"))]
                 retirement: None,
             },
         )))
@@ -19096,10 +19690,11 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
             let (key, value) = row?;
             let id = parse_event_subscription_id(key.value())?;
             let record = decode_event_subscription_record(value.value())?;
+            numbered_event_operation::require_owner_registered_write(write, &record.owner)?;
             let authority = authority.ok_or(StoreError::SemanticInvariant(
                 "unbound store contains Event subscriptions",
             ))?;
-            if event_subscription_id(authority, &record.operation_key) != id {
+            if event_subscription_id(authority, &record.owner, &record.operation_key) != id {
                 return Err(StoreError::SemanticInvariant(
                     "Event subscription identifier differs from its operation key",
                 ));
@@ -20726,6 +21321,7 @@ fn validate_event_publication_intent(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn prepare_event_operation<'a>(
     request: &'a EventOperationRequest<'a>,
     event: &ContentVerifiedEventEnvelope,
@@ -20763,7 +21359,7 @@ fn prepare_numbered_event_operation<'a>(
 
 fn admit_pending_event_operation_write(
     write: &redb::WriteTransaction,
-    mission_authority: &NodeId,
+    _mission_authority: &NodeId,
     operation: PendingEventOperation<'_>,
     receipt: CommittedEventReceipt,
     content: CommittedEventContent,
@@ -20771,12 +21367,13 @@ fn admit_pending_event_operation_write(
     tombstone: bool,
 ) -> Result<Option<NumberedEventResult>, StoreError> {
     match operation {
+        #[cfg(any(test, feature = "test-utils"))]
         PendingEventOperation::Legacy(operation) => {
             match content {
                 CommittedEventContent::Available => {
                     event_operation::admit_active_event_operation_write(
                         write,
-                        mission_authority,
+                        _mission_authority,
                         operation.key,
                         operation.intent_digest,
                         receipt.transfer_id,
@@ -20787,7 +21384,7 @@ fn admit_pending_event_operation_write(
                 CommittedEventContent::Retired(reason) => {
                     event_operation::admit_retired_event_operation_write(
                         write,
-                        mission_authority,
+                        _mission_authority,
                         operation.key,
                         operation.intent_digest,
                         reason,
@@ -20895,10 +21492,16 @@ fn event_operation_witness_write(
         .transpose()
 }
 
-fn event_subscription_id(authority: NodeId, key: &EventSubscriptionKey) -> EventSubscriptionId {
+fn event_subscription_id(
+    authority: NodeId,
+    owner: &EventClientId,
+    key: &EventSubscriptionKey,
+) -> EventSubscriptionId {
     let mut digest = Sha256::new();
     digest.update(EVENT_SUBSCRIPTION_ID_DOMAIN);
     digest.update(authority);
+    digest.update([owner.as_bytes().len() as u8]);
+    digest.update(owner.as_bytes());
     digest.update(
         u16::try_from(key.as_bytes().len())
             .expect("validated subscription key fits u16")
@@ -20923,6 +21526,8 @@ fn encode_event_subscription_record(
     let mut encoded =
         Vec::with_capacity(17 + record.operation_key.as_bytes().len() + topic.len() + scope.len());
     encoded.push(EVENT_SUBSCRIPTION_VERSION);
+    encoded.push(record.owner.as_bytes().len() as u8);
+    encoded.extend_from_slice(record.owner.as_bytes());
     encoded.push(match record.spec.mode {
         EventSubscriptionMode::Consume => 0,
         EventSubscriptionMode::Carry => 1,
@@ -20945,6 +21550,9 @@ fn decode_event_subscription_record(bytes: &[u8]) -> Result<EventSubscriptionRec
             "unknown Event subscription encoding version",
         ));
     }
+    let owner_length = usize::from(cursor.u8()?);
+    let owner = EventClientId::new(cursor.take(owner_length)?.to_vec())
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event subscription owner"))?;
     let mode = match cursor.u8()? {
         0 => EventSubscriptionMode::Consume,
         1 => EventSubscriptionMode::Carry,
@@ -20973,6 +21581,7 @@ fn decode_event_subscription_record(bytes: &[u8]) -> Result<EventSubscriptionRec
         .map_err(|_| StoreError::SemanticInvariant("invalid Event subscription scope"))?;
     cursor.finish()?;
     let record = EventSubscriptionRecord {
+        owner,
         operation_key,
         spec: EventSubscriptionSpec {
             mode,
@@ -24125,10 +24734,11 @@ fn event_subscription_stats_read(
         let (key, value) = row?;
         let id = parse_event_subscription_id(key.value())?;
         let record = decode_event_subscription_record(value.value())?;
+        numbered_event_operation::require_owner_registered_read(read, &record.owner)?;
         let authority = authority.ok_or(StoreError::SemanticInvariant(
             "unbound store contains Event subscriptions",
         ))?;
-        if event_subscription_id(authority, &record.operation_key) != id {
+        if event_subscription_id(authority, &record.owner, &record.operation_key) != id {
             return Err(StoreError::SemanticInvariant(
                 "Event subscription identifier differs from its operation key",
             ));
@@ -24472,6 +25082,7 @@ fn parse_id(table: &'static str, bytes: &[u8]) -> Result<ItemId, StoreError> {
 
 #[cfg(test)]
 mod tests {
+    mod event_client_ownership;
     mod event_operation_audit;
     mod event_operation_migration;
     mod event_operation_publication;
@@ -24494,6 +25105,146 @@ mod tests {
     static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(0);
     const ABRUPT_STORE_PATH: &str = "ASTER_REDB_TEST_ABRUPT_STORE_PATH";
     const ABRUPT_STORE_MODE: &str = "ASTER_REDB_TEST_ABRUPT_STORE_MODE";
+
+    #[test]
+    fn numbered_startup_recovers_unclean_stores_but_preserves_unclean_legacy_bytes() {
+        const CHILD_PATH: &str = "ASTER_NUMBERED_PREFLIGHT_CHILD_PATH";
+        const CHILD_LEGACY: &str = "ASTER_NUMBERED_PREFLIGHT_CHILD_LEGACY";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let store = Store::open_numbered_for_mission(
+                PathBuf::from(path),
+                StoreLimits::default(),
+                BlobDepotLimits::DEFAULT,
+                EventOperationLimits::DEFAULT,
+                [1; 32],
+            )
+            .unwrap();
+            let write = store.database.begin_write().unwrap();
+            if std::env::var_os(CHILD_LEGACY).is_some() {
+                write
+                    .open_table(event_operation::EVENT_OPERATION_LEDGER_V3)
+                    .unwrap()
+                    .insert(b"old-key".as_slice(), b"old-value".as_slice())
+                    .unwrap();
+            } else {
+                write
+                    .open_table(METADATA)
+                    .unwrap()
+                    .insert("unclean_publication_fixture", 1)
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            std::process::exit(0); // deliberately skip redb's clean-close allocator receipt
+        }
+        for legacy in [false, true] {
+            let file = TestFile::new("unclean-numbered-preflight");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "tests::numbered_startup_recovers_unclean_stores_but_preserves_unclean_legacy_bytes", "--nocapture"]).env(CHILD_PATH, &file.0);
+            if legacy {
+                child.env(CHILD_LEGACY, "1");
+            }
+            assert!(child.status().unwrap().success());
+            let before = std::fs::read(&file.0).unwrap();
+            assert!(matches!(
+                redb::Builder::new().open_read_only(&file.0),
+                Err(redb::DatabaseError::RepairAborted)
+            ));
+            let result = Store::require_numbered_publication_compatible(&file.0);
+            if legacy {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::NumberedEventOperation(
+                        NumberedEventOperationError::LegacyStoreRequiresFreshState
+                    ))
+                ));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                std::fs::read(&file.0).unwrap(),
+                before,
+                "preflight must never repair the original"
+            );
+            if !legacy {
+                let store = Store::open_numbered_for_mission(
+                    &file.0,
+                    StoreLimits::default(),
+                    BlobDepotLimits::DEFAULT,
+                    EventOperationLimits::DEFAULT,
+                    [1; 32],
+                )
+                .unwrap();
+                assert_eq!(
+                    store.numbered_event_operation_stats().unwrap(),
+                    NumberedEventOperationStats::default()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_startup_refuses_every_nonempty_legacy_table_without_mutation() {
+        for definition in [
+            EVENT_OPERATIONS,
+            EVENT_OPERATION_WITNESSES,
+            event_operation::EVENT_OPERATION_LEDGER_V3,
+            event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
+        ] {
+            let file = TestFile::new("legacy-numbered-startup-refusal");
+            let database = redb::Database::create(&file.0).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(definition)
+                .unwrap()
+                .insert(b"historical-key".as_slice(), b"historical-value".as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            drop(database);
+            let before = std::fs::read(&file.0).unwrap();
+            assert!(matches!(
+                Store::require_numbered_publication_compatible(&file.0),
+                Err(StoreError::NumberedEventOperation(
+                    NumberedEventOperationError::LegacyStoreRequiresFreshState
+                ))
+            ));
+            assert!(matches!(
+                Store::open_numbered_for_mission(
+                    &file.0,
+                    StoreLimits::default(),
+                    BlobDepotLimits::DEFAULT,
+                    EventOperationLimits::DEFAULT,
+                    [1; 32]
+                ),
+                Err(StoreError::NumberedEventOperation(
+                    NumberedEventOperationError::LegacyStoreRequiresFreshState
+                ))
+            ));
+            assert!(matches!(
+                Store::open_numbered_with_all_limits_and_blob_lease_limits_for_mission(
+                    &file.0,
+                    StoreLimits::default(),
+                    BlobDepotLimits::DEFAULT,
+                    EventOperationLimits::DEFAULT,
+                    BlobLifecycleLimits::default(),
+                    BlobLeaseLimits::new(2, 3, 4).unwrap(),
+                    [1; 32]
+                ),
+                Err(StoreError::NumberedEventOperation(
+                    NumberedEventOperationError::LegacyStoreRequiresFreshState
+                ))
+            ));
+            assert_eq!(std::fs::read(&file.0).unwrap(), before);
+        }
+        let absent = TestFile::new("absent-numbered-startup-preflight");
+        Store::require_numbered_publication_compatible(&absent.0).unwrap();
+        assert!(!absent.0.exists());
+        let empty = TestFile::new("empty-numbered-startup-preflight");
+        let store = Store::open(&empty.0).unwrap();
+        drop(store);
+        let before = std::fs::read(&empty.0).unwrap();
+        Store::require_numbered_publication_compatible(&empty.0).unwrap();
+        assert_eq!(std::fs::read(&empty.0).unwrap(), before);
+    }
 
     struct TestFile(PathBuf);
 
@@ -25517,6 +26268,70 @@ mod tests {
             })
             .filter(|candidate| *candidate == generation)
             .count()
+    }
+
+    fn accept_owned_finite_event(
+        store: &Store,
+        services: &mut EventServices,
+        operation_suffix: u8,
+        payload: &[u8],
+        ttl_ms: u64,
+        sample: aster_mesh::CustodySample,
+    ) -> EventTransferId {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("finite Event policy");
+        let client = store.test_event_client_context().unwrap();
+        let sequence = store.test_next_event_operation_sequence(&client).unwrap();
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("finite Event reservation");
+        let header = reservation
+            .header(
+                Priority::Routine,
+                vec![b'f', operation_suffix],
+                Some(ttl_ms),
+                u64::try_from(payload.len()).expect("bounded finite payload"),
+                false,
+                1,
+            )
+            .expect("finite Event header");
+        let intent = event_publication_intent(&header, payload);
+        let request = NumberedEventOperationRequest::new(
+            &client.client_id,
+            client.session,
+            sequence,
+            None,
+            &intent,
+            payload,
+        )
+        .expect("finite Event request");
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal finite Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        store
+            .commit_reserved_numbered_event_with_custody_policy(
+                &policy,
+                LocalCustodyCheckpoint::new(
+                    store.custody_policy_revision().expect("custody revision"),
+                    sample,
+                ),
+                &request,
+                &reservation,
+                &event,
+                &sealed.bytes,
+            )
+            .expect("commit finite Event")
+            .result
+            .receipt
+            .transfer_id
     }
 
     fn seed_peer_receipt_fanout(store: &Store, object: CustodyObjectKey, count: usize) {
@@ -26670,11 +27485,16 @@ mod tests {
     fn event_subscription_identity_snapshot_modes_and_quota_are_stable() {
         let vector_key = EventSubscriptionKey::new(b"app/feed".to_vec()).expect("vector key");
         assert_eq!(
-            event_subscription_id([0x11; 32], &vector_key).as_bytes(),
+            event_subscription_id(
+                [0x11; 32],
+                &EventClientId::new(b"test.subscription-owner".to_vec()).unwrap(),
+                &vector_key
+            )
+            .as_bytes(),
             &[
-                0xfa, 0x5c, 0xbe, 0x02, 0x70, 0xc7, 0x6d, 0xdc, 0x00, 0x24, 0x5b, 0x72, 0x21, 0x50,
-                0x76, 0x46, 0x30, 0xe1, 0x24, 0xd9, 0xb1, 0x7a, 0xfd, 0xe3, 0xed, 0x71, 0xfa, 0xee,
-                0xe1, 0xf5, 0xbf, 0x29,
+                0x04, 0x9f, 0xd2, 0x0a, 0x39, 0x04, 0x4e, 0x07, 0x2c, 0x45, 0xeb, 0xf4, 0xa5, 0x6d,
+                0xba, 0x0c, 0x95, 0xad, 0x3a, 0x79, 0x5f, 0x0a, 0x19, 0xda, 0xc3, 0x22, 0xb7, 0xb0,
+                0x10, 0x4c, 0xbe, 0x87
             ],
             "domain-separated subscription identity is a frozen durable vector"
         );
@@ -26713,12 +27533,26 @@ mod tests {
         let carry_key = EventSubscriptionKey::new(b"relay/carry".to_vec()).expect("carry key");
         let carry = subscription_spec(EventSubscriptionMode::Carry);
         let carry_created = store
-            .create_event_subscription_with_policy(&policy, &carry_key, carry.clone())
+            .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                &carry_key,
+                carry.clone(),
+            )
             .expect("create Carry selector");
         assert!(carry_created.inserted);
         assert_eq!(
             store
-                .create_event_subscription_with_policy(&policy, &carry_key, carry.clone())
+                .create_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    &carry_key,
+                    carry.clone()
+                )
                 .expect("exact retry"),
             EventSubscriptionCreateOutcome {
                 id: carry_created.id,
@@ -26727,6 +27561,9 @@ mod tests {
         );
         assert!(matches!(
             store.create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &carry_key,
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -26734,7 +27571,15 @@ mod tests {
             Err(StoreError::EventSubscriptionConflict)
         ));
         assert!(matches!(
-            store.prepare_event_subscription_poll_with_policy(&policy, carry_created.id, 1, 1),
+            store.prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                carry_created.id,
+                1,
+                1
+            ),
             Err(StoreError::EventSubscriptionNotConsumable)
         ));
         let carry_snapshot = store
@@ -26754,6 +27599,9 @@ mod tests {
             EventSubscriptionKey::new(b"application/consume".to_vec()).expect("consume key");
         let consume_created = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &consume_key,
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -26791,6 +27639,9 @@ mod tests {
         child_carry.scope = child_event_scope();
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"relay/child".to_vec()).expect("child key"),
                 child_carry,
@@ -26800,6 +27651,9 @@ mod tests {
         descendant_consume.include_descendant_scopes = true;
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"application/descendants".to_vec())
                     .expect("descendant key"),
@@ -26824,6 +27678,9 @@ mod tests {
         for requested in [0, MAX_EVENT_POLL_DELIVERIES + 1] {
             assert!(matches!(
                 store.prepare_event_subscription_poll_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &policy,
                     consume_created.id,
                     requested,
@@ -26837,13 +27694,27 @@ mod tests {
             let key = EventSubscriptionKey::new(format!("duplicate/{index}").into_bytes())
                 .expect("bounded quota key");
             store
-                .create_event_subscription_with_policy(&policy, &key, carry.clone())
+                .create_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    &key,
+                    carry.clone(),
+                )
                 .expect("fill subscription quota");
         }
         let overflow_key =
             EventSubscriptionKey::new(b"quota/overflow".to_vec()).expect("overflow key");
         assert!(matches!(
-            store.create_event_subscription_with_policy(&policy, &overflow_key, carry),
+            store.create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                &overflow_key,
+                carry
+            ),
             Err(StoreError::EventSubscriptionLimitExceeded {
                 current: MAX_EVENT_SUBSCRIPTIONS,
                 limit: MAX_EVENT_SUBSCRIPTIONS,
@@ -26871,6 +27742,9 @@ mod tests {
             let policy = store.control_policy_snapshot().expect("remove policy");
             carry_id = store
                 .create_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &policy,
                     &carry_key,
                     subscription_spec(EventSubscriptionMode::Carry),
@@ -26879,6 +27753,9 @@ mod tests {
                 .id;
             consume_id = store
                 .create_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &policy,
                     &consume_key,
                     subscription_spec(EventSubscriptionMode::Consume),
@@ -26905,7 +27782,15 @@ mod tests {
                 ));
             }
             let plan = store
-                .prepare_event_subscription_poll_with_policy(&policy, consume_id, 2, 2)
+                .prepare_event_subscription_poll_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    consume_id,
+                    2,
+                    2,
+                )
                 .expect("prepare two deliveries");
             let selection = verify_subscription_plan(&mut services.reader, &plan);
             store
@@ -26914,6 +27799,9 @@ mod tests {
             assert_eq!(
                 store
                     .acknowledge_event_delivery_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
                         &policy,
                         consume_id,
                         accepted[0].semantic_id,
@@ -26936,7 +27824,13 @@ mod tests {
             assert_eq!(consume_snapshot.selector_generation(), 2);
             assert_eq!(
                 store
-                    .remove_event_subscription_with_policy(&policy, consume_id)
+                    .remove_event_subscription_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
+                        &policy,
+                        consume_id
+                    )
                     .expect("remove Consume selector"),
                 EventSubscriptionRemoveOutcome {
                     id: consume_id,
@@ -26973,7 +27867,13 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("reopen policy");
         assert_eq!(
             store
-                .remove_event_subscription_with_policy(&policy, consume_id)
+                .remove_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    consume_id
+                )
                 .expect("idempotent remove retry"),
             EventSubscriptionRemoveOutcome {
                 id: consume_id,
@@ -26990,6 +27890,9 @@ mod tests {
         );
         let recreated = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &consume_key,
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -27005,7 +27908,13 @@ mod tests {
             4
         );
         store
-            .remove_event_subscription_with_policy(&policy, carry_id)
+            .remove_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                carry_id,
+            )
             .expect("remove overlapping Carry");
         let last_consume = store
             .event_replication_policy_snapshot()
@@ -27013,7 +27922,13 @@ mod tests {
         assert_eq!(last_consume.selector_generation(), 5);
         assert_eq!(last_consume.selectors().len(), 1);
         store
-            .remove_event_subscription_with_policy(&policy, consume_id)
+            .remove_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                consume_id,
+            )
             .expect("remove final selector");
         let receive_none = store
             .event_replication_policy_snapshot()
@@ -27049,6 +27964,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("settled policy");
         let created = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"projection/carry".to_vec()).expect("key"),
                 subscription_spec(EventSubscriptionMode::Carry),
@@ -27159,6 +28077,9 @@ mod tests {
 
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"relay/carry-atomic".to_vec()).expect("Carry key"),
                 subscription_spec(EventSubscriptionMode::Carry),
@@ -27178,6 +28099,9 @@ mod tests {
 
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"application/consume-atomic".to_vec())
                     .expect("Consume key"),
@@ -27275,6 +28199,9 @@ mod tests {
         ));
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"relay/carry-semantic".to_vec()).expect("Carry key"),
                 subscription_spec(EventSubscriptionMode::Carry),
@@ -27295,6 +28222,9 @@ mod tests {
 
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"application/consume-semantic".to_vec())
                     .expect("Consume key"),
@@ -27337,6 +28267,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("settled policy");
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"application/consume-batch".to_vec())
                     .expect("Consume key"),
@@ -27411,6 +28344,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("settled policy");
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"application/consume-batch-rollback".to_vec())
                     .expect("Consume key"),
@@ -27489,6 +28425,9 @@ mod tests {
         let target_policy = target.control_policy_snapshot().expect("target policy");
         source
             .create_event_subscription_with_policy(
+                &source
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &source_policy,
                 &EventSubscriptionKey::new(b"source/carry".to_vec()).expect("source key"),
                 subscription_spec(EventSubscriptionMode::Carry),
@@ -27498,6 +28437,9 @@ mod tests {
         unrelated.topic = reaction_topic();
         target
             .create_event_subscription_with_policy(
+                &target
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &target_policy,
                 &EventSubscriptionKey::new(b"target/carry".to_vec()).expect("target key"),
                 unrelated,
@@ -27571,6 +28513,9 @@ mod tests {
         let target_policy = target.control_policy_snapshot().expect("target policy");
         source
             .create_event_subscription_with_policy(
+                &source
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &source_policy,
                 &EventSubscriptionKey::new(b"source/consume".to_vec()).expect("source key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -27578,6 +28523,9 @@ mod tests {
             .expect("source Consume selector");
         target
             .create_event_subscription_with_policy(
+                &target
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &target_policy,
                 &EventSubscriptionKey::new(b"target/carry".to_vec()).expect("target key"),
                 subscription_spec(EventSubscriptionMode::Carry),
@@ -27652,6 +28600,9 @@ mod tests {
         let key = EventSubscriptionKey::new(b"application/events".to_vec()).expect("key");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &key,
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -27711,6 +28662,9 @@ mod tests {
         );
         assert!(matches!(
             store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 subscription,
                 EventSemanticId::new([0xff; 32]),
@@ -27718,12 +28672,27 @@ mod tests {
             Err(StoreError::EventDeliveryNotFound)
         ));
         assert!(matches!(
-            store.acknowledge_event_delivery_with_policy(&policy, subscription, first.semantic_id,),
+            store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                first.semantic_id,
+            ),
             Err(StoreError::EventDeliveryNotFound)
         ));
 
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("first bounded plan");
         assert_eq!(plan.discovered_through(), 0);
         assert_eq!(plan.scanned_candidates(), std::slice::from_ref(&first));
@@ -27745,7 +28714,15 @@ mod tests {
         let store = Store::open_for_mission(&file.0, services.authority).expect("restart store");
         let policy = store.control_policy_snapshot().expect("restart policy");
         let retry_plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 4)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                4,
+            )
             .expect("pending retry plan");
         assert!(retry_plan.scanned_candidates().is_empty());
         assert_eq!(retry_plan.pending_candidates().len(), 1);
@@ -27758,7 +28735,14 @@ mod tests {
         assert_eq!(retry.deliveries[0].event, first);
         assert_eq!(
             store
-                .acknowledge_event_delivery_with_policy(&policy, subscription, first.semantic_id)
+                .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    first.semantic_id
+                )
                 .expect("ack first"),
             EventDeliveryAck::Acknowledged
         );
@@ -27770,14 +28754,29 @@ mod tests {
             .expect("acknowledgement retry policy");
         assert_eq!(
             store
-                .acknowledge_event_delivery_with_policy(&policy, subscription, first.semantic_id)
+                .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    first.semantic_id
+                )
                 .expect("durable idempotent ack retry"),
             EventDeliveryAck::AlreadyAcknowledged
         );
 
         event_subscription_listing::assert_listing_does_not_mutate_delivery(&store);
         let gap_plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 4, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                4,
+                1,
+            )
             .expect("bounded unfiltered gap plan");
         assert_eq!(
             gap_plan.scanned_candidates(),
@@ -27793,6 +28792,9 @@ mod tests {
         assert!(gap_page.has_more);
         assert!(matches!(
             store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 subscription,
                 skipped.semantic_id,
@@ -27801,7 +28803,15 @@ mod tests {
         ));
 
         let final_plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 4, 4)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                4,
+                4,
+            )
             .expect("post-gap plan");
         assert_eq!(
             final_plan.scanned_candidates(),
@@ -27834,12 +28844,27 @@ mod tests {
         );
         assert_eq!(
             store
-                .acknowledge_event_delivery_with_policy(&policy, subscription, third.semantic_id)
+                .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    third.semantic_id
+                )
                 .expect("ack post-gap delivery"),
             EventDeliveryAck::Acknowledged
         );
         let appended_plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("appended Event plan");
         assert_eq!(
             appended_plan.scanned_candidates(),
@@ -27858,6 +28883,9 @@ mod tests {
         assert_eq!(
             store
                 .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &policy,
                     subscription,
                     appended.semantic_id,
@@ -27884,7 +28912,15 @@ mod tests {
             .begin_zeroization(&intent)
             .expect("enter terminal state");
         assert!(matches!(
-            store.prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1),
+            store.prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1
+            ),
             Err(StoreError::StoreZeroized(
                 StoreZeroizationState::CleanupPending
             ))
@@ -27901,6 +28937,9 @@ mod tests {
         let key = EventSubscriptionKey::new(b"application/inactive".to_vec()).expect("key");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &initial_policy,
                 &key,
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -27957,7 +28996,15 @@ mod tests {
             .expect("read undiscovered Event")
             .expect("undiscovered Event row");
         let first_plan = store
-            .prepare_event_subscription_poll_with_policy(&initial_policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &initial_policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("initial plan");
         let first_selection = verify_subscription_plan(&mut services.authority, &first_plan);
         store
@@ -27979,11 +29026,27 @@ mod tests {
             .expect("apply revocation");
         let current_policy = store.control_policy_snapshot().expect("current policy");
         assert!(matches!(
-            store.prepare_event_subscription_poll_with_policy(&initial_policy, subscription, 1, 1,),
+            store.prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &initial_policy,
+                subscription,
+                1,
+                1,
+            ),
             Err(StoreError::ControlPolicyChanged)
         ));
         let inactive_plan = store
-            .prepare_event_subscription_poll_with_policy(&current_policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &current_policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("inactive pending plan");
         assert_eq!(inactive_plan.pending_candidates().len(), 1);
         content_event(
@@ -28006,7 +29069,15 @@ mod tests {
             0
         );
         let first_inactive_scan = store
-            .prepare_event_subscription_poll_with_policy(&current_policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &current_policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("first scan of already-inactive Event");
         assert!(first_inactive_scan.pending_candidates().is_empty());
         assert_eq!(
@@ -28031,6 +29102,9 @@ mod tests {
         );
         assert!(matches!(
             store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &current_policy,
                 subscription,
                 stored.semantic_id,
@@ -28039,6 +29113,9 @@ mod tests {
         ));
         assert!(matches!(
             store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &current_policy,
                 subscription,
                 never_delivered.semantic_id,
@@ -28053,7 +29130,15 @@ mod tests {
             0
         );
         let empty = store
-            .prepare_event_subscription_poll_with_policy(&current_policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &current_policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("no starvation after inactive first scan");
         assert!(empty.pending_candidates().is_empty());
         assert!(empty.scanned_candidates().is_empty());
@@ -28070,6 +29155,9 @@ mod tests {
             let policy = store.control_policy_snapshot().expect("settled policy");
             subscription = store
                 .create_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &policy,
                     &EventSubscriptionKey::new(b"application/receipt-audit".to_vec())
                         .expect("subscription key"),
@@ -28094,7 +29182,15 @@ mod tests {
                 payload,
             );
             let plan = store
-                .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                .prepare_event_subscription_poll_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    1,
+                    1,
+                )
                 .expect("receipt poll plan");
             let selection = verify_subscription_plan(&mut services.reader, &plan);
             store
@@ -28103,6 +29199,9 @@ mod tests {
             assert_eq!(
                 store
                     .acknowledge_event_delivery_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
                         &policy,
                         subscription,
                         stored.semantic_id,
@@ -28192,6 +29291,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("settled policy");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"application/receipt-cap".to_vec())
                     .expect("subscription key"),
@@ -28216,7 +29318,15 @@ mod tests {
             payload,
         );
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("cap poll plan");
         let selection = verify_subscription_plan(&mut services.reader, &plan);
         store
@@ -28258,8 +29368,14 @@ mod tests {
         }
 
         assert!(matches!(
-            store
-                .acknowledge_event_delivery_with_policy(&policy, subscription, stored.semantic_id,),
+            store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                stored.semantic_id,
+            ),
             Err(StoreError::EventAcknowledgementReceiptLimitExceeded {
                 current: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
                 limit: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
@@ -28349,6 +29465,9 @@ mod tests {
             ] {
                 migrated
                     .create_event_subscription_with_policy(
+                        &migrated
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
                         &policy,
                         &EventSubscriptionKey::new(key.to_vec()).expect("legacy key"),
                         subscription_spec(mode),
@@ -28473,6 +29592,9 @@ mod tests {
             let policy = store.control_policy_snapshot().expect("policy");
             subscription = store
                 .create_event_subscription_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &policy,
                     &EventSubscriptionKey::new(b"application/overflow".to_vec()).expect("key"),
                     subscription_spec(EventSubscriptionMode::Consume),
@@ -28496,7 +29618,15 @@ mod tests {
                 payload,
             );
             let plan = store
-                .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                .prepare_event_subscription_poll_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    1,
+                    1,
+                )
                 .expect("first plan");
             let selection = verify_subscription_plan(&mut services.reader, &plan);
             store
@@ -28523,7 +29653,15 @@ mod tests {
                 .expect("maximum nonzero attempt audits");
             let policy = store.control_policy_snapshot().expect("reopen policy");
             let plan = store
-                .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                .prepare_event_subscription_poll_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    1,
+                    1,
+                )
                 .expect("terminal attempt plan");
             assert_eq!(plan.pending_candidates()[0].previous_attempt, u64::MAX);
             let selection = verify_subscription_plan(&mut services.reader, &plan);
@@ -34848,6 +35986,9 @@ mod tests {
                     .expect("subscription policy");
                 let subscription = store
                     .create_event_subscription_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
                         &policy,
                         &EventSubscriptionKey::new(b"abrupt/subscription".to_vec())
                             .expect("subscription key"),
@@ -34872,7 +36013,15 @@ mod tests {
                     payload,
                 );
                 let plan = store
-                    .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                    .prepare_event_subscription_poll_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
+                        &policy,
+                        subscription,
+                        1,
+                        1,
+                    )
                     .expect("abrupt delivery plan");
                 let selection = verify_subscription_plan(&mut services.reader, &plan);
                 let page = store
@@ -34961,6 +36110,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("recovered policy");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"abrupt/subscription".to_vec()).expect("same key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -34968,7 +36120,15 @@ mod tests {
             .expect("exact subscription retry")
             .id;
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("recovered pending attempt");
         assert_eq!(plan.pending_candidates()[0].previous_attempt, 1);
         let selection = verify_subscription_plan(&mut services.reader, &plan);
@@ -35717,6 +36877,9 @@ mod tests {
 
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &event_query_policy,
                 &EventSubscriptionKey::new(b"terminal/preserved".to_vec())
                     .expect("terminal subscription key"),
@@ -35725,7 +36888,15 @@ mod tests {
             .expect("terminal subscription")
             .id;
         let subscription_plan = store
-            .prepare_event_subscription_poll_with_policy(&event_query_policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &event_query_policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("terminal subscription plan");
         let subscription_selection =
             verify_subscription_plan(&mut events.reader, &subscription_plan);
@@ -35739,6 +36910,9 @@ mod tests {
         assert_eq!(
             store
                 .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
                     &event_query_policy,
                     subscription,
                     event_candidates.events[0].semantic_id,
@@ -35790,6 +36964,9 @@ mod tests {
         ));
         assert!(matches!(
             store.prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &event_query_policy,
                 subscription,
                 1,
@@ -35801,6 +36978,9 @@ mod tests {
         ));
         assert!(matches!(
             store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &event_query_policy,
                 subscription,
                 event_candidates.events[0].semantic_id,
@@ -41231,23 +42411,6 @@ mod tests {
                 reason: CustodyRetirementReason::Expired,
             })
         ));
-        store
-            .create_event_subscription_with_policy(
-                &policy,
-                &EventSubscriptionKey::new(b"retirement/carry".to_vec()).expect("selector key"),
-                subscription_spec(EventSubscriptionMode::Carry),
-            )
-            .expect("create receive selector");
-        let replication = store
-            .event_replication_policy_snapshot()
-            .expect("replication policy");
-        assert_eq!(
-            store
-                .event_receiver_fences_with_policy(&replication, None, 1)
-                .expect("receiver fence")[0]
-                .object,
-            key
-        );
 
         store
             .release_transfer_lease(lease.id)
@@ -41474,7 +42637,27 @@ mod tests {
     }
 
     #[test]
+    fn custody_collection_limit_keeps_the_production_maximum_and_fails_closed() {
+        assert_eq!(MAX_CUSTODY_PAGE, 1_024);
+        let file = TestFile::new("custody collection page limit contract");
+        let services = event_services(0xec);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let revision = store.custody_policy_revision().expect("policy revision");
+
+        for limit in [0, MAX_CUSTODY_PAGE + 1] {
+            assert!(matches!(
+                store.collect_custody_garbage(None, revision, limit),
+                Err(StoreError::Custody(CustodyStoreError::PageLimitExceeded {
+                    requested,
+                    maximum: MAX_CUSTODY_PAGE,
+                })) if requested == limit
+            ));
+        }
+    }
+
+    #[test]
     fn custody_reanchors_more_than_one_page_transactionally_across_reopen() {
+        const TEST_PAGE: usize = 2;
         let file = TestFile::new("custody multi-page re-anchor survives reopen");
         let mut services = event_services(0xed);
         let initial = aster_mesh::CustodySample {
@@ -41485,7 +42668,7 @@ mod tests {
             clock_id: [0xd4; 16],
             tick_ms: 5_000,
         };
-        let item_count = MAX_CUSTODY_PAGE + 1;
+        let item_count = TEST_PAGE + 1;
         let store = Store::open_for_mission(&file.0, services.authority).expect("store");
         seed_numbered_local_finite_event_group(&store, &mut services, item_count, 10_000, initial);
         assert_eq!(custody_expiration_generation_count(&store, 1), item_count);
@@ -41495,7 +42678,7 @@ mod tests {
             store
                 .custody_policy_revision()
                 .expect("pre-transition revision"),
-            MAX_CUSTODY_PAGE,
+            TEST_PAGE,
         );
         assert_eq!(transition.writer_commits(), 1);
         assert!(matches!(
@@ -41503,10 +42686,7 @@ mod tests {
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
         ));
         assert_eq!(custody_expiration_generation_count(&store, 1), 1);
-        assert_eq!(
-            custody_expiration_generation_count(&store, 2),
-            MAX_CUSTODY_PAGE
-        );
+        assert_eq!(custody_expiration_generation_count(&store, 2), TEST_PAGE);
         drop(store);
 
         Store::inspect_existing(&file.0).expect("inspect partially re-anchored store");
@@ -41515,7 +42695,7 @@ mod tests {
             .collect_custody_garbage(
                 Some(changed),
                 store.custody_policy_revision().expect("reopened revision"),
-                MAX_CUSTODY_PAGE,
+                TEST_PAGE,
             )
             .expect("finish re-anchor");
         assert_eq!(final_page.examined_expirations, 1);
@@ -41811,6 +42991,9 @@ mod tests {
                 let policy = store.control_policy_snapshot().expect("control policy");
                 let subscription = store
                     .create_event_subscription_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
                         &policy,
                         &EventSubscriptionKey::new(vec![kind]).expect("subscription key"),
                         subscription_spec(EventSubscriptionMode::Consume),
@@ -41818,7 +43001,15 @@ mod tests {
                     .expect("subscription")
                     .id;
                 let plan = store
-                    .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                    .prepare_event_subscription_poll_with_policy(
+                        &store
+                            .test_event_client_context()
+                            .expect("recovered subscription fixture"),
+                        &policy,
+                        subscription,
+                        1,
+                        1,
+                    )
                     .expect("poll plan");
                 let selection = verify_subscription_plan(&mut services.reader, &plan);
                 store
@@ -41828,6 +43019,9 @@ mod tests {
                     assert_eq!(
                         store
                             .acknowledge_event_delivery_with_policy(
+                                &store
+                                    .test_event_client_context()
+                                    .expect("recovered subscription fixture"),
                                 &policy,
                                 subscription,
                                 stored.semantic_id,
@@ -41968,6 +43162,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("policy");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"retirement/clean-fence".to_vec()).expect("key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -41975,9 +43172,17 @@ mod tests {
             .expect("subscription")
             .id;
         let transfer =
-            accept_local_finite_event(&store, &mut services, 0, b"clean fence", 100, initial);
+            accept_owned_finite_event(&store, &mut services, 0, b"clean fence", 100, initial);
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("poll plan");
         let selection = verify_subscription_plan(&mut services.reader, &plan);
         store
@@ -43483,6 +44688,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("policy");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"retirement/race".to_vec()).expect("key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -43490,13 +44698,21 @@ mod tests {
             .expect("subscription")
             .id;
         let transfer =
-            accept_local_finite_event(&store, &mut services, 0, b"poll race", 100, initial);
+            accept_owned_finite_event(&store, &mut services, 0, b"poll race", 100, initial);
         let event = store
             .get_event(transfer)
             .expect("event lookup")
             .expect("event");
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("poll plan");
         let selection = verify_subscription_plan(&mut services.reader, &plan);
         let expired = aster_mesh::CustodySample {
@@ -43518,7 +44734,14 @@ mod tests {
             Err(StoreError::EventSubscriptionPlanChanged)
         ));
         assert!(matches!(
-            store.acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id),
+            store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                event.semantic_id
+            ),
             Err(StoreError::EventDeliveryNotFound)
         ));
         assert_eq!(
@@ -43546,6 +44769,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("policy");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"retirement/late-ack".to_vec()).expect("key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -43553,13 +44779,21 @@ mod tests {
             .expect("subscription")
             .id;
         let transfer =
-            accept_local_finite_event(&store, &mut services, 0, b"late ack", 100, initial);
+            accept_owned_finite_event(&store, &mut services, 0, b"late ack", 100, initial);
         let event = store
             .get_event(transfer)
             .expect("event lookup")
             .expect("event");
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("poll plan");
         let selection = verify_subscription_plan(&mut services.reader, &plan);
         store
@@ -43567,7 +44801,14 @@ mod tests {
             .expect("commit delivery");
         assert_eq!(
             store
-                .acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id)
+                .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    event.semantic_id
+                )
                 .expect("initial acknowledgement"),
             EventDeliveryAck::Acknowledged
         );
@@ -43594,7 +44835,14 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("reopened policy");
         assert_eq!(
             store
-                .acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id)
+                .acknowledge_event_delivery_with_policy(
+                    &store
+                        .test_event_client_context()
+                        .expect("recovered subscription fixture"),
+                    &policy,
+                    subscription,
+                    event.semantic_id
+                )
                 .expect("late acknowledgement"),
             EventDeliveryAck::AlreadyAcknowledged
         );
@@ -43636,6 +44884,9 @@ mod tests {
         let policy = store.control_policy_snapshot().expect("policy");
         let subscription = store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(b"retirement/stale-pending".to_vec()).expect("key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -43643,13 +44894,21 @@ mod tests {
             .expect("subscription")
             .id;
         let transfer =
-            accept_local_finite_event(&store, &mut services, 0, b"stale pending", 100, initial);
+            accept_owned_finite_event(&store, &mut services, 0, b"stale pending", 100, initial);
         let event = store
             .get_event(transfer)
             .expect("event lookup")
             .expect("event");
         let plan = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("poll plan");
         let selection = verify_subscription_plan(&mut services.reader, &plan);
         store
@@ -43676,7 +44935,7 @@ mod tests {
         let store = Store::open_for_mission(&file.0, services.authority)
             .expect("reopen fenced pending cleanup");
         let policy = store.control_policy_snapshot().expect("reopened policy");
-        let _later = accept_local_finite_event(
+        let _later = accept_owned_finite_event(
             &store,
             &mut services,
             1,
@@ -43686,14 +44945,29 @@ mod tests {
         );
 
         let stale = store
-            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .prepare_event_subscription_poll_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                1,
+                1,
+            )
             .expect("skip stale pending within one scanned row");
         assert!(stale.pending_candidates().is_empty());
         assert!(stale.scanned_candidates().is_empty());
         assert_eq!(stale.scanned_through(), event.acceptance_marker);
         assert!(stale.has_more());
         assert!(matches!(
-            store.acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id),
+            store.acknowledge_event_delivery_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                subscription,
+                event.semantic_id
+            ),
             Err(StoreError::EventDeliveryNotFound)
         ));
         let read = store.database.begin_read().expect("partial cleanup read");
@@ -44103,6 +45377,9 @@ mod tests {
         let receiver_policy = receiver.control_policy_snapshot().expect("receiver policy");
         receiver
             .create_event_subscription_with_policy(
+                &receiver
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &receiver_policy,
                 &EventSubscriptionKey::new(b"custody/carry".to_vec()).expect("Carry key"),
                 subscription_spec(EventSubscriptionMode::Carry),
@@ -44225,6 +45502,9 @@ mod tests {
             .expect("reopened receiver policy");
         receiver
             .create_event_subscription_with_policy(
+                &receiver
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &receiver_policy,
                 &EventSubscriptionKey::new(b"custody/consume".to_vec()).expect("Consume key"),
                 subscription_spec(EventSubscriptionMode::Consume),
@@ -44714,6 +45994,9 @@ mod tests {
         let receiver_policy = receiver.control_policy_snapshot().expect("receiver policy");
         receiver
             .create_event_subscription_with_policy(
+                &receiver
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &receiver_policy,
                 &EventSubscriptionKey::new(b"custody/pending-consume".to_vec())
                     .expect("Consume key"),
@@ -46161,7 +47444,7 @@ mod tests {
             b"live",
         );
         let clock_id = [0x77; 16];
-        let retired = accept_local_finite_event(
+        let retired = accept_owned_finite_event(
             &store,
             &mut services,
             2,
@@ -46189,6 +47472,9 @@ mod tests {
         let control = store.control_policy_snapshot().expect("control policy");
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &control,
                 &EventSubscriptionKey::new(b"class/fences".to_vec()).expect("selector key"),
                 subscription_spec(EventSubscriptionMode::Carry),

@@ -3,14 +3,66 @@
 use sha2::{Digest as _, Sha256};
 use std::{
     fs,
+    io::{self, Read as _},
     net::TcpListener,
     os::unix::fs::PermissionsExt as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use aho_corasick::{AhoCorasick, AhoCorasickKind};
+use memchr::memmem::Finder;
+
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+const BINARY_MARKER_SCAN_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Eq, PartialEq)]
+struct MarkerReport {
+    missing_required: Vec<Vec<u8>>,
+    present_forbidden: Vec<Vec<u8>>,
+}
+
+#[test]
+fn binary_marker_scan_reports_boundary_matches_and_io_errors() {
+    let fixture = BinaryFixture::new(compose_binary_path());
+    let binary = fixture.root.join("marker-fixture.bin");
+    let mut bytes = vec![b'x'; BINARY_MARKER_SCAN_BYTES - 2];
+    bytes.extend_from_slice(b"required-across-boundary");
+    bytes.resize(BINARY_MARKER_SCAN_BYTES * 2 - 3, b'x');
+    bytes.extend_from_slice(b"forbidden-across-boundary");
+    bytes.extend_from_slice(b"present-required");
+    fs::write(&binary, bytes).expect("write marker fixture");
+
+    let report = find_binary_markers(
+        &binary,
+        &[
+            b"required-across-boundary".as_slice(),
+            b"across-boundary".as_slice(),
+            b"present-required".as_slice(),
+            b"missing-required".as_slice(),
+            b"missing-required".as_slice(),
+        ],
+        &[
+            b"forbidden-across-boundary".as_slice(),
+            b"bidden-across-boundary".as_slice(),
+            b"absent-forbidden".as_slice(),
+        ],
+    )
+    .expect("scan marker fixture");
+    assert_eq!(report.missing_required, [b"missing-required".to_vec()]);
+    assert_eq!(
+        report.present_forbidden,
+        [
+            b"forbidden-across-boundary".to_vec(),
+            b"bidden-across-boundary".to_vec()
+        ]
+    );
+
+    let error = find_binary_markers(&fixture.root.join("missing.bin"), &[], &[])
+        .expect_err("unavailable marker path must return its I/O error");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
 
 #[test]
 fn compose_binary_accepts_only_exact_schema_v2() {
@@ -109,21 +161,29 @@ fn compose_binary_has_only_the_compose_provider_and_no_legacy_mode() {
     // Break caught: linking systemd/admin code or retaining the unprotected
     // development CLI would create an alternate customer credential path.
     let binary_path = compose_binary_path();
-    let binary = fs::read(binary_path).expect("read Compose agent binary");
-    assert!(contains(&binary, b"aster-compose-secret-store/v1"));
-    for forbidden in [
-        b"aster-systemd-credential-store/v2".as_slice(),
-        b"CREDENTIALS_DIRECTORY".as_slice(),
-        b"aster-credential-admin".as_slice(),
-        b"SystemdCredentialLoader".as_slice(),
-        b"aster_systemd_credentials".as_slice(),
-        b"--mission-bundle-unprotected-reference".as_slice(),
-    ] {
-        assert!(
-            !contains(&binary, forbidden),
-            "forbidden binary contract present"
-        );
-    }
+    let report = find_binary_markers(
+        Path::new(binary_path),
+        &[b"aster-compose-secret-store/v1"],
+        &[
+            b"aster-systemd-credential-store/v2",
+            b"CREDENTIALS_DIRECTORY",
+            b"aster-credential-admin",
+            b"SystemdCredentialLoader",
+            b"aster_systemd_credentials",
+            b"--mission-bundle-unprotected-reference",
+        ],
+    )
+    .expect("scan Compose agent binary");
+    assert!(
+        report.missing_required.is_empty(),
+        "required Compose binary contracts missing: {:?}",
+        report.missing_required
+    );
+    assert!(
+        report.present_forbidden.is_empty(),
+        "forbidden systemd or legacy binary contracts present: {:?}",
+        report.present_forbidden
+    );
 
     let fixture = BinaryFixture::new(binary_path);
     let output = Command::new(binary_path)
@@ -199,20 +259,91 @@ fn compose_binary_rejects_oversized_config_before_hash_or_parse() {
     assert_eq!(utf8(output.stderr), "ERROR configuration file is invalid\n");
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+fn find_binary_markers(
+    path: &Path,
+    required: &[&[u8]],
+    forbidden: &[&[u8]],
+) -> io::Result<MarkerReport> {
+    let mut binary = fs::File::open(path)?;
+    let mut patterns: Vec<Vec<u8>> = Vec::new();
+    for marker in required.iter().chain(forbidden) {
+        if !marker.is_empty() && !patterns.iter().any(|pattern| pattern == marker) {
+            patterns.push(marker.to_vec());
+        }
+    }
+    let matcher = if patterns.is_empty() {
+        None
+    } else {
+        Some(
+            AhoCorasick::builder()
+                .kind(Some(AhoCorasickKind::DFA))
+                .build(&patterns)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        )
+    };
+    let finders = patterns.iter().map(Finder::new).collect::<Vec<_>>();
+    let longest_marker = patterns.iter().map(Vec::len).max().unwrap_or(0);
+    let overlap = longest_marker.saturating_sub(1);
+    let mut pattern_present = vec![false; patterns.len()];
+    let mut block = vec![0; BINARY_MARKER_SCAN_BYTES];
+    let mut tail = Vec::with_capacity(overlap);
+    let mut window = Vec::with_capacity(BINARY_MARKER_SCAN_BYTES + overlap);
+
+    loop {
+        let read = binary.read(&mut block)?;
+        if read == 0 {
+            break;
+        }
+        window.clear();
+        window.extend_from_slice(&tail);
+        window.extend_from_slice(&block[..read]);
+        if let Some(matcher) = &matcher {
+            for found in matcher.find_iter(&window) {
+                pattern_present[found.pattern().as_usize()] = true;
+                let local_start = found.start().saturating_sub(overlap);
+                let local_end = (found.end() + overlap).min(window.len());
+                for (index, finder) in finders.iter().enumerate() {
+                    if !pattern_present[index]
+                        && finder.find(&window[local_start..local_end]).is_some()
+                    {
+                        pattern_present[index] = true;
+                    }
+                }
+            }
+        }
+        let retained = overlap.min(window.len());
+        tail.clear();
+        tail.extend_from_slice(&window[window.len() - retained..]);
+    }
+
+    Ok(MarkerReport {
+        missing_required: report_markers(required, &patterns, &pattern_present, false),
+        present_forbidden: report_markers(forbidden, &patterns, &pattern_present, true),
+    })
+}
+
+fn report_markers(
+    markers: &[&[u8]],
+    patterns: &[Vec<u8>],
+    pattern_present: &[bool],
+    selected: bool,
+) -> Vec<Vec<u8>> {
+    let mut result: Vec<Vec<u8>> = Vec::new();
+    for marker in markers {
+        let present = marker.is_empty()
+            || patterns
+                .iter()
+                .position(|pattern| pattern == marker)
+                .is_some_and(|index| pattern_present[index]);
+        if present == selected && !result.iter().any(|item| item.as_slice() == *marker) {
+            result.push(marker.to_vec());
+        }
+    }
+    result
 }
 
 fn compose_binary_path() -> &'static str {
-    let binary_path = env!("CARGO_BIN_EXE_aster-compose-agent");
-    let binary = fs::read(binary_path).expect("read candidate Compose agent binary");
-    assert!(
-        contains(&binary, b"aster-compose-secret-store/v1"),
-        "Compose tests must inspect the Compose aster-agent binary"
-    );
-    binary_path
+    env!("CARGO_BIN_EXE_aster-compose-agent")
 }
 
 fn utf8(bytes: Vec<u8>) -> String {

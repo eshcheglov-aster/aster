@@ -1,5 +1,121 @@
 # Aster path-lab
 
+## Opt-in Event impairment and resource diagnostic
+
+`tools/aster_path_diagnostic.py` shares the delivery image, production agents,
+Connect JSON client and owned-container cleanup with the smoke below. It runs
+four independent two-agent workloads by default:
+
+| Profile | Both WAN egress interfaces |
+| --- | --- |
+| baseline | No configured delay, loss, rate limit or reordering |
+| impaired | 40 ms delay, 5 ms jitter, 1% loss, 100 Mbit/s |
+| reorder | The impaired profile plus 10% reordering |
+| outage | Baseline, then 100% loss for 10 seconds starting after 20 seconds |
+
+Each endpoint attempts 600 durable 1-KiB Events at 10 Events/second, continuously
+polls and acknowledges deliveries, and requires every admitted Event's exact ID,
+logical key and payload at its peer. Each publishing lane owns a durable SDK
+journal and stable client identity. Lost replies are recovered through the
+numbered session and original journaled intent, never a new publication. The
+CLI does not expose structured capacity-rejection details, so resource
+exhaustion alone is not counted as a definite rejection; unresolved outcomes
+fail the run. Journals remain available to the helper's recovery path during the
+run; final owned-state cleanup removes them together with the disposable mission
+credentials, including on failure. Retained receipts are not resumable journals.
+A run with no admitted Events cannot pass. The outage publishes
+new witness Events only after both 100%-loss qdiscs are read back, checks them
+absent at the peer before restoration, and allows 120 seconds after restoration
+for delivery. Restoration is armed after the loss replacements, before qdisc
+readback; late or failed readback cannot extend the timer or establish negative
+witness evidence. Both interface change times are retained. Finally both agents
+stop, reopen **without peers**, with WAN still
+cut, and query every accepted Event using bounded advancing pagination.
+
+```sh
+docker build --file docker/path-lab/Dockerfile.delivery \
+  --tag aster-path-delivery:local .
+python3 tools/aster_path_diagnostic.py --output artifacts/path-diagnostic
+python3 tools/test_aster_path_diagnostic.py
+```
+
+### Manual GitHub Actions launch
+
+Choose **Actions → Diagnostic: manual runtime-volume test → Run workflow**, then
+select the source branch. `.github/workflows/diagnostic-runtime-volume.yml` must exist on
+the default branch before GitHub exposes the launch button. This replaces the
+archived runtime-volume launch; it does not revive that implementation or run
+on pushes, pull requests, or as part of `CI / required`.
+
+The Ubuntu 24.04 job builds `Dockerfile.delivery` from the selected checkout,
+using the same digest-pinned Rust base, locked Cargo dependencies and Debian
+snapshot as the delivery smoke. It then runs all four default profiles above,
+without privileged containers or host networking. There are no free-form shell
+inputs or pre-existing local image dependencies.
+
+Download **aster-path-diagnostic-<commit SHA>-<run attempt>** from the run's
+Artifacts section (14-day retention). Its root contains `receipt.json`, per-profile
+JSON and `preflight.log`, `build.log`, and `controller.log` as available. Upload
+is attempted even after failures and command timeouts; a build failure has no
+runtime receipt. The receipt records source/image identities and cleanup results.
+The build is bounded to 30 minutes, the controller to 50 minutes plus five minutes
+for termination/owned-resource cleanup, and the job to 90 minutes. The controller's
+own per-profile deadlines normally expire earlier. Private ownership directories
+and credentials are never uploaded. A hard kill or runner loss can prevent final
+cleanup/report writes or upload; the disposable hosted runner is the final
+containment boundary. No TLS bypass or alternate-image fallback is used if the
+canonical build fails; inspect `build.log` instead.
+
+This diagnostic needs access to the local rootful Linux Docker Engine and kernel
+veth/netem support, but **not host root, sudo or host NET_ADMIN**. It creates veths
+inside owned containers using NET_ADMIN-only setup helpers and a read-only bind
+of the owned WAN container's network namespace. No host interface, route, qdisc,
+firewall, SYS_ADMIN capability or privileged container is used. Unlike the short
+smoke, the three setup helpers and CHOWN-only provisioner remain for the bounded
+run, so they can change impairments and reclaim private credentials. Agents and
+namespace holders remain UID/GID 10001 with all capabilities dropped. No network
+path bypasses WAN. The diagnostic source helper is bound read-only into nodes;
+the production executable comes from the delivery image. All four local Python
+helpers (diagnostic, numbered publisher, Connect client, and Docker controller)
+are copied at campaign start and mounted read-only; every container is created
+from the resolved immutable image ID, not the mutable tag.
+
+`--help` lists bounded workload, impairment, sampling and recovery parameters.
+`--profiles baseline` selects a shorter development run; the default runs all
+four profiles. Samples contain actual agent-PID CPU ticks, RSS and application
+status counters/capacities. Application delivery backlog is **not an Iroh send
+queue**. Monotonic phase timings, configured arguments, qdisc readback, accepted
+and rejected publications, exact deliveries, restart results and cleanup errors
+are retained in JSON even when a profile fails. `receipt.json` records the image
+ID, source HEAD, complete tracked delta against HEAD (including staged changes),
+and individual helper digests (including relevant untracked helpers). Source
+and helper identities are rechecked throughout and after cleanup; profile PASS
+receipts are withheld until final campaign validation succeeds. The provisioner
+wipes private credentials;
+owned-resource cleanup must then succeed before ownership metadata is removed.
+Failed cleanup retains its ownership locator. No credentials are included in the receipt.
+
+The publisher schedules locally inside each persistent helper, independently of
+continuous polling/acknowledgement. At most 48 publication RPCs per endpoint may
+be outstanding; exhausting that diagnostic bound fails instead of silently
+slowing the requested pace. Connect JSON calls have a 30-second timeout; numbered
+publication uses `asterctl --timeout 10` with a 35-second subprocess bound per
+CLI invocation (recovery may require several invocations). The peerless query
+has a separate 180-second deadline per node, and each profile has an overall
+publication + restoration + 420-second deadline. These are diagnostic bounds,
+not changed application capacities.
+
+A compatible locally assembled image can be selected with `--image` and labelled
+with `--build-kind local-debug` or `--build-kind local-release`. Keep its build
+log, Dockerfile, binary hashes and package versions alongside the receipt;
+these runs are not the canonical digest-pinned release image. In particular,
+debug-build throughput is not interchangeable with release-build throughput.
+
+These are one-host diagnostics, not target-hardware thresholds, physical-link
+qualification, deterministic packet-loss sequences, or new requirements credit.
+The opt-in workload does not run as part of `mise run check`; its controller
+regressions do. The original one-Event smoke behavior below is unchanged.
+
 The path-lab is a bounded Linux-only network-emulation scaffold for the
 Linux/Event customer-readiness profile. It uses Containerlab only for topology
 orchestration and Linux `netem` for packet-path impairment. Product nodes and

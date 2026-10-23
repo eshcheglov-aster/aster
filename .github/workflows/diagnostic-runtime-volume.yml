@@ -1,0 +1,67 @@
+name: "Diagnostic: manual runtime-volume test"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  diagnostic:
+    name: Runtime-volume diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Validate diagnostic contracts and record environment
+        run: |
+          mkdir -p artifacts/path-diagnostic
+          {
+            git rev-parse HEAD &&
+            uname -r &&
+            docker version &&
+            python3 --version &&
+            python3 tools/test_aster_path_diagnostic.py &&
+            python3 tools/test_aster_path_delivery.py
+          } 2>&1 | tee artifacts/path-diagnostic/preflight.log
+
+      - name: Build the canonical release image from this checkout
+        # Same digest-pinned Rust toolchain and Debian snapshot as the smoke.
+        # No local-image fallback or TLS verification bypass.
+        run: |
+          timeout --signal=TERM --kill-after=30s 30m \
+            docker build --pull=false --progress=plain \
+              --file docker/path-lab/Dockerfile.delivery \
+              --tag aster-path-delivery:local . \
+            2>&1 | tee artifacts/path-diagnostic/build.log
+
+      - name: Run all four default profiles
+        # Controller deadlines and finally blocks own cleanup, including TERM.
+        # Leave time before the job limit for cleanup and artifact upload.
+        # Never upload the private ownership/credential directories in TMPDIR.
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout --signal=TERM --kill-after=300s 50m \
+            python3 -u tools/aster_path_diagnostic.py \
+              --output artifacts/path-diagnostic \
+            2>&1 | tee artifacts/path-diagnostic/controller.log
+
+      - name: Retain reports and logs even after failure or timeout
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: aster-path-diagnostic-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/path-diagnostic/
+          if-no-files-found: error
+          retention-days: 14

@@ -37,7 +37,7 @@ async fn blob_ranges_stream_saturated_six_mutable_directions() {
             &scope,
             b"stream-six",
         );
-        for index in 0..16 {
+        for index in 0..2 {
             publish_test_epoch_one_event(
                 store,
                 &mut sealer,
@@ -73,8 +73,10 @@ async fn blob_ranges_stream_saturated_six_mutable_directions() {
     }
     let a_cache = test_event_route_cache(&stores[0], &a.credentials);
     let b_cache = test_event_route_cache(&stores[1], &b.credentials);
-    let preaccounted =
-        event_transfer_capacity(&PeerReceipt::default(), Some(SEMANTIC_PROTOCOL_V7)).unwrap() - 2;
+    let production_event_capacity =
+        event_transfer_capacity(&PeerReceipt::default(), Some(SEMANTIC_PROTOCOL_V7)).unwrap();
+    assert_eq!(production_event_capacity, MAX_CONTACT_ITEMS - 9);
+    let preaccounted = production_event_capacity - 2;
     let contact = blob_contact_test_pair_with_caches(
         stores[0].clone(),
         a.credentials,
@@ -92,6 +94,8 @@ async fn blob_ranges_stream_saturated_six_mutable_directions() {
     );
     let (left, right) = contact.await;
     for receipt in [&left, &right] {
+        assert_eq!(receipt.event_page_entries_sent, 1, "{receipt:?}");
+        assert_eq!(receipt.event_page_unscheduled, 1, "{receipt:?}");
         assert!(receipt.blob_ranges_fetched > 0, "{receipt:?}");
         assert!(
             receipt.offered + receipt.fetched <= MAX_CONTACT_ITEMS,

@@ -114,17 +114,21 @@ source bytes. `--schema-id` is Base64;
 `18446744073709551615`. Omitting it selects durable publication.
 
 `blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
-it writes to an anonymous temporary inode in the pinned destination directory,
-then publishes that exact open inode with an atomic no-replace descriptor link
-after synchronization. No named partial path exists. Closing the descriptor
-discards an incomplete read, and an existing or concurrently created
-destination is never overwritten. The command fails before contacting the
-agent on non-Linux platforms and when the destination filesystem cannot create
-the required anonymous temporary. If descriptor-link publication is
-unsupported, finalization fails without publishing an output path. Every
-streamed page must have contiguous offsets, stable authenticated metadata and
-TTL, and an exact complete length. Blob bytes go only to the destination;
-stdout contains metadata and never Blob plaintext.
+it requires a destination directory owned by the current user and not writable
+by group or other users. It writes to a randomly named mode-0600 sibling,
+synchronizes the complete verified stream, then atomically renames that exact
+inode with no-replace semantics and synchronizes the directory. The requested
+destination remains absent until publication, and an existing or concurrently
+created destination is never overwritten. Failure cleanup removes the sibling
+on a best-effort basis; filesystem errors or an abrupt process or host failure
+can leave that hidden owner-only file for operator cleanup. A post-publication
+directory-sync error says that the output exists and must be verified before
+retrying. The command fails before contacting the agent on non-Linux platforms
+and fails closed when the destination filesystem cannot provide named staging,
+atomic no-replace rename, or directory synchronization. Every streamed page
+must have contiguous offsets, stable authenticated metadata and TTL, and an
+exact complete length. Blob bytes go only to the output filesystem; stdout
+contains metadata and never Blob plaintext.
 
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.
@@ -142,32 +146,80 @@ See [asterctl-blob-publish(1)](asterctl-blob-publish.1) and
 
 ## Publish
 
+Initialize one journal for a stable application identity, then reuse it across
+CLI invocations:
+
 ```sh
+asterctl publication-init --journal ./publisher.redb --client-id chat-controller
 asterctl --token-file ./client.token publish \
-    --topic chat.events --scope mission/team/alpha \
-    --operation-key auto "Hello, Aster!"
+    --journal ./publisher.redb --client-id chat-controller \
+    --topic chat.events --scope mission/team/alpha "Hello, Aster!"
 
 cat image.png | asterctl --token-file ./client.token publish \
-    --topic chat.events --scope mission/team/alpha --operation-key image-001
+    --journal ./publisher.redb --client-id chat-controller \
+    --topic chat.events --scope mission/team/alpha
 ```
+
+Journal initialization is local and requires no token. It refuses an existing
+file. Keep the journal in a protected directory: it contains complete plaintext
+intents and payloads. Opening a missing, corrupt, already-open, or differently
+configured journal fails before reading stdin or contacting the agent. Do not
+delete and recreate an established journal or choose a new client ID to retry
+an uncertain operation. Lost-journal recovery is outside this increment.
 
 Supply one `MSG` argument or read the payload from stdin until EOF. When stdin
 is a terminal, the CLI prints instructions to stderr before reading: finish
 with Ctrl-D on an empty line, or cancel with Ctrl-C. Piped input, an explicit
 `MSG`, and tombstone publications do not print these instructions. Payload
 bytes are preserved, including NUL bytes and newlines from stdin; no newline is
-added to `MSG`. Use `--` before a message beginning with `-`.
-The complete encoded request, including metadata, must fit within 1 MiB.
+added to `MSG`. Use `--` before a message beginning with `-`. The complete
+encoded request, including space for the largest session and sequence fields,
+must fit within 1 MiB. The journal-backed CLI additionally limits the payload
+to 65,536 bytes, matching the Rust and Go publication journals. Each journal
+retains at most eight entries within a 1 MiB logical serialized-state budget,
+including metadata and reserved result/recovery space. Apply committed results
+idempotently and use `publication-ack` to free journal capacity. The journal
+budget does not cap the physical database file size.
 
-See `asterctl publish --help` or [asterctl-publish(1)](asterctl-publish.1)
-for all publication options. `--operation-key KEY|auto` is required.
-Reuse the same key with an identical request for an idempotent retry;
-see [Operation keys and manual recovery](#operation-keys-and-manual-recovery).
+Fresh publish JSON contains the numbered `result` and the service's transient
+`inserted` observation. Recovery/retry JSON contains the retained committed
+result; that receipt does not retain an insertion observation.
 
-This command uses the arbitrary-key `PublishEvent` RPC provided by the agent.
-For finite Events, the CLI checks that the receipt confirms the requested
-TTL. If an older agent omits it, the command reports failure; the Event may
-already have been published without the requested lifetime.
+The CLI recovers its fenced publication session, assigns a positive operation
+sequence durably, and announces that sequence before `PublishNumberedEvent`.
+It saves the committed result before displaying it. A failed publication stays
+journaled; new publication is blocked while an earlier intent remains pending.
+After an uncertain outcome, recover using the same journal and identity:
+
+```sh
+asterctl --token-file ./client.token --json publication-recover \
+    --journal ./publisher.redb --client-id chat-controller
+asterctl --token-file ./client.token --json publication-retry \
+    --journal ./publisher.redb --client-id chat-controller --sequence 1
+```
+
+`publication-show --sequence N` inspects one retained original intent locally;
+it does not contact the agent. This supports applying a recovered result using
+the exact original payload after process replacement.
+
+`publication-retry` sends the original journaled intent or displays its recovered
+committed receipt. Apply the result idempotently, then reclaim its journal and
+server result rows explicitly:
+
+```sh
+asterctl --token-file ./client.token publication-ack \
+    --journal ./publisher.redb --client-id chat-controller --sequence 1
+```
+
+`publication-abandon` with the same identity and `--sequence N` permanently
+consumes the next unadmitted sequence. It cannot undo a committed Event. Use it
+only when deliberately discarding that pending operation. Transport errors do
+not trigger abandonment. TTL cleanup may retire Event content while its
+committed receipt remains recoverable until acknowledgement.
+
+See `asterctl publish --help` or [asterctl-publish(1)](asterctl-publish.1) for
+publication options. Subscription creation retains its existing operation-key
+model until the separate client-ownership increment.
 
 ## Query
 
@@ -197,10 +249,25 @@ See [asterctl-query(1)](asterctl-query.1) for the command reference.
 
 ```sh
 asterctl --token-file ./client.token subscribe \
+    --journal ./publisher.redb --client-id chat-controller \
     --scope mission/team/alpha --operation-key=auto chat.events
 asterctl --token-file ./client.token --json subscribe \
+    --journal ./publisher.redb --client-id chat-controller \
     --scope 'mission/team/*' --operation-key chat-reader chat.events
 ```
+
+`subscribe` and `unsubscribe` require `--journal` and `--client-id` for the
+subscription owner. Initialize once as shown under Publish, then retain that
+journal across restarts. These CLI commands explicitly recover before mutation.
+`client-status --journal PATH --client-id ID` observes the journal caller
+without recovery or takeover, including immediately after `publication-init`.
+A client absent from the server returns unregistered status, no current session,
+and zero ownership counts. The journal retains session zero until recovery;
+the status request omits that unissued session. A registered client with no
+observed session reports recovery-required; a positive observed session can
+report current, fenced, or recovery-required. Status preserves the journal and
+never claims a session. Mutation commands retain their existing recovery checks. `publication-recover` also returns the recovered
+`client` context for direct JSON calls.
 
 `TOPIC` is a required positional argument; `--scope` is also required.
 The scope wildcard has the same meaning as in `query`. Use `--` before a
@@ -237,8 +304,10 @@ in JSON. See [asterctl-subscriptions(1)](asterctl-subscriptions.1).
 ## Unsubscribe
 
 ```sh
-asterctl --token-file ./client.token unsubscribe "$SUBSCRIPTION_ID"
-asterctl --token-file ./client.token --json unsubscribe "$SUBSCRIPTION_ID"
+asterctl --token-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \
+    --journal ./publisher.redb --client-id chat-controller
+asterctl --token-file ./client.token --json unsubscribe "$SUBSCRIPTION_ID" \
+    --journal ./publisher.redb --client-id chat-controller
 ```
 
 Removes an Event subscription and its delivery ledger. Use the ID returned by
@@ -252,10 +321,9 @@ See [asterctl-unsubscribe(1)](asterctl-unsubscribe.1).
 
 ## Operation keys and manual recovery
 
-`publish`, `blob-publish`, and `subscribe` require `--operation-key KEY|auto`.
+`blob-publish` and `subscribe` require `--operation-key KEY|auto`.
 `--operation-key auto` and `--operation-key=auto` are equivalent. An omitted
-key is an argument error (exit code `2`), detected before reading a publication
-payload from stdin or sending an RPC:
+key is an argument error (exit code `2`), detected before sending an RPC:
 
 ```text
 asterctl: --operation-key is required; specify a key or 'auto'
@@ -272,7 +340,7 @@ asterctl: operation-key=8f129cd0e346a27b9014fe6c72a583bd
 ```
 
 If writing or flushing that message fails, the command exits with code `1`
-without sending the RPC. `publish` and `subscribe` JSON results
+without sending the RPC. Subscription JSON results
 also include `operation_key`, for both explicit and generated keys.
 
 A timeout, lost connection, or unusable response can leave the operation's
@@ -281,11 +349,11 @@ command exits with code `1` and reports the key and recovery instruction on
 stderr, for example:
 
 ```text
-asterctl: PublishEvent outcome unknown: deadline_exceeded
+asterctl: CreateEventSubscription outcome unknown: deadline_exceeded
 retry the identical request with --operation-key=8f129cd0e346a27b9014fe6c72a583bd
 ```
 
-Subscription diagnostics use `CreateEventSubscription`. Request rejections
+Request rejections
 such as `invalid_argument` or `aborted` are reported as failures. Codes that
 also represent lost or unusable responses, including `resource_exhausted`,
 are conservatively reported as unknown outcomes.
@@ -293,7 +361,8 @@ are conservatively reported as unknown outcomes.
 To recover, repeat the request against the same agent with the printed key
 and identical parameters and payload. For stdin, retain and reuse the original
 bytes. Do not use `auto` for that retry: every invocation generates a new key.
-No automatic retry is performed. The CLI keeps no persistent journal; printing
+No automatic subscription retry is performed. Subscription creation keeps no
+persistent journal; printing
 and flushing a key does not guarantee durable storage. Automation should save
 an explicit key and the request before invoking the command.
 
@@ -308,10 +377,11 @@ booleans display `Yes` or `No`; enum names display as readable words (for
 example, `Last contact complete`). Unknown enum values display as `Unknown (N)`.
 Identities remain full standard padded base64.
 
-Publication receipts show the Event ID, publisher, counters, priority,
-acceptance marker, and TTL. The result is `Published locally` for a new Event
-or `Already published` for an idempotent retry; both succeed. TTL displays its
-original duration, including milliseconds, or `None` for no expiry.
+Publication results show the client operation sequence, committed Event and
+transfer IDs, original acceptance marker, and current content status. Retired
+content retains its committed identity and includes a retirement reason in
+JSON. Use query to inspect source counters, priority, or TTL while content is
+available. Printing a result does not acknowledge or erase it.
 
 Storage sizes use binary units (`B`, `KiB`, `MiB`, and so on), rounded to at most
 two decimal places. Durations use days, hours, minutes, and seconds, such as

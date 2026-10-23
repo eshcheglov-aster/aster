@@ -13,6 +13,19 @@ feature and an already running agent at `127.0.0.1:8181`; pass its provisioned
 client token (without the `Bearer ` prefix). See the
 [agent quickstart](../../docs/quickstart/connect-agent.md) for local setup.
 
+Blob API access is independent of network receive policy. Strict schema v1/v2
+configuration defaults absent or empty `mesh.blob_interests` to receive none.
+A nonempty list accepts at most 256 unique canonical exact `TOPIC@SCOPE`
+selectors and requires explicit nonzero `storage.blob_depot.max_bytes`,
+`max_chunks`, and `max_variants`; all of these fields are restart-only. Mission
+route/content authorization remains authoritative, and authenticated peers can
+observe exact configured topic/scope interest metadata under the current
+policy. `receive_only` retains the selectors in configuration but performs
+zero Blob network work. Receiving through the mesh does not create an
+application subscription, and the agent does not expose the separate Rust Blob
+subscription surface. Older agents reject the new fields, so rollback must
+restore the older configuration shape as well as the executable.
+
 ### Connect client and borrowed response
 
 `view()` borrows fields from the response buffer. Keep the response alive while
@@ -121,95 +134,129 @@ protocol maximum. The current selected backend nevertheless admits at most
 and caps each stream at 30 seconds. Those are current implementation limits,
 not RPC compatibility guarantees or large-file performance claims.
 
-`blob-read` currently requires Linux plus destination-filesystem support for
-`O_TMPFILE` and descriptor-relative linking. It creates an anonymous mode-0600
-inode in the pinned destination directory, synchronizes it, and atomically
-links that exact open inode to the requested new path. Unsupported platforms or
-filesystems fail closed. The caller's publish source and completed read output
-remain caller-owned files outside node zeroization custody; zeroizing the node
-does not erase either file. The agent's upload staging is separate, private,
-unlinked before payload acceptance, and currently Linux-only. On Linux the
-configured state root (including an accepted symlink) is resolved once and the
-node start is verified against that exact device/inode before Blob staging uses
-the pinned descriptor; later path replacement cannot redirect either side. On
-other supported Unix platforms the existing Event and status service still
-starts, while Blob publish fails with a fixed unsupported response before
-consuming stream bytes.
+`blob-read` currently requires Linux, an owner-controlled destination directory
+(owned by the current user and not writable by group or other users), and a
+filesystem that supports named staging, atomic no-replace rename, and directory
+synchronization.
+It writes to a randomly named mode-0600 sibling, synchronizes the complete
+verified stream, atomically renames that exact inode without replacing an
+existing or concurrently created path, and synchronizes the directory. Failure
+cleanup is best-effort; filesystem errors or an abrupt process or host failure
+can leave the hidden owner-only file for operator cleanup. A post-publication
+directory-sync error says the output exists and must be verified before retrying.
+Unsupported platforms or filesystems fail closed. The caller's publish source
+and completed read output remain caller-owned files outside node zeroization
+custody; zeroizing the node does not erase either file. The agent's upload
+staging is separate, private, unlinked before payload acceptance, and currently
+Linux-only. On Linux the configured state root (including an accepted symlink)
+is resolved once and the node start is verified against that exact device/inode
+before Blob staging uses the pinned descriptor; later path replacement cannot
+redirect either side. On other supported Unix platforms the existing Event and
+status service still starts, while Blob publish fails with a fixed unsupported
+response before consuming stream bytes.
 
 This agent increment provides Blob publish and read only. Blob subscription,
 poll, acknowledgement, transfer-status commands, and Blob FFI lifetime fields
 remain outside this surface.
 
+The legacy binary flag `--blob-interest TOPIC@SCOPE` is repeatable but exists
+only for development/migration mode. Customer service deployments use strict
+schema v1 or v2 configuration; neither form grants public API access or creates
+an application subscription.
+
 ### Pipelined durable Event publication
 
-Native Connect and gRPC clients over HTTP/2 can keep independent ordinary
-Event publications in flight with [`sdk::PipelinedEventPublisher`]. Each
-ordered published outcome is returned only after the running selected node's
-local durable authority has committed that Event and its operation-key mapping.
-A sanitized application failure is returned in order without claiming an Event
-commit. Neither outcome waits for mesh delivery: synchronization starts from a
-successfully published durable local object independently.
+Shipped Event publication is numbered-only. `PublishEvent`, `PublishEvents`,
+and the ordinary-publication SDK helpers have been removed. Both unary and
+pipelined publishers require a stable client ID, an explicitly initialized
+journal, and recovery before assigning new work.
 
-Persist every operation key before calling the publisher. If a bounded stream
-session rotates or disconnects, the helper resends only sent requests without
-an observed response and keeps their original keys. The durable operation
-ledger resolves a commit whose response was lost. The retry budget passed to
-`new` bounds consecutive transport disconnects; healthy session rotation does
-not consume it.
+Native Connect and gRPC over HTTP/2 use `PublishNumberedEvents`. The SDK journals
+complete intents before sending, persists each ordered result before freeing a
+window slot, and replays the exact unanswered sequences after a disconnect.
+
+Initialize `path` once with `PublicationJournal::initialize(path, client_id)`
+during explicit fresh provisioning. Reopen it on subsequent process launches;
+a missing journal must be diagnosed rather than recreated.
 
 ```no_run
 # #[cfg(feature = "client")]
 async fn publish_telemetry(
     token: &str,
+    path: &std::path::Path,
+    mut apply: impl FnMut(u64, &aster_agent::proto::aster::application::v1alpha1::CommittedPublicationResult) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use aster_agent::{
-        proto::aster::application::v1alpha1 as api,
-        sdk::PipelinedEventPublisher,
-    };
+    use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, RecoveredState}};
     use connectrpc::{Protocol, client::{ClientConfig, Http2Connection}};
-
-    let uri = "http://127.0.0.1:8181".parse()?;
-    let connection = Http2Connection::connect_plaintext(uri).await?.shared(32);
+    let connection = Http2Connection::connect_plaintext("http://127.0.0.1:8181".parse()?).await?.shared(32);
     let config = ClientConfig::new("http://127.0.0.1:8181".parse()?)
         .with_protocol(Protocol::Connect)
         .with_default_header("authorization", format!("Bearer {token}"));
     let client = api::AsterApplicationServiceClient::new(connection, config);
-    let requests = (0_u8..4)
-        .map(|sample| api::PublishEventRequest {
-            operation_key: format!("sensor-a/{sample}").into_bytes(),
-            topic: "telemetry.temperature".to_owned(),
-            scope: "mission/team/alpha".to_owned(),
-            priority: api::Priority::Routine.into(),
-            logical_key: b"sensor-a".to_vec(),
-            payload: vec![sample],
-            ..Default::default()
-        })
-        .collect();
-    let outcomes = PipelinedEventPublisher::new(client, 3)
-        .publish_all(requests)
-        .await?;
-    assert_eq!(outcomes.len(), 4);
+    let sdk = NumberedEventSdk::open(client, path, b"sensor-a")?;
+    for operation in sdk.recover().await?.operations {
+        let result = match operation.state {
+            RecoveredState::Pending => Some(sdk.publish_journaled(operation.sequence).await?),
+            RecoveredState::Committed(result) => Some(result),
+            RecoveredState::Retired => None,
+        };
+        if let Some(result) = result {
+            apply(operation.sequence, &result)?; // durable, idempotent application progress
+            sdk.acknowledge(operation.sequence).await?;
+        }
+    }
+    let sequences = (0_u8..4).map(|sample| sdk.journal_publication(api::PublishNumberedEventRequest {
+        topic: "telemetry.temperature".to_owned(), scope: "mission/team/alpha".to_owned(),
+        priority: api::Priority::Routine.into(), logical_key: b"sensor-a".to_vec(), payload: vec![sample], ..Default::default()
+    })).collect::<Result<Vec<_>, _>>()?;
+    let results = sdk.publish_journaled_pipeline(&sequences, 3).await?;
+    for (sequence, result) in sequences.into_iter().zip(results) {
+        apply(sequence, &result)?;
+        sdk.acknowledge(sequence).await?;
+    }
     Ok(())
 }
 ```
 
-The helper's active window and session-rotation interval are bounded reference
-implementation choices, not protocol rate or batch limits. The stream keeps
-ordinary publications independent; it is not the atomic cryptographic batch
-API and does not accept numbered publication. gRPC-Web cannot stream request
-bodies, so browser clients must use a bounded application-selected window of
-concurrent unary `PublishEvent` calls with the same operation-key retry rule.
+The reference window is eight and healthy streams rotate after eight seconds,
+before the ten-second server deadline. These are implementation bounds, not
+validated rates. gRPC-Web uses ordered unary `PublishNumberedEvent` calls per
+client; different configured clients may proceed concurrently. The SDK stops
+at the first rejected sequence and preserves that intent and later journaled
+work for explicit repair or abandonment. It never abandons work automatically.
 
 ### Crash-safe numbered publication
 
 With the `client` feature, [`sdk::PublicationJournal`] and
-[`sdk::NumberedEventSdk`] implement the experimental numbered-publication
-profile. Journal creation is explicit. The journal contains plaintext publication
+[`sdk::NumberedEventSdk`] implement numbered Event publication. Journal creation is explicit. The journal contains plaintext publication
 intents and payloads: keep it in a protected directory. On Unix, creation uses
 mode `0600`, and opening rejects symlinks, non-regular files, files owned by
 another user, or group/other permissions. Existing journals with broader
 permissions must be restricted by their owner before opening. On other
 platforms, protect access through the directory and file ACLs.
+Initialization commits the initial state with immediate durability, then opens
+and synchronizes the parent directory before reporting success, matching the
+Go and native journals. A directory-sync failure returns an error and retains
+the journal; preserve that state rather than deleting or reinitializing it.
+Parent lookup currently uses the pathname; retaining the exact creation-directory
+handle against concurrent renames or replacement is tracked in
+[issue #111](https://github.com/defenseunicorns/aster/issues/111).
+
+The Rust SDK retains at most **eight entries** and charges a **1 MiB logical
+serialized-state budget** across metadata, entry keys, intents, and saved
+results. Admission reserves 1,024 serialized bytes per result plus worst-case
+recovery-claim and counter metadata, so a full journal can still save current
+receipts, retire content, and recover. Event payloads are limited to 65,536
+bytes, matching the Go journal. These are local journal bounds; the independent
+eight-request network window limits only concurrent transmission. The byte
+budget does not cap redb's physical file size or allocator overhead.
+
+Checks run inside each journal write transaction. A rejected publication does
+not consume a sequence or change retained state. Pending intents and committed
+results awaiting acknowledgement both occupy slots; acknowledgement or
+confirmed abandonment/removal frees capacity. Opening rejects an existing
+journal above these limits without discarding its retained state. Preserve an
+incompatible journal for diagnosis rather than deleting or recreating it.
 
 Opening a missing, corrupt,
 already-open, or differently configured journal fails closed. Call `recover`
@@ -227,6 +274,23 @@ and their payloads are removed from the journal. A `publish()` error exposes
 retain that sequence for recovery after an uncertain RPC outcome. See the
 [agent quickstart](../../docs/quickstart/connect-agent.md#use-crash-safe-numbered-publication)
 for an end-to-end example and the exact Increment 1 boundary.
+
+`publish_journaled_pipeline(&sequences, max_disconnect_retries)` sends a
+contiguous range beginning at the next first admission over native HTTP/2
+`PublishNumberedEvents`. Complete intents must already be journaled. It uses
+the existing eight-input window and rotates before the server's default
+stream deadline; each committed receipt is saved before the SDK releases a
+window slot. Disconnect replay preserves client ID, session, sequence, and
+intent. A rejected input stops this SDK pipeline and remains journaled, along
+with unresolved later inputs, for explicit repair or abandonment. Successful
+receipts already saved before a later error are available through recovery.
+The service returns ordered per-input numbered outcomes and rejects gRPC-Web
+request streaming; numbered unary calls remain available there. Migrate
+ordinary publishers to this journaled lifecycle and regenerate clients against
+the current service schema. Nonempty legacy Event publication ledgers are
+refused at startup; preserve them for read-only inspection and explicitly
+provision fresh state. See the
+[numbered-publication migration guide](../../docs/quickstart/connect-agent.md#use-crash-safe-numbered-publication).
 
 ### Serving a live node for development or migration
 

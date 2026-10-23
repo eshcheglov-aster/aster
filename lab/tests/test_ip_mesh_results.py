@@ -520,8 +520,6 @@ def passing_gate_h_execution_provenance() -> dict:
                     "aster_host_gate_h_formal": 1,
                 },
                 "forbidden_tokens": [
-                    "legacy-single-contact-service",
-                    "legacy-lab",
                     "libp2p*",
                     "iroh*",
                 ],
@@ -2839,7 +2837,7 @@ class IpMeshResultsTests(unittest.TestCase):
             receipt = json.loads(path.read_text(encoding="utf-8"))
             host_build = receipt["test_executable_build"]["builds"]["aster-host"]
             host_build["argv"][host_build["argv"].index("gate-h-formal")] = (
-                "legacy-single-contact-service"
+                "iroh-probe"
             )
             build_plan = [
                 {
@@ -3023,7 +3021,7 @@ class IpMeshResultsTests(unittest.TestCase):
             graph = receipt["execution_provenance"]["formal_feature_graph"]
             stdout = base64.b64decode(graph["stdout"]["base64"], validate=True)
             graph.update(
-                _fault_stream_fields("stdout", stdout + b"legacy-lab\n")
+                _fault_stream_fields("stdout", stdout + b"iroh-probe\n")
             )
             rewrite_gate_h_fault_receipt(root, receipt)
             with self.assertRaisesRegex(results.ResultsError, "provider-tainted"):

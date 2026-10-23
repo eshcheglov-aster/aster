@@ -253,25 +253,84 @@ async fn blob_ranges_stream_publication_capacity_rotates_two_installed_sources()
                 &topic,
                 &scope,
                 1,
-                &vec![n + 5; 32 * 1024],
+                &[n + 5],
             )
         })
         .collect();
-    for _ in 0..4 {
-        blob_contact_test_pair(
-            a_store.clone(),
-            a.credentials.clone(),
-            interests(),
-            b_store.clone(),
-            b.credentials.clone(),
-            interests(),
-        )
-        .await;
+    let receiver_cache = test_event_route_cache(&b_store, &b.credentials);
+    for source in &sources {
+        let sealed = a_store
+            .get_blob(*source)
+            .unwrap()
+            .expect("installed rotation source")
+            .sealed;
+        stage_test_pending_blob(
+            &b_store,
+            &receiver_cache,
+            &b.credentials,
+            *source,
+            &sealed,
+        );
+        let mut source_verifier = open_test_sealer(&a.credentials);
+        let route = source_verifier.verify_blob(&sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = source_verifier
+            .verify_blob_content(route, &sealed)
+            .unwrap()
+        else {
+            panic!("installed rotation source lost content access")
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).unwrap();
+        let completion = a_store
+            .blob_depot()
+            .and_then(|mut depot| depot.completed_blob(&blob, &manifest_bytes))
+            .unwrap();
+        let lineage = source_verifier.verify_current_blob_lineage(&blob).unwrap();
+        let source_policy = a_store.control_policy_snapshot().unwrap();
+        let receiver_policy = b_store.control_policy_snapshot().unwrap();
+        for carrier in plan.carrier_ids() {
+            let object = BlobCarrierObjectId::new(carrier.wire_bytes()).unwrap();
+            let total = plan.carrier_total_len(object.as_bytes()).unwrap();
+            let mut offset = 0;
+            while offset < total {
+                let range_len = usize::try_from(
+                    (total - offset).min(u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES).unwrap()),
+                )
+                .unwrap();
+                let (stable_total, bytes) = a_store
+                    .read_completed_blob_carrier_range_with_policy(
+                        &source_policy,
+                        &completion,
+                        &lineage,
+                        *source,
+                        object,
+                        offset,
+                        range_len,
+                        &plan,
+                    )
+                    .unwrap()
+                    .expect("installed rotation carrier range");
+                assert_eq!(stable_total, total);
+                b_store
+                    .append_blob_carrier_prefix_with_policy(
+                        &receiver_policy,
+                        *source,
+                        object,
+                        total,
+                        offset,
+                        &bytes,
+                    )
+                    .unwrap();
+                offset += u64::try_from(bytes.len()).unwrap();
+            }
+        }
     }
     assert_eq!(b_store.blob_stats().unwrap().pending_sources, 2);
     let peer = a.credentials.identity();
+    let mut turns = Vec::new();
     for _ in 0..3 {
-        let before = b_store.blob_carrier_fetch_cursor(peer).unwrap().unwrap();
         let (receipt, _, _, _) = blob_contact_test_pair(
             a_store.clone(),
             a.credentials.clone(),
@@ -283,17 +342,26 @@ async fn blob_ranges_stream_publication_capacity_rotates_two_installed_sources()
         .await;
         assert!(receipt.blob_deferred > 0);
         assert_eq!(receipt.blob_bytes_fetched, 0);
-        let after = b_store.blob_carrier_fetch_cursor(peer).unwrap().unwrap();
-        assert_ne!(
-            before.source(),
-            after.source(),
-            "capacity-deferred installed source must yield its scheduling turn"
+        turns.push(
+            b_store
+                .blob_carrier_fetch_cursor(peer)
+                .unwrap()
+                .expect("capacity deferral advances the installed-source cursor")
+                .source(),
         );
         for source in &sources {
             assert!(b_store.get_blob(*source).unwrap().is_none());
             assert!(b_store.pending_blob_source(*source).unwrap().is_some());
         }
     }
+    assert_ne!(
+        turns[0], turns[1],
+        "capacity-deferred installed source must yield its scheduling turn"
+    );
+    assert_eq!(
+        turns[0], turns[2],
+        "two installed sources must rotate without skipping either source"
+    );
     drop(a_store);
     drop(b_store);
     fs::remove_dir_all(ar).unwrap();

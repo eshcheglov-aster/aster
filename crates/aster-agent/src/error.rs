@@ -12,8 +12,8 @@ const PUBLIC_ERROR_DETAIL_TYPE: &str = "aster.application.v1alpha1.PublicErrorDe
 pub enum PublicOperation {
     Unspecified,
     GetStatus,
-    PublishEvent,
-    PublishEvents,
+    GetEventClientStatus,
+    PublishNumberedEvents,
     BeginEventPublicationSession,
     CompleteEventPublicationRecovery,
     PublishNumberedEvent,
@@ -36,9 +36,9 @@ impl PublicOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unspecified => "unspecified",
+            Self::GetEventClientStatus => "get_event_client_status",
             Self::GetStatus => "get_status",
-            Self::PublishEvent => "publish_event",
-            Self::PublishEvents => "publish_events",
+            Self::PublishNumberedEvents => "publish_numbered_events",
             Self::BeginEventPublicationSession => "begin_event_publication_session",
             Self::CompleteEventPublicationRecovery => "complete_event_publication_recovery",
             Self::PublishNumberedEvent => "publish_numbered_event",
@@ -59,8 +59,9 @@ impl PublicOperation {
 
     const fn from_application(operation: &str) -> Option<Self> {
         match operation.as_bytes() {
+            b"client_status" => Some(Self::GetEventClientStatus),
             b"status" => Some(Self::GetStatus),
-            b"publish" => Some(Self::PublishEvent),
+            b"publish" => Some(Self::PublishNumberedEvent),
             b"begin_publication_session" => Some(Self::BeginEventPublicationSession),
             b"complete_publication_recovery" => Some(Self::CompleteEventPublicationRecovery),
             b"publish_numbered" => Some(Self::PublishNumberedEvent),
@@ -409,7 +410,7 @@ mod tests {
         let error = public_error(
             ErrorCode::Internal,
             api::PublicErrorReason::Internal,
-            PublicOperation::PublishEvent,
+            PublicOperation::PublishNumberedEvent,
             false,
             None,
         );
@@ -418,7 +419,7 @@ mod tests {
         assert_detail(
             error,
             api::PublicErrorReason::Internal,
-            "publish_event",
+            "publish_numbered_event",
             false,
             None,
         );
@@ -499,7 +500,11 @@ mod tests {
             let mapping = application_error_mapping(kind, "publish");
             assert_eq!(mapping.code, code, "{kind:?}");
             assert_eq!(mapping.reason, reason, "{kind:?}");
-            assert_eq!(mapping.operation, PublicOperation::PublishEvent, "{kind:?}");
+            assert_eq!(
+                mapping.operation,
+                PublicOperation::PublishNumberedEvent,
+                "{kind:?}"
+            );
             assert_eq!(mapping.retryable, retryable, "{kind:?}");
             assert_eq!(mapping.retry_delay, None, "{kind:?}");
         }
@@ -533,7 +538,11 @@ mod tests {
     fn application_operation_names_are_translated_through_a_closed_allowlist() {
         let cases = [
             ("status", PublicOperation::GetStatus, "get_status"),
-            ("publish", PublicOperation::PublishEvent, "publish_event"),
+            (
+                "publish",
+                PublicOperation::PublishNumberedEvent,
+                "publish_numbered_event",
+            ),
             ("query", PublicOperation::QueryEvents, "query_events"),
             (
                 "subscribe",

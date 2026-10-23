@@ -23,15 +23,30 @@ run = [
 [tasks.check-foundation]
 description = "Run formatting, policy, traceability, and receipt checks"
 run = [
+  { task = "check-lockfiles" },
+  { task = "check-foundation-core" },
+  { task = "check-compose-policy" },
+]
+
+[tasks.check-lockfiles]
+description = "Validate committed Cargo dependency graphs and their rejection tests"
+run = [
   "sh tools/check-cargo-lockfiles.sh",
+  "python3 tools/test-check-cargo-lockfiles.py",
+]
+
+[tasks.check-foundation-core]
+description = "Run foundation checks after committed Cargo graphs are validated"
+run = [
   "cargo fmt --all -- --check",
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/check-protocol-version-contract.py",
   "python3 tools/test-protocol-version-contract.py",
+  "python3 .github/scripts/test-ci-test-lanes.py",
+  "python3 .github/scripts/test-nextest-timing.py",
   "python3 tools/test-run-fuzz-smoke.py",
-  "python3 tools/test-check-cargo-lockfiles.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
@@ -40,11 +55,10 @@ run = [
   "python3 tools/test_aster_lan_scale_compose.py",
   "python3 tools/test_aster_hierarchy_mvp_compose.py",
   "python3 tools/test_aster_hierarchy_scale_compose.py",
-  "python3 tools/test_aster_compose_delivery.py",
-  "python3 tools/test_inspect_aster_compose_oci.py",
   "python3 tools/test_aster_path_lab.py",
   "python3 tools/aster_path_lab.py docker/path-lab/scenarios/netem-readback-smoke.json",
   "python3 tools/test_aster_path_delivery.py",
+  "python3 tools/test_aster_path_diagnostic.py",
   "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json",
   "sh -n docker/lan-scale/init-state.sh",
   "sh -n docker/hierarchy-mvp/demo-node-entrypoint.sh",
@@ -64,6 +78,13 @@ run = [
   "sh ./tools/test-dependency-exception-scope.sh",
 ]
 
+[tasks.check-compose-policy]
+description = "Validate Compose-provider delivery policy without Docker"
+run = [
+  "python3 tools/test_aster_compose_delivery.py",
+  "python3 tools/test_inspect_aster_compose_oci.py",
+]
+
 [tasks.check-clippy]
 description = "Run Clippy for every Rust workspace target and feature"
 run = "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings"
@@ -76,11 +97,47 @@ run = [
   "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc",
 ]
 
+[tasks.check-rust-ci-slice-1]
+description = "Run the first required-CI Rust test slice with retained JUnit timing"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --profile ci --locked --workspace --all-features --test-threads 2 --partition slice:1/2"
+
+[tasks.check-rust-ci-slice-2]
+description = "Run the second required-CI Rust test slice with retained JUnit timing"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --profile ci --locked --workspace --all-features --test-threads 2 --partition slice:2/2"
+
+[tasks.qualify-generated-blob]
+description = "Run the ignored generated 100 MiB Blob pipeline qualification"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-core --all-features --run-ignored ignored-only -E 'test(=blob::tests::qualify_generated_100mb_blob_pipeline)'"
+
+[tasks.qualify-local-blob-above-network-limit]
+description = "Run the ignored local Blob-above-network-limit qualification"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --lib --run-ignored ignored-only --test-threads 1 -E 'test(=runtime::tests::qualify_valid_local_blob_above_network_limit)'"
+
+[tasks.qualify-near-two-mib-events]
+description = "Run the ignored near-2-MiB bidirectional Event qualification"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --lib --run-ignored ignored-only --test-threads 1 -E 'test(=runtime::tests::qualify_current_stack_near_two_mib_events_each_direction)'"
+
+[tasks.qualify-control-mesh]
+description = "Run the complete ignored 23-process control-mesh qualification"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --test mesh_cli --run-ignored ignored-only --test-threads 1 -E 'test(=four_real_processes_propagate_controls_without_authority_and_exclude_captured_leaf)'"
+
+[tasks.qualify-ping-pong-mesh]
+description = "Run both complete ignored Ping/Pong mesh qualifications serially"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --test mesh_cli --run-ignored ignored-only --test-threads 1 -E 'test(=two_real_processes_use_the_same_stopped_state_ping_pong_plan) | test(=four_real_processes_default_to_ping_pong_and_restart_cleanly)'"
+
 [tasks.check-integration]
 description = "Run real-process, binding, and conformance checks"
 run = [
   "sh tools/test-aster-mesh-playground-real.sh",
   "sh tools/test-aster-hello-real.sh",
+  "sh tools/test-aster-numbered-go-real.sh",
   "cargo build --locked -p aster-ffi",
   "cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.c",
   "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",

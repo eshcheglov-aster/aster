@@ -1,10 +1,13 @@
-//! Client support for pipelined ordinary and crash-safe numbered Event publication.
+//! Client support for crash-safe numbered-only Event publication.
 //!
-//! Ordinary publications use bounded native HTTP/2 sessions and replay only
-//! sent-but-unanswered operation keys. The numbered publication journal is
-//! protocol state rather than a cache. It must be explicitly initialized once
-//! and is then opened exclusively. Opening never creates or repairs a missing
-//! or corrupt journal.
+//! Unary `PublishNumberedEvent` and native HTTP/2 `PublishNumberedEvents`
+//! use a stable client identity, fenced session, and operation sequence.
+//! The journal stores complete intents before sending and results before
+//! exposing them; recovery and exact replay resolve uncertain outcomes.
+//! It is protocol state rather than a cache: initialize it explicitly once,
+//! open it exclusively, and recover before assigning new work. Opening never
+//! creates or repairs a missing or corrupt journal. Ordinary `PublishEvent`
+//! and `PublishEvents` RPCs and their SDK helpers are removed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -12,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use connectrpc::client::{ClientTransport, UnaryResponse};
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::aster::application::v1alpha1 as api;
@@ -24,6 +29,16 @@ const JOURNAL_ENTRIES: TableDefinition<u64, &[u8]> =
 const STATE_KEY: &str = "state";
 const JOURNAL_VERSION: u32 = 1;
 const CLAIM_NONCE_BYTES: usize = 32;
+/// Maximum retained intents, including committed results awaiting acknowledgement.
+pub const MAX_PUBLICATION_JOURNAL_ENTRIES: usize = 8;
+/// Logical serialized journal budget, including metadata and recovery/result reserves.
+/// This does not bound redb's physical pages, allocator overhead, or file size.
+pub const MAX_PUBLICATION_JOURNAL_BYTES: usize = 1 << 20;
+/// Maximum Event payload retained by the Rust and Go publication journals.
+pub const MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES: usize = 65_536;
+// Each row reserves this much serialized result space before any publication RPC.
+// Current fixed-size receipts and both retirement reasons fit within this bound.
+const JOURNAL_RESULT_RESERVE_BYTES: usize = 1_024;
 const PIPELINED_PUBLICATION_WINDOW: usize = 8;
 const PIPELINED_PUBLICATION_SESSION: Duration = Duration::from_secs(8);
 
@@ -112,14 +127,14 @@ impl std::error::Error for PublicationError {
 }
 type Result<T> = std::result::Result<T, NumberedEventSdkError>;
 
-struct PipelinedPublicationState {
-    pending: VecDeque<api::PublishEventRequest>,
+struct NumberedPipelinedPublicationState {
+    pending: VecDeque<api::PublishNumberedEventRequest>,
     sent: usize,
-    responses: Vec<api::PublishEventsResponse>,
+    responses: Vec<api::PublishNumberedEventsResponse>,
 }
 
-impl PipelinedPublicationState {
-    fn new(requests: Vec<api::PublishEventRequest>) -> Self {
+impl NumberedPipelinedPublicationState {
+    fn new(requests: Vec<api::PublishNumberedEventRequest>) -> Self {
         Self {
             pending: requests.into(),
             sent: 0,
@@ -127,7 +142,7 @@ impl PipelinedPublicationState {
         }
     }
 
-    fn fill_window(&mut self, window: usize) -> Vec<api::PublishEventRequest> {
+    fn fill_window(&mut self, window: usize) -> Vec<api::PublishNumberedEventRequest> {
         let count = window
             .saturating_sub(self.sent)
             .min(self.pending.len().saturating_sub(self.sent));
@@ -144,7 +159,7 @@ impl PipelinedPublicationState {
 
     fn accept_response(
         &mut self,
-        response: api::PublishEventsResponse,
+        response: api::PublishNumberedEventsResponse,
     ) -> std::result::Result<(), connectrpc::ConnectError> {
         if response.outcome.is_none() {
             return Err(connectrpc::ConnectError::internal(
@@ -169,25 +184,31 @@ impl PipelinedPublicationState {
         self.pending.is_empty()
     }
 
-    fn into_responses(self) -> Vec<api::PublishEventsResponse> {
+    fn into_responses(self) -> Vec<api::PublishNumberedEventsResponse> {
         self.responses
     }
 }
 
-/// Native HTTP/2 publisher that keeps ordinary Event publication pipelined.
-///
-/// Each result is returned in request order only after the agent reports the
-/// corresponding local durable outcome. Sessions rotate before the agent's
-/// ten-second default stream deadline. If an established stream disconnects,
-/// every sent request without a response is replayed with its original
-/// operation key, so the node's durable idempotency contract resolves whether
-/// it was committed before the disconnect.
-pub struct PipelinedEventPublisher<T> {
-    client: api::AsterApplicationServiceClient<T>,
-    max_disconnect_retries: usize,
+/// Observations of the actual transport loop for integration tests only.
+#[cfg(feature = "sdk-test-support")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PublicationPipelineTestStats {
+    pub stream_sessions: usize,
+    pub send_batches: usize,
+    pub requests_sent: usize,
+    pub max_in_flight: usize,
 }
 
-impl<T> PipelinedEventPublisher<T>
+struct NumberedPipelinedEventPublisher<'a, T> {
+    client: &'a api::AsterApplicationServiceClient<T>,
+    max_disconnect_retries: usize,
+    window: usize,
+    #[cfg(feature = "sdk-test-support")]
+    test_stats: Option<std::sync::Arc<std::sync::Mutex<PublicationPipelineTestStats>>>,
+}
+
+impl<'a, T> NumberedPipelinedEventPublisher<'a, T>
 where
     T: ClientTransport,
     T::ResponseBody: Unpin,
@@ -198,37 +219,66 @@ where
     /// durable response. A bounded session that made progress may rotate
     /// without consuming this budget.
     pub fn new(
-        client: api::AsterApplicationServiceClient<T>,
+        client: &'a api::AsterApplicationServiceClient<T>,
         max_disconnect_retries: usize,
     ) -> Self {
         Self {
             client,
             max_disconnect_retries,
+            window: PIPELINED_PUBLICATION_WINDOW,
+            #[cfg(feature = "sdk-test-support")]
+            test_stats: None,
         }
     }
 
     /// Publishes a finite ordered set over one or more bounded native streams.
-    pub async fn publish_all(
+    async fn publish_all<F>(
         &self,
-        requests: Vec<api::PublishEventRequest>,
-    ) -> std::result::Result<Vec<api::PublishEventsResponse>, connectrpc::ConnectError> {
-        let mut state = PipelinedPublicationState::new(requests);
+        requests: Vec<api::PublishNumberedEventRequest>,
+        mut persist: F,
+    ) -> Result<Vec<api::PublishNumberedEventsResponse>>
+    where
+        F: FnMut(
+            &api::PublishNumberedEventRequest,
+            &api::PublishNumberedEventsResponse,
+        ) -> Result<()>,
+    {
+        let mut state = NumberedPipelinedPublicationState::new(requests);
         let mut consecutive_disconnects = 0_usize;
         while !state.is_complete() {
             state.reconnect();
-            let mut stream = self.client.publish_events().await?;
+            let mut stream = self.client.publish_numbered_events().await?;
+            #[cfg(feature = "sdk-test-support")]
+            if let Some(stats) = &self.test_stats {
+                stats.lock().expect("pipeline test stats").stream_sessions += 1;
+            }
             let deadline = tokio::time::Instant::now() + PIPELINED_PUBLICATION_SESSION;
             let mut rotate = false;
             let mut session_made_progress = false;
 
             while !state.is_complete() && !rotate {
-                for request in state.fill_window(PIPELINED_PUBLICATION_WINDOW) {
-                    let send = stream.send(api::PublishEventsRequest {
+                let batch = state.fill_window(self.window);
+                #[cfg(feature = "sdk-test-support")]
+                if !batch.is_empty()
+                    && let Some(stats) = &self.test_stats
+                {
+                    let mut stats = stats.lock().expect("pipeline test stats");
+                    stats.send_batches += 1;
+                    stats.max_in_flight = stats.max_in_flight.max(state.sent);
+                }
+                for request in batch {
+                    let send = stream.send(api::PublishNumberedEventsRequest {
                         publication: request.into(),
                         ..Default::default()
                     });
                     match tokio::time::timeout_at(deadline, send).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) =>
+                        {
+                            #[cfg(feature = "sdk-test-support")]
+                            if let Some(stats) = &self.test_stats {
+                                stats.lock().expect("pipeline test stats").requests_sent += 1;
+                            }
+                        }
                         Err(_) => {
                             record_no_progress_rotation(
                                 session_made_progress,
@@ -240,7 +290,7 @@ where
                         }
                         Ok(Err(error)) => {
                             if consecutive_disconnects >= self.max_disconnect_retries {
-                                return Err(error);
+                                return Err(error.into());
                             }
                             consecutive_disconnects += 1;
                             rotate = true;
@@ -254,7 +304,7 @@ where
 
                 match tokio::time::timeout_at(
                     deadline,
-                    stream.message::<api::PublishEventsResponse>(),
+                    stream.message::<api::PublishNumberedEventsResponse>(),
                 )
                 .await
                 {
@@ -267,7 +317,14 @@ where
                         rotate = true;
                     }
                     Ok(Ok(Some(response))) => {
-                        state.accept_response(response.to_owned_message())?;
+                        let response = response.to_owned_message();
+                        let request = state.pending.front().ok_or_else(|| {
+                            NumberedEventSdkError::Protocol(
+                                "unpaired publication response".to_owned(),
+                            )
+                        })?;
+                        persist(request, &response)?;
+                        state.accept_response(response)?;
                         session_made_progress = true;
                         consecutive_disconnects = 0;
                     }
@@ -276,14 +333,14 @@ where
                             "publication stream ended before every durable response",
                         );
                         if consecutive_disconnects >= self.max_disconnect_retries {
-                            return Err(error);
+                            return Err(error.into());
                         }
                         consecutive_disconnects += 1;
                         rotate = true;
                     }
                     Ok(Err(error)) => {
                         if consecutive_disconnects >= self.max_disconnect_retries {
-                            return Err(error);
+                            return Err(error.into());
                         }
                         consecutive_disconnects += 1;
                         rotate = true;
@@ -377,9 +434,19 @@ pub struct PublicationJournal {
 
 impl PublicationJournal {
     /// Creates a new journal. Existing paths are refused instead of reused.
+    /// Success requires both the initial transaction and parent directory to be
+    /// synchronized. If directory synchronization fails, the journal is retained;
+    /// initialization must not be retried by deleting or replacing that state.
     pub fn initialize(path: impl AsRef<Path>, client_id: &[u8]) -> Result<()> {
+        Self::initialize_with_parent_sync(path.as_ref(), client_id, sync_journal_parent)
+    }
+
+    fn initialize_with_parent_sync(
+        path: &Path,
+        client_id: &[u8],
+        sync_parent: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         validate_client_id(client_id)?;
-        let path = path.as_ref();
         let file = open_journal_file(path, true)?;
         let database = redb::Builder::new()
             .create_file(file)
@@ -413,7 +480,8 @@ impl PublicationJournal {
         }
         write
             .commit()
-            .map_err(|error| journal_error(path, "commit initialization", error))
+            .map_err(|error| journal_error(path, "commit initialization", error))?;
+        sync_parent(path)
     }
 
     /// Opens an existing journal and acquires redb's exclusive writer lock.
@@ -497,6 +565,7 @@ impl PublicationJournal {
                 .map_err(|error| journal_error(&self.path, "open entries", error))?;
             update(&mut state, &mut entries)?;
             let encoded = encode_json(&state)?;
+            check_journal_limits(&state, encoded.len(), &entries, &self.path)?;
             meta.insert(STATE_KEY, encoded.as_slice())
                 .map_err(|error| journal_error(&self.path, "write metadata", error))?;
         }
@@ -528,6 +597,14 @@ impl PublicationJournal {
         let table = read
             .open_table(JOURNAL_ENTRIES)
             .map_err(|error| journal_error(&self.path, "open entries", error))?;
+        let meta = read
+            .open_table(JOURNAL_META)
+            .map_err(|error| journal_error(&self.path, "open metadata", error))?;
+        let encoded_state = meta
+            .get(STATE_KEY)
+            .map_err(|error| journal_error(&self.path, "get metadata", error))?
+            .ok_or_else(|| NumberedEventSdkError::Journal("metadata is missing".to_owned()))?;
+        check_journal_limits(state, encoded_state.value().len(), &table, &self.path)?;
         let iter = table
             .iter()
             .map_err(|error| journal_error(&self.path, "iterate entries", error))?;
@@ -568,6 +645,18 @@ impl PublicationJournal {
             .map(|value| decode_json(value.value(), "entry"))
             .transpose()
     }
+}
+
+// Like the Go and native journals, resolve the parent by pathname here.
+// Retaining the exact directory used for creation is separate hardening.
+fn sync_journal_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| journal_error(path, "sync parent directory", error))
 }
 
 fn open_journal_file(path: &Path, create: bool) -> Result<std::fs::File> {
@@ -635,6 +724,82 @@ where
         })
     }
 
+    /// Context for this journal's current recovered incarnation. Never silently takes over.
+    pub fn client_context(&self) -> Result<api::EventClientContext> {
+        let state = self.journal.read_state()?;
+        require_recovered(&state)?;
+        Ok(api::EventClientContext {
+            client_id: state.client_id,
+            session: state.session,
+            ..Default::default()
+        })
+    }
+
+    /// Read-only observation remains available even before local recovery completes.
+    pub async fn client_status(&self) -> Result<api::GetEventClientStatusResponse> {
+        let state = self.journal.read_state()?;
+        Ok(self
+            .client
+            .get_event_client_status(api::GetEventClientStatusRequest {
+                client_id: state.client_id,
+                observed_session: (state.session != 0).then_some(state.session),
+                ..Default::default()
+            })
+            .await?
+            .into_owned())
+    }
+
+    pub async fn create_subscription(
+        &self,
+        mut request: api::CreateEventSubscriptionRequest,
+    ) -> Result<api::CreateEventSubscriptionResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self
+            .client
+            .create_event_subscription(request)
+            .await?
+            .into_owned())
+    }
+
+    pub async fn poll_events(
+        &self,
+        mut request: api::PollEventsRequest,
+    ) -> Result<api::PollEventsResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self.client.poll_events(request).await?.into_owned())
+    }
+
+    /// Opens a stream under the already recovered session; never takes over automatically.
+    pub async fn stream_events(
+        &self,
+        mut request: api::StreamEventsRequest,
+    ) -> Result<
+        connectrpc::client::ServerStream<T::ResponseBody, api::StreamEventsResponseView<'static>>,
+    > {
+        request.client = self.client_context()?.into();
+        Ok(self.client.stream_events(request).await?)
+    }
+
+    pub async fn acknowledge_delivery(
+        &self,
+        mut request: api::AcknowledgeEventRequest,
+    ) -> Result<api::AcknowledgeEventResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self.client.acknowledge_event(request).await?.into_owned())
+    }
+
+    pub async fn delete_subscription(
+        &self,
+        mut request: api::DeleteEventSubscriptionRequest,
+    ) -> Result<api::DeleteEventSubscriptionResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self
+            .client
+            .delete_event_subscription(request)
+            .await?
+            .into_owned())
+    }
+
     pub fn journal_path(&self) -> &Path {
         self.journal.path()
     }
@@ -679,6 +844,9 @@ where
             })
             .await?
             .into_owned();
+        if response.outstanding.len() > MAX_PUBLICATION_JOURNAL_ENTRIES {
+            return Err(journal_capacity_error());
+        }
         if claim.expected_session.checked_add(1) != Some(response.session)
             || response.allocated_through < state.allocated_through
             || response.snapshot_revision == 0
@@ -888,6 +1056,14 @@ where
         let mut assigned = 0;
         self.journal.write(|state, entries| {
             require_recovered(state)?;
+            validate_journal_intent(&intent)?;
+            if entries
+                .len()
+                .map_err(|error| journal_error(self.journal.path(), "count entries", error))?
+                >= MAX_PUBLICATION_JOURNAL_ENTRIES as u64
+            {
+                return Err(journal_capacity_error());
+            }
             assigned = state.next_sequence.ok_or_else(|| {
                 NumberedEventSdkError::Protocol("operation sequence exhausted".to_owned())
             })?;
@@ -895,7 +1071,7 @@ where
             intent.session = state.session;
             intent.operation_sequence = assigned;
             let entry = JournalEntry {
-                intent: intent.clone(),
+                intent,
                 result: None,
                 abandoned: false,
             };
@@ -911,12 +1087,226 @@ where
         Ok(assigned)
     }
 
+    /// Returns the original durable intent for application recovery. This is
+    /// a local read, not an admission or acknowledgement. Consumed operations
+    /// have no retained journal row and return `None`.
+    pub fn journaled_intent(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<api::PublishNumberedEventRequest>> {
+        Ok(self.journal.entry(sequence)?.map(|entry| entry.intent))
+    }
+
+    /// Pipelines a contiguous range of journaled operations. Every successful
+    /// receipt is durably saved before releasing another slot. A rejected
+    /// operation stops the pipeline and remains journaled for explicit repair
+    /// or abandonment; uncertain transport outcomes are replayed unchanged.
+    pub async fn publish_journaled_pipeline(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+    ) -> Result<Vec<api::CommittedPublicationResult>>
+    where
+        T::ResponseBody: Unpin,
+    {
+        self.publish_journaled_pipeline_inner(
+            sequences,
+            max_disconnect_retries,
+            PIPELINED_PUBLICATION_WINDOW,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        )
+        .await
+    }
+
+    /// Integration-test seam: lower the network window without changing the
+    /// production ceiling or the journal capacity. Not a customer SDK API.
+    #[cfg(feature = "sdk-test-support")]
+    #[doc(hidden)]
+    pub async fn publish_journaled_pipeline_with_window_for_test(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+        window: usize,
+    ) -> Result<(
+        Vec<api::CommittedPublicationResult>,
+        PublicationPipelineTestStats,
+    )>
+    where
+        T::ResponseBody: Unpin,
+    {
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(
+            PublicationPipelineTestStats::default(),
+        ));
+        let results = self
+            .publish_journaled_pipeline_inner(
+                sequences,
+                max_disconnect_retries,
+                window,
+                Some(stats.clone()),
+            )
+            .await?;
+        let stats = *stats.lock().expect("pipeline test stats");
+        Ok((results, stats))
+    }
+
+    async fn publish_journaled_pipeline_inner(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+        window: usize,
+        #[cfg(feature = "sdk-test-support")] test_stats: Option<
+            std::sync::Arc<std::sync::Mutex<PublicationPipelineTestStats>>,
+        >,
+    ) -> Result<Vec<api::CommittedPublicationResult>>
+    where
+        T::ResponseBody: Unpin,
+    {
+        if !(1..=PIPELINED_PUBLICATION_WINDOW).contains(&window) {
+            return Err(NumberedEventSdkError::Protocol(
+                "publication window must be between one and eight".to_owned(),
+            ));
+        }
+        let state = self.journal.read_state()?;
+        require_recovered(&state)?;
+        if sequences.len() > MAX_PUBLICATION_JOURNAL_ENTRIES {
+            return Err(journal_capacity_error());
+        }
+        let mut requests = Vec::with_capacity(sequences.len());
+        let mut expected = state.allocated_through.checked_add(1);
+        for &sequence in sequences {
+            if Some(sequence) != expected {
+                return Err(NumberedEventSdkError::Protocol(
+                    "pipeline must start at the next admission and contain contiguous sequences"
+                        .to_owned(),
+                ));
+            }
+            let mut entry = self.journal.entry(sequence)?.ok_or_else(|| {
+                NumberedEventSdkError::Journal(format!("sequence {sequence} is not journaled"))
+            })?;
+            if entry.abandoned || entry.result.is_some() {
+                return Err(NumberedEventSdkError::Protocol(format!(
+                    "sequence {sequence} is already resolved"
+                )));
+            }
+            entry.intent.client_id.clone_from(&state.client_id);
+            entry.intent.session = state.session;
+            requests.push(entry.intent);
+            expected = sequence.checked_add(1);
+        }
+        let mut publisher =
+            NumberedPipelinedEventPublisher::new(&self.client, max_disconnect_retries);
+        publisher.window = window;
+        #[cfg(feature = "sdk-test-support")]
+        {
+            publisher.test_stats = test_stats;
+        }
+        let responses = publisher
+            .publish_all(requests, |request, response| {
+                let published = match &response.outcome {
+                    Some(api::publish_numbered_events_response::Outcome::Published(published)) => {
+                        published
+                    }
+                    Some(api::publish_numbered_events_response::Outcome::Failure(failure)) => {
+                        return Err(NumberedEventSdkError::Protocol(format!(
+                            "sequence {} was rejected: {:?}; intent remains journaled",
+                            request.operation_sequence, failure.reason
+                        )));
+                    }
+                    None => {
+                        return Err(NumberedEventSdkError::Protocol(
+                            "publication stream omitted its outcome".to_owned(),
+                        ));
+                    }
+                };
+                let result = published.result.as_option().ok_or_else(|| {
+                    NumberedEventSdkError::Protocol(
+                        "publication response omitted its committed result".to_owned(),
+                    )
+                })?;
+                validate_committed_result(result)?;
+                if result.operation_sequence != request.operation_sequence {
+                    return Err(NumberedEventSdkError::Protocol(
+                        "publication response returned a different sequence".to_owned(),
+                    ));
+                }
+                self.save_publication_result(state.session, result)
+            })
+            .await?;
+        Ok(responses
+            .into_iter()
+            .map(|response| match response.outcome {
+                Some(api::publish_numbered_events_response::Outcome::Published(published)) => {
+                    published
+                        .result
+                        .into_option()
+                        .expect("validated and journaled result")
+                }
+                _ => unreachable!("failed outcomes stop the pipeline"),
+            })
+            .collect())
+    }
+
+    fn save_publication_result(
+        &self,
+        session: u64,
+        result: &api::CommittedPublicationResult,
+    ) -> Result<()> {
+        let sequence = result.operation_sequence;
+        self.journal.write(|current, entries| {
+            require_recovered(current)?;
+            if current.session != session
+                || current.allocated_through.checked_add(1) != Some(sequence)
+            {
+                return Err(NumberedEventSdkError::Journal(
+                    "publication frontier changed while an RPC was in flight".to_owned(),
+                ));
+            }
+            let value = entries
+                .get(sequence)
+                .map_err(|error| journal_error(self.journal.path(), "get publication", error))?
+                .ok_or_else(|| {
+                    NumberedEventSdkError::Journal("publication disappeared".to_owned())
+                })?;
+            let mut saved: JournalEntry = decode_json(value.value(), "entry")?;
+            drop(value);
+            if saved.abandoned || saved.result.is_some() {
+                return Err(NumberedEventSdkError::Journal(
+                    "publication changed while an RPC was in flight".to_owned(),
+                ));
+            }
+            saved.result = Some(result.clone());
+            let encoded = encode_json(&saved)?;
+            entries
+                .insert(sequence, encoded.as_slice())
+                .map_err(|error| {
+                    journal_error(self.journal.path(), "store publication result", error)
+                })?;
+            current.allocated_through = sequence;
+            Ok(())
+        })
+    }
+
     /// Sends only a previously journaled intent and persists its result before
     /// exposing it to the caller.
     pub async fn publish_journaled(
         &self,
         sequence: u64,
     ) -> Result<api::CommittedPublicationResult> {
+        let outcome = self.publish_journaled_outcome(sequence).await?;
+        Ok(outcome
+            .result
+            .into_option()
+            .expect("validated and saved result"))
+    }
+
+    /// Returns the agent's transient insertion observation along with the
+    /// durable result. A result already recovered from the journal reports
+    /// `inserted = false`; insertion is not an additional durable receipt field.
+    pub async fn publish_journaled_outcome(
+        &self,
+        sequence: u64,
+    ) -> Result<api::PublishNumberedEventResponse> {
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
         let mut entry = self.journal.entry(sequence)?.ok_or_else(|| {
@@ -928,7 +1318,11 @@ where
             )));
         }
         if let Some(result) = entry.result {
-            return Ok(result);
+            return Ok(api::PublishNumberedEventResponse {
+                result: result.into(),
+                inserted: false,
+                ..Default::default()
+            });
         }
         if sequence != state.allocated_through + 1 {
             return Err(NumberedEventSdkError::Protocol(format!(
@@ -952,32 +1346,9 @@ where
                 "publication response returned a different sequence".to_owned(),
             ));
         }
-        self.journal.write(|current, entries| {
-            require_recovered(current)?;
-            if current.session != state.session || current.allocated_through + 1 != sequence {
-                return Err(NumberedEventSdkError::Journal(
-                    "publication frontier changed while an RPC was in flight".to_owned(),
-                ));
-            }
-            let value = entries
-                .get(sequence)
-                .map_err(|error| journal_error(self.journal.path(), "get publication", error))?
-                .ok_or_else(|| {
-                    NumberedEventSdkError::Journal("publication disappeared".to_owned())
-                })?;
-            let mut saved: JournalEntry = decode_json(value.value(), "entry")?;
-            drop(value);
-            saved.result = Some(result.clone());
-            let encoded = encode_json(&saved)?;
-            entries
-                .insert(sequence, encoded.as_slice())
-                .map_err(|error| {
-                    journal_error(self.journal.path(), "store publication result", error)
-                })?;
-            current.allocated_through = sequence;
-            Ok(())
-        })?;
-        Ok(result)
+        validate_committed_result(&result)?;
+        self.save_publication_result(state.session, &result)?;
+        Ok(response)
     }
 
     pub async fn publish(
@@ -1149,12 +1520,121 @@ fn validate_client_id(client_id: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn journal_capacity_error() -> NumberedEventSdkError {
+    NumberedEventSdkError::Journal(
+        "journal capacity exceeded: at most eight retained entries and 1 MiB including recovery and result reserves".to_owned(),
+    )
+}
+
+fn validate_journal_intent(intent: &api::PublishNumberedEventRequest) -> Result<()> {
+    if intent.payload.len() > MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES {
+        return Err(NumberedEventSdkError::Journal(
+            "publication payload exceeds the journal's 65536-byte limit".to_owned(),
+        ));
+    }
+    // Bound individual caller-owned fields before serialization (including any
+    // temporary base64 allocation). Complete serialized accounting follows in
+    // the same transaction; protocol admission still belongs to the agent.
+    if intent.topic.len() > MAX_PUBLICATION_JOURNAL_BYTES
+        || intent.scope.len() > MAX_PUBLICATION_JOURNAL_BYTES
+        || intent.logical_key.len() > MAX_PUBLICATION_JOURNAL_BYTES
+        || intent
+            .predecessor_id
+            .as_ref()
+            .is_some_and(|id| id.len() > MAX_PUBLICATION_JOURNAL_BYTES)
+    {
+        return Err(journal_capacity_error());
+    }
+    Ok(())
+}
+
+fn reserved_metadata_bytes(state: &JournalState) -> Result<usize> {
+    let mut reserved = state.clone();
+    reserved.session = u64::MAX;
+    reserved.allocated_through = u64::MAX;
+    reserved.snapshot_revision = u64::MAX;
+    reserved.next_sequence = Some(u64::MAX);
+    reserved.recovery_complete = false;
+    reserved.pending_claim = Some(PendingClaim {
+        expected_session: u64::MAX,
+        nonce: vec![u8::MAX; CLAIM_NONCE_BYTES],
+    });
+    Ok(encode_json(&reserved)?.len())
+}
+
+fn check_journal_limits(
+    state: &JournalState,
+    metadata_bytes: usize,
+    entries: &impl ReadableTable<u64, &'static [u8]>,
+    path: &Path,
+) -> Result<()> {
+    // Check the stored count before iterating or decoding an existing journal.
+    if entries
+        .len()
+        .map_err(|error| journal_error(path, "count entries", error))?
+        > MAX_PUBLICATION_JOURNAL_ENTRIES as u64
+    {
+        return Err(journal_capacity_error());
+    }
+    let mut charged = metadata_bytes.max(reserved_metadata_bytes(state)?) + STATE_KEY.len();
+    if charged > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(journal_capacity_error());
+    }
+    for row in entries
+        .iter()
+        .map_err(|error| journal_error(path, "measure entries", error))?
+    {
+        let (_, value) = row.map_err(|error| journal_error(path, "measure entry", error))?;
+        let encoded = value.value();
+        let entry: JournalEntry = decode_json(encoded, "entry")?;
+        validate_journal_intent(&entry.intent)?;
+        let result_bytes = match &entry.result {
+            Some(result) => encode_json(result)?.len(),
+            None => 4, // The serialized `null` replaced by a returned result.
+        };
+        let reserve = JOURNAL_RESULT_RESERVE_BYTES
+            .checked_sub(result_bytes)
+            .ok_or_else(journal_capacity_error)?;
+        charged = charged
+            .checked_add(size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(encoded.len()))
+            .and_then(|bytes| bytes.checked_add(reserve))
+            .ok_or_else(journal_capacity_error)?;
+        if charged > MAX_PUBLICATION_JOURNAL_BYTES {
+            return Err(journal_capacity_error());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct BoundedJournalEncoding(Vec<u8>);
+
+impl std::io::Write for BoundedJournalEncoding {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_PUBLICATION_JOURNAL_BYTES - self.0.len() {
+            return Err(std::io::Error::other("journal encoding exceeds 1 MiB"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn encode_json(value: &impl Serialize) -> Result<Vec<u8>> {
-    serde_json::to_vec(value)
-        .map_err(|error| NumberedEventSdkError::Journal(format!("encode state: {error}")))
+    let mut encoded = BoundedJournalEncoding::default();
+    serde_json::to_writer(&mut encoded, value)
+        .map_err(|error| NumberedEventSdkError::Journal(format!("encode state: {error}")))?;
+    Ok(encoded.0)
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], name: &str) -> Result<T> {
+    if bytes.len() > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(journal_capacity_error());
+    }
     serde_json::from_slice(bytes).map_err(|error| {
         NumberedEventSdkError::Journal(format!("decode {name}; journal is corrupt: {error}"))
     })
@@ -1308,6 +1788,330 @@ mod tests {
         }
     }
 
+    fn bounded_sdk(name: &str, steps: Vec<Step>) -> (PathBuf, NumberedEventSdk<ScriptedTransport>) {
+        let path = journal_path(name);
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let (_, client) = scripted(steps);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .update_state(|state| {
+                state.session = 1;
+                state.snapshot_revision = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        (path, sdk)
+    }
+
+    fn journal_image(journal: &PublicationJournal) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
+        let read = journal.database.begin_read().unwrap();
+        let meta = read.open_table(JOURNAL_META).unwrap();
+        let state = meta.get(STATE_KEY).unwrap().unwrap().value().to_vec();
+        let entries = read.open_table(JOURNAL_ENTRIES).unwrap();
+        let rows = entries
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.value(), value.value().to_vec())
+            })
+            .collect();
+        (state, rows)
+    }
+
+    #[tokio::test]
+    async fn journal_entry_limit_preserves_sequences_and_acknowledgement_frees_capacity() {
+        let (path, sdk) = bounded_sdk(
+            "entry-budget",
+            vec![
+                step(
+                    "/PublishNumberedEvent",
+                    api::PublishNumberedEventResponse {
+                        result: result(1).into(),
+                        ..Default::default()
+                    },
+                ),
+                step(
+                    "/AcknowledgeEventPublicationResult",
+                    api::AcknowledgeEventPublicationResultResponse::default(),
+                ),
+            ],
+        );
+        for sequence in 1..=8 {
+            assert_eq!(sdk.journal_publication(intent()).unwrap(), sequence);
+        }
+        let before = journal_image(&sdk.journal);
+        let error = sdk.journal_publication(intent()).unwrap_err();
+        assert!(error.to_string().contains("journal capacity exceeded"));
+        assert_eq!(journal_image(&sdk.journal), before);
+        sdk.publish_journaled(1).await.unwrap();
+        assert!(
+            sdk.journal_publication(intent()).is_err(),
+            "saved results still retain a slot"
+        );
+        sdk.acknowledge(1).await.unwrap();
+        assert_eq!(sdk.journal_publication(intent()).unwrap(), 9);
+        drop(sdk);
+        let (_, client) = scripted(vec![begin_revision(2, 1, 2, vec![]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert_eq!(report.operations.len(), 8);
+        assert_eq!(report.operations.first().unwrap().sequence, 2);
+        assert_eq!(report.operations.last().unwrap().sequence, 9);
+        let before = journal_image(&sdk.journal);
+        assert!(sdk.journal_publication(intent()).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "sdk-test-support")]
+    #[tokio::test]
+    async fn test_pipeline_window_cannot_exceed_production_ceiling_or_be_zero() {
+        let (path, sdk) = bounded_sdk("test-window-validation", vec![]);
+        let before = journal_image(&sdk.journal);
+        for window in [0, PIPELINED_PUBLICATION_WINDOW + 1] {
+            assert!(
+                sdk.publish_journaled_pipeline_with_window_for_test(&[], 0, window)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("publication window must be between one and eight")
+            );
+            assert_eq!(journal_image(&sdk.journal), before);
+        }
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_publications_cannot_claim_the_same_last_journal_slot() {
+        let (path, sdk) = bounded_sdk("concurrent-entry-budget", vec![]);
+        for _ in 0..7 {
+            sdk.journal_publication(intent()).unwrap();
+        }
+        let outcomes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| sdk.journal_publication(intent()));
+            let second = scope.spawn(|| sdk.journal_publication(intent()));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(outcomes.into_iter().find_map(Result::ok), Some(8));
+        assert_eq!(sdk.journal.read_state().unwrap().next_sequence, Some(9));
+        assert_eq!(journal_image(&sdk.journal).1.len(), 8);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_byte_budget_reserves_results_and_recovery_and_reuses_acknowledged_space() {
+        let mut available = result(1);
+        available.receipt.as_option_mut().unwrap().acceptance_marker = u64::MAX;
+        let mut retired = available.clone();
+        retired.content = api::CommittedContentStatus::Retired.into();
+        retired.retirement_reason = Some(api::RetirementReason::QuotaPressure.into());
+        let (path, sdk) = bounded_sdk("byte-budget", vec![]);
+        // Size a boundary fixture with a valid-size payload and large metadata.
+        // Agent admission of that metadata is separate from local journal capacity.
+        let state = sdk.journal.read_state().unwrap();
+        let mut publication = intent();
+        publication.client_id = b"client".to_vec();
+        publication.session = 1;
+        publication.operation_sequence = 1;
+        publication.topic = "x".to_owned();
+        let row = JournalEntry {
+            intent: publication.clone(),
+            result: None,
+            abandoned: false,
+        };
+        let charged = reserved_metadata_bytes(&state).unwrap()
+            + STATE_KEY.len()
+            + size_of::<u64>()
+            + serde_json::to_vec(&row).unwrap().len()
+            + JOURNAL_RESULT_RESERVE_BYTES
+            - 4;
+        publication
+            .topic
+            .push_str(&"x".repeat(MAX_PUBLICATION_JOURNAL_BYTES - charged));
+        let mut over = publication.clone();
+        over.topic.push('x');
+        let before = journal_image(&sdk.journal);
+        assert!(
+            sdk.journal_publication(over).is_err(),
+            "cap plus one includes reserves"
+        );
+        assert_eq!(journal_image(&sdk.journal), before);
+        assert_eq!(
+            sdk.journal_publication(publication).unwrap(),
+            1,
+            "exact cap is accepted"
+        );
+        let before = journal_image(&sdk.journal);
+        assert!(sdk.journal_publication(intent()).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        sdk.save_publication_result(1, &available).unwrap();
+        drop(sdk);
+        let (_, client) = scripted(vec![
+            begin_revision(2, 1, u64::MAX, vec![retired.clone()]),
+            complete(),
+            step(
+                "/AcknowledgeEventPublicationResult",
+                api::AcknowledgeEventPublicationResultResponse::default(),
+            ),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert_eq!(
+            report.operations[0].state,
+            RecoveredState::Committed(retired)
+        );
+        let before = journal_image(&sdk.journal);
+        assert!(sdk.journal_publication(intent()).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        sdk.acknowledge(1).await.unwrap();
+        assert_eq!(sdk.journal_publication(intent()).unwrap(), 2);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_and_oversized_encoding_are_rejected_before_assignment() {
+        let (path, sdk) = bounded_sdk("payload-budget", vec![]);
+        let before = journal_image(&sdk.journal);
+        let mut publication = intent();
+        publication.payload = vec![0xff; MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES + 1];
+        let error = sdk.publish(publication).await.unwrap_err();
+        assert!(matches!(error, PublicationError::BeforeAssignment(_)));
+        assert_eq!(journal_image(&sdk.journal), before);
+        let mut publication = intent();
+        publication.payload = vec![0xff; MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES];
+        assert_eq!(sdk.journal_publication(publication).unwrap(), 1);
+        let before = journal_image(&sdk.journal);
+        let mut publication = intent();
+        publication.topic = "x".repeat(MAX_PUBLICATION_JOURNAL_BYTES);
+        assert!(sdk.journal_publication(publication).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opening_existing_journal_rejects_entry_byte_and_payload_limits_without_changing_saved_state()
+    {
+        for name in [
+            "entry-count",
+            "aggregate-bytes",
+            "row-bytes",
+            "metadata-bytes",
+            "payload-bytes",
+        ] {
+            let (path, sdk) = bounded_sdk(name, vec![]);
+            let mut state = sdk.journal.read_state().unwrap();
+            let count = match name {
+                "entry-count" => 9,
+                "aggregate-bytes" => 8,
+                _ => 1,
+            };
+            state.next_sequence = Some(count + 1);
+            let mut metadata = serde_json::to_vec(&state).unwrap();
+            if name == "metadata-bytes" {
+                metadata.resize(MAX_PUBLICATION_JOURNAL_BYTES + 1, b' ');
+            }
+            // Write legacy/untrusted fixtures below the guarded production seam.
+            let write = sdk.journal.database.begin_write().unwrap();
+            {
+                write
+                    .open_table(JOURNAL_META)
+                    .unwrap()
+                    .insert(STATE_KEY, metadata.as_slice())
+                    .unwrap();
+                let mut entries = write.open_table(JOURNAL_ENTRIES).unwrap();
+                for sequence in 1..=count {
+                    let mut publication = intent();
+                    publication.client_id = b"client".to_vec();
+                    publication.session = 1;
+                    publication.operation_sequence = sequence;
+                    match name {
+                        "aggregate-bytes" => {
+                            publication.topic = "x".repeat(MAX_PUBLICATION_JOURNAL_BYTES / 7)
+                        }
+                        "row-bytes" => {
+                            publication.topic = "x".repeat(MAX_PUBLICATION_JOURNAL_BYTES)
+                        }
+                        "payload-bytes" => {
+                            publication.payload = vec![0; MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES + 1]
+                        }
+                        _ => {}
+                    }
+                    let mut encoded = serde_json::to_vec(&JournalEntry {
+                        intent: publication,
+                        result: None,
+                        abandoned: false,
+                    })
+                    .unwrap();
+                    if name == "entry-count" {
+                        encoded = b"not json".to_vec();
+                    }
+                    entries.insert(sequence, encoded.as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+            let before = journal_image(&sdk.journal);
+            drop(sdk);
+            let error = PublicationJournal::open(&path, b"client")
+                .err()
+                .expect(name);
+            if name == "entry-count" {
+                assert!(
+                    error.to_string().contains("capacity exceeded"),
+                    "count is checked before decoding"
+                );
+            }
+            let database = redb::Builder::new().open_read_only(&path).unwrap();
+            let read = database.begin_read().unwrap();
+            let meta = read.open_table(JOURNAL_META).unwrap();
+            let state = meta.get(STATE_KEY).unwrap().unwrap().value().to_vec();
+            let entries = read.open_table(JOURNAL_ENTRIES).unwrap();
+            let rows: Vec<_> = entries
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (key, value) = row.unwrap();
+                    (key.value(), value.value().to_vec())
+                })
+                .collect();
+            assert!(
+                (state, rows) == before,
+                "{name}: rejected open changed durable state"
+            );
+            drop(read);
+            drop(database);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn result_reserve_covers_maximum_receipts_and_every_content_state() {
+        for reason in [
+            None,
+            Some(api::RetirementReason::Expired),
+            Some(api::RetirementReason::QuotaPressure),
+        ] {
+            let mut result = result(u64::MAX);
+            let receipt = result.receipt.as_option_mut().unwrap();
+            receipt.transfer_id.fill(0xff);
+            receipt.event_id.fill(0xff);
+            receipt.acceptance_marker = u64::MAX;
+            if let Some(reason) = reason {
+                result.content = api::CommittedContentStatus::Retired.into();
+                result.retirement_reason = Some(reason.into());
+            }
+            validate_committed_result(&result).unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len() <= JOURNAL_RESULT_RESERVE_BYTES);
+        }
+    }
+
     fn raw_journal_snapshot(journal: &PublicationJournal, sequence: u64) -> (Vec<u8>, Vec<u8>) {
         let read = journal.database.begin_read().expect("read journal");
         let meta = read.open_table(JOURNAL_META).expect("metadata table");
@@ -1327,9 +2131,9 @@ mod tests {
         (state, row)
     }
 
-    fn publication_outcome() -> api::PublishEventsResponse {
-        api::PublishEventsResponse {
-            outcome: Some(api::publish_events_response::Outcome::Published(
+    fn publication_outcome() -> api::PublishNumberedEventsResponse {
+        api::PublishNumberedEventsResponse {
+            outcome: Some(api::publish_numbered_events_response::Outcome::Published(
                 Box::default(),
             )),
             ..Default::default()
@@ -1337,15 +2141,15 @@ mod tests {
     }
 
     #[test]
-    fn publish_events_session_replays_every_sent_unanswered_operation_key() {
-        let request = |key: &[u8]| api::PublishEventRequest {
-            operation_key: key.to_vec(),
+    fn numbered_transport_session_replays_every_sent_unanswered_logical_key() {
+        let request = |key: &[u8]| api::PublishNumberedEventRequest {
+            logical_key: key.to_vec(),
             topic: "chat.events".to_owned(),
             scope: "mission/team/alpha".to_owned(),
             priority: api::Priority::Routine.into(),
             ..Default::default()
         };
-        let mut session = PipelinedPublicationState::new(vec![
+        let mut session = NumberedPipelinedPublicationState::new(vec![
             request(b"first"),
             request(b"second"),
             request(b"third"),
@@ -1355,7 +2159,7 @@ mod tests {
             session
                 .fill_window(2)
                 .iter()
-                .map(|request| request.operation_key.as_slice())
+                .map(|request| request.logical_key.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"first".as_slice(), b"second".as_slice()]
         );
@@ -1366,7 +2170,7 @@ mod tests {
             session
                 .fill_window(2)
                 .iter()
-                .map(|request| request.operation_key.as_slice())
+                .map(|request| request.logical_key.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"third".as_slice()]
         );
@@ -1376,21 +2180,21 @@ mod tests {
             session
                 .fill_window(2)
                 .iter()
-                .map(|request| request.operation_key.as_slice())
+                .map(|request| request.logical_key.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"second".as_slice(), b"third".as_slice()]
         );
     }
 
     #[test]
-    fn publish_events_stalled_reader_never_advances_beyond_window() {
+    fn numbered_transport_stalled_reader_never_advances_beyond_window() {
         let requests = (0_u8..20)
-            .map(|key| api::PublishEventRequest {
-                operation_key: vec![key],
+            .map(|key| api::PublishNumberedEventRequest {
+                logical_key: vec![key],
                 ..Default::default()
             })
             .collect();
-        let mut session = PipelinedPublicationState::new(requests);
+        let mut session = NumberedPipelinedPublicationState::new(requests);
 
         assert_eq!(session.fill_window(PIPELINED_PUBLICATION_WINDOW).len(), 8);
         assert!(session.fill_window(PIPELINED_PUBLICATION_WINDOW).is_empty());
@@ -1402,30 +2206,28 @@ mod tests {
     }
 
     #[test]
-    fn publish_events_missing_outcome_does_not_advance_durable_frontier() {
-        let mut session = PipelinedPublicationState::new(vec![api::PublishEventRequest {
-            operation_key: b"unchanged".to_vec(),
-            ..Default::default()
-        }]);
+    fn numbered_transport_missing_outcome_does_not_advance_durable_frontier() {
+        let mut session =
+            NumberedPipelinedPublicationState::new(vec![api::PublishNumberedEventRequest {
+                logical_key: b"unchanged".to_vec(),
+                ..Default::default()
+            }]);
         assert_eq!(session.fill_window(1).len(), 1);
 
         session
-            .accept_response(api::PublishEventsResponse::default())
+            .accept_response(api::PublishNumberedEventsResponse::default())
             .expect_err("missing durable outcome must be rejected");
         session.reconnect();
-        assert_eq!(
-            session.fill_window(1)[0].operation_key,
-            b"unchanged".to_vec()
-        );
+        assert_eq!(session.fill_window(1)[0].logical_key, b"unchanged".to_vec());
     }
 
     #[cfg(feature = "server")]
     #[tokio::test]
-    async fn publish_events_transport_replays_only_sent_unanswered_keys_after_disconnect() {
+    async fn numbered_transport_transport_replays_only_sent_unanswered_keys_after_disconnect() {
         let sessions = Arc::new(Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
         let captured = sessions.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     let session = {
@@ -1439,7 +2241,7 @@ mod tests {
                             connectrpc::ConnectError::invalid_argument("missing publication")
                         })?;
                         captured.lock().expect("session capture")[session]
-                            .push(publication.operation_key);
+                            .push(publication.logical_key);
                         if (session == 0 && index == 0) || (session == 1 && index == 1) {
                             Err(connectrpc::ConnectError::unavailable(
                                 "deterministic mid-stream disconnect",
@@ -1454,28 +2256,28 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 1);
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 1);
         let requests = [
             b"first".as_slice(),
             b"second".as_slice(),
             b"third".as_slice(),
         ]
         .into_iter()
-        .map(|key| api::PublishEventRequest {
-            operation_key: key.to_vec(),
+        .map(|key| api::PublishNumberedEventRequest {
+            logical_key: key.to_vec(),
             ..Default::default()
         })
         .collect();
 
         let responses = publisher
-            .publish_all(requests)
+            .publish_all(requests, |_, _| Ok(()))
             .await
             .expect("recover disconnected stream");
         assert_eq!(responses.len(), 3);
@@ -1491,11 +2293,11 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[tokio::test(start_paused = true)]
-    async fn publish_events_transport_rotates_before_server_deadline_and_replays_unanswered() {
+    async fn numbered_transport_transport_rotates_before_server_deadline_and_replays_unanswered() {
         let sessions = Arc::new(Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
         let captured = sessions.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     let session = {
@@ -1526,7 +2328,7 @@ mod tests {
                             };
                             let session_requests = {
                                 let mut sessions = captured.lock().expect("session capture");
-                                sessions[session].push(publication.operation_key);
+                                sessions[session].push(publication.logical_key);
                                 sessions[session].len()
                             };
                             if session == 0 && session_requests > 1 {
@@ -1542,24 +2344,24 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 0);
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 0);
         let requests = [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
-            .map(|key| api::PublishEventRequest {
-                operation_key: key.to_vec(),
+            .map(|key| api::PublishNumberedEventRequest {
+                logical_key: key.to_vec(),
                 ..Default::default()
             })
             .collect();
 
         let responses = publisher
-            .publish_all(requests)
+            .publish_all(requests, |_, _| Ok(()))
             .await
             .expect("rotate healthy bounded session");
         assert_eq!(responses.len(), 2);
@@ -1574,18 +2376,18 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[tokio::test(start_paused = true)]
-    async fn publish_events_transport_bounds_consecutive_no_progress_rotations() {
+    async fn numbered_transport_transport_bounds_consecutive_no_progress_rotations() {
         let sessions = Arc::new(Mutex::new(0_usize));
         let captured = sessions.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     *captured.lock().expect("session capture") += 1;
                     let responses = requests.take(1).then(|_request| async {
                         futures::future::pending::<
                             std::result::Result<
-                                api::PublishEventsResponse,
+                                api::PublishNumberedEventsResponse,
                                 connectrpc::ConnectError,
                             >,
                         >()
@@ -1597,38 +2399,40 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 0);
-        let request = api::PublishEventRequest {
-            operation_key: b"stalled".to_vec(),
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 0);
+        let request = api::PublishNumberedEventRequest {
+            logical_key: b"stalled".to_vec(),
             ..Default::default()
         };
 
         let error = tokio::time::timeout(
             PIPELINED_PUBLICATION_SESSION + Duration::from_secs(1),
-            publisher.publish_all(vec![request]),
+            publisher.publish_all(vec![request], |_, _| Ok(())),
         )
         .await
         .expect("publisher must stop after the bounded no-progress session")
         .expect_err("a session without any response must fail");
 
-        assert_eq!(error.code, connectrpc::ErrorCode::DeadlineExceeded);
+        assert!(
+            matches!(error, NumberedEventSdkError::Transport(ref error) if error.code == connectrpc::ErrorCode::DeadlineExceeded)
+        );
         assert_eq!(*sessions.lock().expect("session capture"), 1);
     }
 
     #[cfg(feature = "server")]
     #[tokio::test]
-    async fn publish_events_transport_stops_at_explicit_disconnect_retry_budget() {
+    async fn numbered_transport_transport_stops_at_explicit_disconnect_retry_budget() {
         let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let captured = received.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     let responses = requests.take(1).map(move |request| {
@@ -1639,10 +2443,12 @@ mod tests {
                         captured
                             .lock()
                             .expect("request capture")
-                            .push(publication.operation_key);
-                        Err::<api::PublishEventsResponse, _>(connectrpc::ConnectError::unavailable(
-                            "deterministic unavailable stream",
-                        ))
+                            .push(publication.logical_key);
+                        Err::<api::PublishNumberedEventsResponse, _>(
+                            connectrpc::ConnectError::unavailable(
+                                "deterministic unavailable stream",
+                            ),
+                        )
                     });
                     connectrpc::Response::stream_ok(responses)
                 }
@@ -1650,27 +2456,209 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 1);
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 1);
 
         let error = publisher
-            .publish_all(vec![api::PublishEventRequest {
-                operation_key: b"retry-budget".to_vec(),
-                ..Default::default()
-            }])
+            .publish_all(
+                vec![api::PublishNumberedEventRequest {
+                    logical_key: b"retry-budget".to_vec(),
+                    ..Default::default()
+                }],
+                |_, _| Ok(()),
+            )
             .await
             .expect_err("one retry must be exhausted by two disconnects");
-        assert_eq!(error.code, connectrpc::ErrorCode::Unavailable);
+        assert!(
+            matches!(error, NumberedEventSdkError::Transport(ref error) if error.code == connectrpc::ErrorCode::Unavailable)
+        );
         assert_eq!(
             *received.lock().expect("request capture"),
             vec![b"retry-budget".to_vec(), b"retry-budget".to_vec()]
         );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn numbered_pipeline_persists_each_response_and_replays_unanswered_sequences() {
+        let path = journal_path("numbered-pipeline-replay");
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let sessions = Arc::new(Mutex::new(
+            Vec::<Vec<api::PublishNumberedEventRequest>>::new(),
+        ));
+        let captured = sessions.clone();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
+                let captured = captured.clone();
+                async move {
+                    let session = {
+                        let mut sessions = captured.lock().unwrap();
+                        sessions.push(Vec::new());
+                        sessions.len() - 1
+                    };
+                    let responses = requests.enumerate().map(move |(index, request)| {
+                        let publication = request?.publication.into_option().unwrap();
+                        captured.lock().unwrap()[session].push(publication.clone());
+                        if session == 0 && index == 1 {
+                            return Err(connectrpc::ConnectError::unavailable(
+                                "receipt lost after commit",
+                            ));
+                        }
+                        Ok(api::PublishNumberedEventsResponse {
+                            outcome: Some(
+                                api::publish_numbered_events_response::Outcome::Published(
+                                    Box::new(api::PublishNumberedEventResponse {
+                                        result: result(publication.operation_sequence).into(),
+                                        inserted: session == 0
+                                            || publication.operation_sequence != 2,
+                                        ..Default::default()
+                                    }),
+                                ),
+                            ),
+                            ..Default::default()
+                        })
+                    });
+                    connectrpc::Response::stream_ok(responses)
+                }
+            },
+        );
+        let router = connectrpc::Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishNumberedEvents",
+            handler,
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .write(|state, _| {
+                state.session = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        let sequences: Vec<_> = (0..3)
+            .map(|_| sdk.journal_publication(intent()).unwrap())
+            .collect();
+        assert_eq!(
+            sdk.publish_journaled_pipeline(&sequences, 1).await.unwrap(),
+            vec![result(1), result(2), result(3)]
+        );
+        assert_eq!(sdk.journal.read_state().unwrap().allocated_through, 3);
+        for sequence in sequences {
+            assert_eq!(
+                sdk.journal.entry(sequence).unwrap().unwrap().result,
+                Some(result(sequence))
+            );
+        }
+        let sent = sessions.lock().unwrap();
+        assert_eq!(
+            sent.iter()
+                .map(|requests| requests
+                    .iter()
+                    .map(|request| request.operation_sequence)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![2, 3]]
+        );
+        assert_eq!(
+            sent[0][1], sent[1][0],
+            "retry keeps session, sequence and complete intent"
+        );
+        drop(sent);
+        drop(sdk);
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        assert_eq!(journal.entry(3).unwrap().unwrap().result, Some(result(3)));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn numbered_pipeline_rejection_preserves_the_failed_and_later_intents() {
+        let path = journal_path("numbered-pipeline-rejection");
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| async {
+                let responses = requests.map(|request| {
+                    let publication = request?.publication.into_option().unwrap();
+                    let outcome = if publication.operation_sequence == 1 {
+                        api::publish_numbered_events_response::Outcome::Published(Box::new(
+                            api::PublishNumberedEventResponse {
+                                result: result(1).into(),
+                                ..Default::default()
+                            },
+                        ))
+                    } else {
+                        api::publish_numbered_events_response::Outcome::Failure(Box::new(
+                            api::PublicErrorDetail {
+                                reason: api::PublicErrorReason::MalformedInput.into(),
+                                ..Default::default()
+                            },
+                        ))
+                    };
+                    Ok(api::PublishNumberedEventsResponse {
+                        outcome: Some(outcome),
+                        ..Default::default()
+                    })
+                });
+                connectrpc::Response::stream_ok(responses)
+            },
+        );
+        let router = connectrpc::Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishNumberedEvents",
+            handler,
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .write(|state, _| {
+                state.session = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        let sequences: Vec<_> = (0..3)
+            .map(|_| sdk.journal_publication(intent()).unwrap())
+            .collect();
+        assert!(matches!(
+            sdk.publish_journaled_pipeline(&sequences, 1).await,
+            Err(NumberedEventSdkError::Protocol(_))
+        ));
+        assert_eq!(sdk.journal.read_state().unwrap().allocated_through, 1);
+        assert_eq!(
+            sdk.journal.entry(1).unwrap().unwrap().result,
+            Some(result(1))
+        );
+        for sequence in [2, 3] {
+            let entry = sdk.journal.entry(sequence).unwrap().unwrap();
+            assert!(entry.result.is_none());
+            assert!(!entry.abandoned);
+        }
+        drop(sdk);
+        let (_, client) = scripted(vec![begin(2, 1, vec![result(1)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert!(matches!(
+            report.operations[0].state,
+            RecoveredState::Committed(_)
+        ));
+        assert_eq!(report.operations[1].state, RecoveredState::Pending);
+        assert_eq!(report.operations[2].state, RecoveredState::Pending);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn seed_equal_revision_journal(
@@ -2438,6 +3426,61 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn journal_initialization_syncs_parent_after_writing_state() {
+        let path = journal_path("parent-sync");
+        let _ = std::fs::remove_file(&path);
+        let mut synced = false;
+        PublicationJournal::initialize_with_parent_sync(&path, b"client", |created| {
+            assert_eq!(created, path);
+            // Inspect a separate copy while initialization still holds its
+            // writer lock: the initial transaction must already be committed.
+            let snapshot = journal_path("parent-sync-snapshot");
+            std::fs::copy(created, &snapshot).unwrap();
+            let journal = PublicationJournal::open(&snapshot, b"client").unwrap();
+            assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+            drop(journal);
+            std::fs::remove_file(snapshot).unwrap();
+            sync_journal_parent(created)?;
+            synced = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(synced);
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_initialization_propagates_parent_sync_failure_and_retains_state() {
+        let path = journal_path("parent-sync-failure");
+        let _ = std::fs::remove_file(&path);
+        let error = PublicationJournal::initialize_with_parent_sync(&path, b"client", |created| {
+            // A file cannot be opened as a directory parent. Exercise the real
+            // helper's I/O error mapping without changing process permissions.
+            sync_journal_parent(&created.join("not-a-directory/child"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("sync parent directory"));
+        assert!(PublicationJournal::initialize(&path, b"client").is_err());
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_initialization_syncs_current_directory_for_bare_filename() {
+        let path = PathBuf::from(journal_path("relative-parent").file_name().unwrap());
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

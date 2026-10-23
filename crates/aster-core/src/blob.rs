@@ -5037,8 +5037,17 @@ mod tests {
     }
 
     #[test]
-    fn generated_100mb_blob_is_bounded_resumable_deduplicated_and_verified() {
-        let length = 101 * 1024 * 1024 + 123;
+    fn generated_multichunk_blob_is_bounded_resumable_deduplicated_and_verified() {
+        assert_generated_blob_pipeline(8 * u64::from(MAX_BLOB_CHUNK_SIZE) + 123);
+    }
+
+    #[test]
+    #[ignore = "explicit 101 MiB Blob pipeline qualification"]
+    fn qualify_generated_100mb_blob_pipeline() {
+        assert_generated_blob_pipeline(101 * 1024 * 1024 + 123);
+    }
+
+    fn assert_generated_blob_pipeline(length: u64) {
         let mut source = GeneratedSource::new(length);
         let mut store =
             FileStore::new().unwrap_or_else(|error| panic!("test store failed: {error}"));

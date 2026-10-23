@@ -1,6 +1,6 @@
 [package]
 name = "aster-host"
-description = "High-level offline-first service host for Aster Mesh"
+description = "Shared-node contact and mesh hosts for Aster Mesh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,7 @@ license.workspace = true
 aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
 
 [features]
-default = ["legacy-single-contact-service"]
-legacy-single-contact-service = []
+default = []
 gate-h-formal = []
 
 [lints]
