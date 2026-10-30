@@ -410,6 +410,7 @@ async fn await_authenticated_progress<T>(
     context: &'static str,
     future: impl Future<Output = Result<T, crate::stream_transport::StreamTransportError>>,
 ) -> Result<T, BlobNetworkError> {
+    let _contact_deadline = super::enter_authenticated_contact_idle_deadline(PROFILE5_IDLE_TIMEOUT);
     let value = tokio::time::timeout(PROFILE5_IDLE_TIMEOUT, future)
         .await
         .map_err(|_| transport_failure(context, "authenticated progress idle timeout"))?
@@ -3453,6 +3454,23 @@ pub(crate) mod tests {
                 .await?;
             }
             Ok::<_, BlobNetworkError>(())
+        })
+        .await;
+
+        assert!(matches!(result, Ok(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_profile5_operation_may_use_its_idle_timeout() {
+        let result = super::super::with_authenticated_contact_progress_deadline(async {
+            await_authenticated_progress("slow valid operation", async {
+                tokio::time::sleep(
+                    super::super::CONTACT_DEADLINE + std::time::Duration::from_secs(1),
+                )
+                .await;
+                Ok::<_, StreamTransportError>(())
+            })
+            .await
         })
         .await;
 
