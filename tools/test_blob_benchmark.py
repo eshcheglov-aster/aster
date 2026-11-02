@@ -29,15 +29,20 @@ class MainPublication(unittest.TestCase):
         self.binary = self.root / "fixture"
         self.addCleanup(os.umask, os.umask(0o077))
 
-    def run_fixture(self, change_source=False, campaign_name="default", size=16384):
+    def run_fixture(self, change_source=False, campaign_name="default", size=16384,
+                    interrupt_after_bytes=None):
         # A real subprocess emits a complete receipt; no transport/perf run is needed.
         script = (
             f"#!{sys.executable}\n"
             "import json, sys\n"
             "from pathlib import Path\n"
             "size = int(sys.argv[2])\n"
+            "interrupted = '--interrupt-after-bytes' in sys.argv\n"
+            "if interrupted:\n"
+            " print('BENCH_INTERRUPTION ' + json.dumps(dict(durable_plaintext_bytes=8192)))\n"
             "print('BENCH_RESULT ' + json.dumps(dict(status='complete', bytes=size, "
             "verified_bytes=size, source_sha256='fixture', receiver_sha256='fixture', "
+            "interrupted=interrupted, interrupted_durable_plaintext_bytes=(8192 if interrupted else None), "
             "transfer_until_visible_ns=100, transfer_until_ready_ns=123, "
             "publish_to_visible_ns=200, publish_to_settled_ns=223)))\n"
         )
@@ -48,6 +53,8 @@ class MainPublication(unittest.TestCase):
         argv = ["blob_benchmark", "--variant", "fixture", str(self.repo), str(self.binary),
                 "--output", str(self.output), "--state", str(self.root / "state"),
                 "--campaign", campaign_name, "--sizes", str(size)]
+        if interrupt_after_bytes is not None:
+            argv.extend(["--interrupt-after-bytes", str(interrupt_after_bytes)])
         with patch.object(sys, "argv", argv):
             main()
 
@@ -57,13 +64,16 @@ class MainPublication(unittest.TestCase):
         after = json.loads((self.output / "source-after.json").read_text())
         self.assertEqual(before, after)
         expected = [{"variant": "fixture", "bytes": 16384, "samples": 1,
-                     "completed": 1, "visible_median_ns": 100,
+                     "completed": 1, "interrupted": 0,
+                     "interruption_durable_median_bytes": None,
+                     "visible_median_ns": 100,
                      "settled_median_ns": 123,
                      "publish_to_visible_median_ns": 200}]
         self.assertEqual(json.loads((self.output / "summary.json").read_text()), expected)
         with (self.output / "summary.csv").open(newline="") as source:
             self.assertEqual(list(csv.DictReader(source)),
-                             [{key: str(value) for key, value in expected[0].items()}])
+                             [{key: "" if value is None else str(value)
+                               for key, value in expected[0].items()}])
 
     def test_identity_mismatch_retains_evidence_without_publishing_summaries(self):
         with self.assertRaisesRegex(ValueError, "source or binary changed"):
@@ -84,6 +94,12 @@ class MainPublication(unittest.TestCase):
             metadata["cases"],
             [[f"{100 * 1024 * 1024}-1", 100 * 1024 * 1024, 300]],
         )
+
+    def test_interruption_threshold_is_forwarded_to_the_selected_stack_binary(self):
+        self.run_fixture(interrupt_after_bytes=8192)
+
+        run = json.loads(next(self.output.glob("fixture-*.json")).read_text())
+        self.assertEqual(run["argv"][-2:], ["--interrupt-after-bytes", "8192"])
 
     def test_campaign_rejects_a_size_not_listed_in_the_selected_profile(self):
         argv = [
@@ -120,7 +136,9 @@ class Results(unittest.TestCase):
             runs.append({"variant": "baseline", "exit_code": 0, "records": [{"type": "BENCH_RESULT", "data": {"status": status, "bytes": 8, "transfer_until_visible_ns": ns - 2, "transfer_until_ready_ns": ns, "publish_to_visible_ns": ns + 8}}]})
         rows = summarize(runs)
         self.assertEqual(rows, [{"variant": "baseline", "bytes": 8, "samples": 3,
-                                "completed": 2, "visible_median_ns": 18,
+                                "completed": 2, "interrupted": 0,
+                                "interruption_durable_median_bytes": None,
+                                "visible_median_ns": 18,
                                 "settled_median_ns": 20,
                                 "publish_to_visible_median_ns": 28}])
 

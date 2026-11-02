@@ -177,10 +177,16 @@ pub(super) fn pack_has_pending_upload_write(
 const UPLOAD_MAGIC: &[u8; 8] = b"ASTRUP01";
 const LEGACY_UPLOAD_VERSION: u8 = 1;
 const UPLOAD_VERSION: u8 = 2;
-const PROFILE5_UPLOAD_VERSION: u8 = 4;
+const PROFILE5_UPLOAD_VERSION: u8 = 5;
 const UPLOAD_ID_DOMAIN: &[u8] = b"aster/blob-upload-id/v1\0";
 const UPLOAD_REQUEST_DOMAIN: &[u8] = b"aster/blob-upload-request/v1\0";
 const MAX_UPLOADS: u64 = super::MAX_BLOB_OPERATIONS;
+/// Receiver-local idle retention for an authenticated remote upload.
+///
+/// Thirty days matches the selected offline-resume tolerance. Durable
+/// checkpoint progress refreshes this lease; continuity loss restarts the full
+/// interval instead of manufacturing elapsed time across clock domains.
+const RECEIVED_PROFILE5_UPLOAD_IDLE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 enum Profile5PromotionLifetime {
     Local(Option<aster_mesh::CustodySample>),
@@ -455,6 +461,90 @@ pub(super) struct BlobUploadCreditClaim {
     request_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceivedUploadIdleAnchor {
+    continuity_generation: u64,
+    sample: aster_mesh::CustodySample,
+    checkpoint_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Profile5UploadExpiryAuthority {
+    Local {
+        continuity_generation: u64,
+    },
+    Received {
+        anchor: Option<ReceivedUploadIdleAnchor>,
+    },
+}
+
+impl Profile5UploadExpiryAuthority {
+    fn encode(self, output: &mut Vec<u8>) {
+        match self {
+            Self::Local {
+                continuity_generation,
+            } => {
+                output.extend_from_slice(&[0, 1]);
+                output.extend_from_slice(&continuity_generation.to_be_bytes());
+                output.extend_from_slice(&[0; 16]);
+                output.extend_from_slice(&0_u64.to_be_bytes());
+                output.extend_from_slice(&0_u64.to_be_bytes());
+            }
+            Self::Received { anchor } => {
+                output.push(1);
+                match anchor {
+                    None => {
+                        output.push(0);
+                        output.extend_from_slice(&0_u64.to_be_bytes());
+                        output.extend_from_slice(&[0; 16]);
+                        output.extend_from_slice(&0_u64.to_be_bytes());
+                        output.extend_from_slice(&0_u64.to_be_bytes());
+                    }
+                    Some(anchor) => {
+                        output.push(1);
+                        output.extend_from_slice(&anchor.continuity_generation.to_be_bytes());
+                        output.extend_from_slice(&anchor.sample.clock_id);
+                        output.extend_from_slice(&anchor.sample.tick_ms.to_be_bytes());
+                        output.extend_from_slice(&anchor.checkpoint_generation.to_be_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode(cursor: &mut UploadCursor<'_>) -> Result<Self, StoreError> {
+        let kind = cursor.u8()?;
+        let initialized = cursor.u8()?;
+        let continuity_generation = cursor.u64()?;
+        let clock_id = cursor.array()?;
+        let tick_ms = cursor.u64()?;
+        let checkpoint_generation = cursor.u64()?;
+        match (kind, initialized) {
+            (0, 1) if clock_id == [0; 16] && tick_ms == 0 && checkpoint_generation == 0 => {
+                Ok(Self::Local {
+                    continuity_generation,
+                })
+            }
+            (1, 0)
+                if continuity_generation == 0
+                    && clock_id == [0; 16]
+                    && tick_ms == 0
+                    && checkpoint_generation == 0 =>
+            {
+                Ok(Self::Received { anchor: None })
+            }
+            (1, 1) if continuity_generation != 0 => Ok(Self::Received {
+                anchor: Some(ReceivedUploadIdleAnchor {
+                    continuity_generation,
+                    sample: aster_mesh::CustodySample { clock_id, tick_ms },
+                    checkpoint_generation,
+                }),
+            }),
+            _ => Err(schema_error()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DurableBlobUpload {
     format_version: u8,
@@ -476,6 +566,17 @@ struct DurableProfile5Open {
     pack_open: BlobStreamOpen,
     pack_authenticated: Vec<u8>,
     authenticated_is_publication: bool,
+    expiry_authority: Profile5UploadExpiryAuthority,
+}
+
+impl DurableProfile5Open {
+    fn has_same_authority(&self, other: &Self) -> bool {
+        self.open == other.open
+            && self.authenticated == other.authenticated
+            && self.pack_open == other.pack_open
+            && self.pack_authenticated == other.pack_authenticated
+            && self.authenticated_is_publication == other.authenticated_is_publication
+    }
 }
 
 impl DurableBlobUpload {
@@ -569,6 +670,7 @@ impl DurableBlobUpload {
             output.extend_from_slice(&pack_authenticated_len.to_be_bytes());
             output.extend_from_slice(&profile5.pack_authenticated);
             output.push(u8::from(profile5.authenticated_is_publication));
+            profile5.expiry_authority.encode(&mut output);
             match &self.profile5_completion {
                 None => output.push(0),
                 Some(completion) => {
@@ -684,12 +786,14 @@ impl DurableBlobUpload {
                 1 => true,
                 _ => return Err(schema_error()),
             };
+            let expiry_authority = Profile5UploadExpiryAuthority::decode(&mut cursor)?;
             let profile5_open = DurableProfile5Open {
                 open,
                 authenticated,
                 pack_open,
                 pack_authenticated,
                 authenticated_is_publication,
+                expiry_authority,
             };
             let completion = match cursor.u8()? {
                 0 => None,
@@ -757,6 +861,26 @@ impl DurableBlobUpload {
         validate_request(&request)?;
         if let Some(profile5) = profile5_open.as_ref() {
             validate_profile5_open_shape(&request, &control_policy, content_epoch, &profile5.open)?;
+            let expiry_shape_valid = match (
+                profile5.authenticated_is_publication,
+                profile5.expiry_authority,
+            ) {
+                (
+                    false,
+                    Profile5UploadExpiryAuthority::Local {
+                        continuity_generation,
+                    },
+                ) => request.ttl_ms.is_some() == (continuity_generation != 0),
+                (true, Profile5UploadExpiryAuthority::Received { anchor }) => {
+                    anchor.is_none_or(|anchor| {
+                        anchor.checkpoint_generation
+                            <= checkpoint
+                                .as_ref()
+                                .map_or(0, BlobPackCheckpoint::generation)
+                    })
+                }
+                _ => false,
+            };
             if profile5.pack_open.total_len() != profile5.open.total_len()
                 || profile5.pack_open.content_epoch() != profile5.open.content_epoch()
                 || profile5.pack_open.metadata() != profile5.open.metadata()
@@ -764,6 +888,7 @@ impl DurableBlobUpload {
                 || (!profile5.authenticated_is_publication
                     && (profile5.pack_open != profile5.open
                         || profile5.pack_authenticated != profile5.authenticated))
+                || !expiry_shape_valid
             {
                 return Err(schema_error());
             }
@@ -1701,6 +1826,12 @@ impl Store {
                 pack_open: verified.open().clone(),
                 pack_authenticated: authenticated,
                 authenticated_is_publication: false,
+                expiry_authority: existing.map_or(
+                    Profile5UploadExpiryAuthority::Local {
+                        continuity_generation: 0,
+                    },
+                    |durable| durable.expiry_authority,
+                ),
             })
         };
         let (reservation, checkpoint, durable) = self.reserve_blob_upload_with_policy_impl(
@@ -1752,6 +1883,7 @@ impl Store {
             pack_open: physical_open.open().clone(),
             pack_authenticated: physical_open.authenticated_bytes().to_vec(),
             authenticated_is_publication: true,
+            expiry_authority: Profile5UploadExpiryAuthority::Received { anchor: None },
         };
         let authenticated_reservation =
             profile5_reservation_from_open(policy, &request, open.initial_custody(), open)?;
@@ -1760,11 +1892,11 @@ impl Store {
             if reservation.counter() != open.publisher_counter()
                 || reservation.context() != open.causal_context()
                 || reservation.initial_custody() != open.initial_custody()
-                || existing.is_some_and(|existing| existing != &durable)
+                || existing.is_some_and(|existing| !existing.has_same_authority(&durable))
             {
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
-            Ok(durable.clone())
+            Ok(existing.cloned().unwrap_or_else(|| durable.clone()))
         };
         let (reservation, checkpoint, restored) = self.reserve_blob_upload_with_policy_impl(
             policy,
@@ -1776,7 +1908,12 @@ impl Store {
             )),
         )?;
         let restored = restored.expect("received Profile-5 reservation returns durable authority");
-        if restored != durable {
+        if !restored.has_same_authority(&durable)
+            || !matches!(
+                restored.expiry_authority,
+                Profile5UploadExpiryAuthority::Received { .. }
+            )
+        {
             return Err(blob_error(BlobStoreError::OperationConflict));
         }
         Ok((reservation, checkpoint, physical_open.clone()))
@@ -1976,6 +2113,13 @@ impl Store {
         };
         let (format_version, profile5_open, verified) =
             if let Some((initial_custody, authenticated_reservation, build)) = profile5.as_mut() {
+                let local_continuity = if authenticated_reservation.is_none() {
+                    (*initial_custody)
+                        .map(|sample| crate::custody::observe_continuity_write(&write, sample))
+                        .transpose()?
+                } else {
+                    None
+                };
                 let mut semantic = if let Some(authenticated) = authenticated_reservation.as_ref() {
                     authenticated.clone()
                 } else {
@@ -2000,7 +2144,24 @@ impl Store {
                 write
                     .open_table(PUBLISHER_HIGH_WATER)?
                     .insert(request.owner.publisher.as_slice(), publisher_high)?;
-                let durable = build(&semantic, None)?;
+                let mut durable = build(&semantic, None)?;
+                durable.expiry_authority = if authenticated_reservation.is_some() {
+                    Profile5UploadExpiryAuthority::Received { anchor: None }
+                } else {
+                    let continuity_generation = match (*initial_custody, local_continuity) {
+                        (None, None) => 0,
+                        (Some(initial), Some(continuity))
+                            if continuity.sample().clock_id == initial.clock_id
+                                && continuity.sample().tick_ms >= initial.tick_ms =>
+                        {
+                            continuity.generation()
+                        }
+                        _ => return Err(schema_error()),
+                    };
+                    Profile5UploadExpiryAuthority::Local {
+                        continuity_generation,
+                    }
+                };
                 validate_durable_profile5_authority(
                     request,
                     policy,
@@ -2126,6 +2287,10 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let owner_key = validate_reservation_capability(self, reservation)?;
         let root = PinnedBlobPackRoot::open(self)?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .read()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
@@ -2156,6 +2321,17 @@ impl Store {
             || !durable.is_bound_to(&self.blob_completion_authority)
         {
             return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        match BlobPackReader::open_projected_upload_pinned(
+            &root,
+            &reservation.pack_identity(),
+            &durable,
+        ) {
+            Ok(reader) => drop(reader),
+            Err(BlobPackError::Invalid(_)) => {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+            Err(error) => return Err(upload_pack_store_error(error)),
         }
         if let Some(current) = upload.checkpoint.as_ref() {
             if current == &durable {
@@ -3055,7 +3231,7 @@ impl Store {
             .iter()
             .find(|(kind, key, _)| *kind == 0 && key == selected)
         {
-            let upload =
+            let mut upload =
                 DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), value)?;
             if blob_operation_owner_key(&upload.reservation.request.owner)? != *key {
                 return Err(schema_error());
@@ -3074,24 +3250,65 @@ impl Store {
                 return Ok(Some((progress(&charge, 0), None)));
             }
             let continuity = crate::custody::lower_bound_continuity_write(write)?;
-            // Only locally minted finite opens have receiver-local clock authority.
-            // Missing or incomparable clock evidence is conservatively retained.
-            let terminal = upload.profile5_open.as_ref().is_some_and(|open| {
-                !open.authenticated_is_publication
-                    && open
+            let checkpoint_generation = upload
+                .checkpoint
+                .as_ref()
+                .map_or(0, BlobPackCheckpoint::generation);
+            let mut refreshed_idle_anchor = false;
+            let terminal = upload.profile5_open.as_mut().is_some_and(|open| {
+                match &mut open.expiry_authority {
+                    Profile5UploadExpiryAuthority::Local {
+                        continuity_generation,
+                    } => open
                         .open
                         .ttl_ms()
                         .zip(open.open.initial_custody())
                         .zip(continuity)
                         .is_some_and(|((ttl, initial), current)| {
-                            current.sample.clock_id == initial.clock_id
+                            current.generation == *continuity_generation
+                                && current.sample.clock_id == initial.clock_id
                                 && current
                                     .sample
                                     .tick_ms
                                     .checked_sub(initial.tick_ms)
                                     .is_some_and(|age| age >= ttl)
-                        })
+                        }),
+                    Profile5UploadExpiryAuthority::Received { anchor } => {
+                        let Some(current) = continuity else {
+                            return false;
+                        };
+                        match anchor {
+                            Some(anchor)
+                                if anchor.continuity_generation == current.generation
+                                    && anchor.sample.clock_id == current.sample.clock_id
+                                    && anchor.checkpoint_generation == checkpoint_generation =>
+                            {
+                                current
+                                    .sample
+                                    .tick_ms
+                                    .checked_sub(anchor.sample.tick_ms)
+                                    .is_some_and(|idle| {
+                                        idle >= RECEIVED_PROFILE5_UPLOAD_IDLE_RETENTION_MS
+                                    })
+                            }
+                            _ => {
+                                *anchor = Some(ReceivedUploadIdleAnchor {
+                                    continuity_generation: current.generation,
+                                    sample: current.sample,
+                                    checkpoint_generation,
+                                });
+                                refreshed_idle_anchor = true;
+                                false
+                            }
+                        }
+                    }
+                }
             });
+            if refreshed_idle_anchor {
+                write
+                    .open_table(super::BLOB_UPLOADS)?
+                    .insert(key.as_slice(), upload.encode()?.as_slice())?;
+            }
             // Physical marker checks are bounded even when no sample is available;
             // a previously staged cleanup must converge independently of the clock.
             if !charge.charge_lengths(0, 1024)? {
@@ -6973,6 +7190,86 @@ mod tests {
     }
 
     #[test]
+    fn upload_atomic_reservation_marker_temporary_converges_on_reopen() {
+        let mut fixture = fixture(
+            "reservation-marker-temporary",
+            0x94,
+            BlobDepotLimits::DEFAULT,
+        );
+        PinnedBlobPackRoot::open(&fixture.store).expect("initialize pack root");
+        super::super::depot::inject_test_fault(
+            &fixture.root.0,
+            super::super::depot::DepotFaultPoint::TempSynced,
+        );
+        let request = request(&fixture, b"reservation-marker-temporary", 4_096);
+        assert!(
+            try_reserve_profile5_on(
+                &fixture.store,
+                &fixture.publisher,
+                &fixture.reader,
+                &request,
+            )
+            .is_err(),
+            "injected crash boundary must retain the atomic temporary"
+        );
+
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("writable reopen reclaims atomic marker temporaries");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn upload_atomic_upload_marker_temporary_converges_on_reopen() {
+        let mut fixture = fixture("upload-marker-temporary", 0x95, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"upload-marker-temporary", 4_096);
+        inject_test_fault(&fixture.store, UploadFaultPoint::ReservationIntentSynced);
+        assert!(
+            try_reserve_profile5_on(
+                &fixture.store,
+                &fixture.publisher,
+                &fixture.reader,
+                &request,
+            )
+            .is_err(),
+            "first crash leaves the exact reservation marker"
+        );
+        super::super::depot::inject_test_fault(
+            &fixture.root.0,
+            super::super::depot::DepotFaultPoint::TempSynced,
+        );
+        assert!(
+            try_reserve_profile5_on(
+                &fixture.store,
+                &fixture.publisher,
+                &fixture.reader,
+                &request,
+            )
+            .is_err(),
+            "second crash leaves the upload marker temporary"
+        );
+
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("writable reopen reclaims upload marker temporaries");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn upload_unexpected_pack_without_reservation_intent_still_fails_closed() {
         let fixture = fixture("unexpected-pack", 0x39, BlobDepotLimits::DEFAULT);
         let request = request(&fixture, b"unexpected-pack", 1_024);
@@ -8090,6 +8387,38 @@ mod tests {
     }
 
     #[test]
+    fn terminal_upload_preserves_authority_after_clock_identity_reuse() {
+        let fixture = fixture(
+            "terminal-clock-identity-reuse",
+            0x96,
+            BlobDepotLimits::DEFAULT,
+        );
+        let req = request(&fixture, b"clock-identity-reuse", 4_096);
+        let (reservation, initial, open) = reserve_profile5(&fixture, &req);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+
+        terminal_upload_turns(
+            &fixture,
+            Some(CustodySample {
+                clock_id: [0x32; 16],
+                tick_ms: 20,
+            }),
+            128,
+        );
+        terminal_upload_turns(&fixture, Some(terminal_upload_sample()), 128);
+
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&req.owner)
+                .unwrap()
+                .is_some(),
+            "clock continuity loss must remain sticky when an identity reappears"
+        );
+    }
+
+    #[test]
     fn terminal_upload_cleanup_recovers_after_each_existing_fault_boundary() {
         for fault in [
             super::super::pack::BlobPackFaultPoint::CleanupEntryRemoved,
@@ -8261,6 +8590,62 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn abandoned_received_upload_releases_capacity_after_idle_retention() {
+        let capacity = profile5_upload_capacity(4_096).unwrap();
+        let limits =
+            BlobDepotLimits::new(capacity.bytes, capacity.chunks, capacity.variants).unwrap();
+        let mut fixture = fixture("terminal-abandoned-received", 0x93, limits);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let abandoned = remote_profile5_pack(&fixture, &fixture.other, b"abandoned-received", 0x55);
+        fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &abandoned.publication,
+                &abandoned.open,
+            )
+            .unwrap();
+
+        let clock_id = [0x33; 16];
+        terminal_upload_turns(
+            &fixture,
+            Some(CustodySample {
+                clock_id,
+                tick_ms: 10,
+            }),
+            128,
+        );
+        terminal_upload_turns(
+            &fixture,
+            Some(CustodySample {
+                clock_id,
+                tick_ms: 10 + RECEIVED_PROFILE5_UPLOAD_IDLE_RETENTION_MS,
+            }),
+            128,
+        );
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            limits,
+            authority,
+        )
+        .unwrap();
+
+        let replacement =
+            remote_profile5_pack(&fixture, &fixture.publisher, b"replacement-received", 0x56);
+        fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &replacement.publication,
+                &replacement.open,
+            )
+            .expect("idle received reservation must release depot capacity");
+    }
+
     #[test]
     fn terminal_upload_preserves_received_finite_and_local_durable_authority() {
         let source = fixture("terminal-received-source", 0x88, BlobDepotLimits::DEFAULT);
@@ -8441,5 +8826,61 @@ mod tests {
                 "late promotion remains ordinary: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn stale_physical_checkpoint_is_rejected_before_projection() {
+        let fixture = fixture("stale-physical-checkpoint", 0x92, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"stale-physical-checkpoint", 4_096);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let (reservation, initial, open) = reserve_profile5(&fixture, &request);
+        let sealer = fixture.publisher.blob_stream_segment_sealer(&open).unwrap();
+        let seal = |fill| {
+            sealer
+                .seal(
+                    BlobStreamPlainPartition::new(
+                        *open.open().stream_id().as_bytes(),
+                        open.open().digest(),
+                        open.open().content_epoch(),
+                        0,
+                        0,
+                        open.open().total_len(),
+                        vec![fill; open.open().total_len() as usize],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+
+        let mut first = fixture
+            .store
+            .open_blob_upload_writer(&reservation, &initial)
+            .unwrap();
+        let (segment, leaves) = seal(0x41);
+        first.append(&segment, leaves).unwrap();
+        let stale = first.checkpoint().unwrap();
+        drop(first);
+
+        let mut second = fixture
+            .store
+            .open_blob_upload_writer(&reservation, &initial)
+            .unwrap();
+        let (segment, leaves) = seal(0x42);
+        second.append(&segment, leaves).unwrap();
+        let replacement = second.checkpoint().unwrap();
+        assert_eq!(stale.generation(), replacement.generation());
+        assert_ne!(stale, replacement);
+        drop(second);
+
+        let result = fixture
+            .store
+            .checkpoint_blob_upload(&policy, &reservation, initial, stale);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::Blob(BlobStoreError::ReservationChanged))
+            ),
+            "physically superseded checkpoint was accepted: {result:?}"
+        );
     }
 }

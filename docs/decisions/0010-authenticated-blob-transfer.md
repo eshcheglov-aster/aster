@@ -1,6 +1,6 @@
 # Decision 0010: Source-bound encrypted Blob carriers
 
-- Status: accepted for reference; stopped/local, semantic-v5 direct-content, and bounded live-application selected subsets implemented
+- Status: accepted for reference; stopped/local, semantic-v5 compatibility, semantic-v9 Profile-5 streaming, and bounded live-application selected subsets implemented
 - Date: 2026-08-18
 
 ## Decision
@@ -258,3 +258,42 @@ selector/network-interest separation, arbitrary-peer or route-only resume,
 power-loss/filesystem-crash or long-offline recovery, TTL/GC, physical or mixed
 implementation, resource/soak, reproducible build, release artifact, or
 production authorization.
+
+## Selected semantic-v9 native streaming amendment (2026-11-02)
+
+This amendment adds Profile 5 for semantic-v9 contacts. It does not migrate the
+protocol back to semantic v8 and does not change the fenced semantic-v7/v8
+Profile-4 compatibility lane. Profile 5 transfers the same independently
+authenticated, append-only `ASTRBS02` records that local publication persists.
+It never reconstructs `ASTRBT01`/`ABX1`, repacks 64-KiB chunks, or creates a
+second serial copy path. Each DATA body contains one complete length-prefixed
+native record; the bounded receiver maps up to four records concurrently and
+commits them in source order.
+
+Local publication remains independent of peer availability. An eligible
+contact later authenticates `PLAN -> OPEN -> SOURCE -> ACCEPT`, resumes at the
+receiver's durable native-pack checkpoint, streams DATA, then settles with
+`FINISH -> RESULT -> ACK`. The checkpoint journal is lifecycle-owned durable
+authority, not transport-session state. Production checkpoints are at most 128
+MiB of carrier data, so a fresh node and fresh adapter instance can continue
+the exact publication without retransmitting the durable prefix. Receiver
+promotion is atomic and precedes RESULT; RESULT_ACK or EOF closes only the
+attempt. Cancelling a receive owns and joins its map pipeline before returning,
+so no detached worker can outlive the attempt or publish incomplete content.
+
+Profile 5 is a transport-neutral Aster protocol exchange. The runtime asks a
+`StreamTransportRegistry` for an eligible reliable, ordered, full-duplex
+adapter. The current production registry contains exactly one adapter,
+`IrohQuicV1`; this amendment neither implements a second adapter nor promises
+cross-transport failover. The protocol, durable checkpoint, pipeline, and
+settlement code consume the selected adapter interface rather than an Iroh
+connection, leaving a future non-IP adapter possible without defining it here.
+
+The receiver-local publication inspection surface reports durable plaintext,
+carrier-byte, and segment frontiers and never claims peer delivery or global
+convergence. Finite TTL, retirement, pressure recovery, and provisional-pack
+cleanup remain governed by the selected Blob lifecycle policy; transport
+cancellation cannot bypass those authorities. This amendment adds no retained
+physical-device acceptance, mixed implementation, BLE, relay, multi-adapter
+selection/failover, supported throughput, release artifact, or production
+authorization claim.

@@ -4,11 +4,12 @@ use aster_iroh::{EndpointId, ExpectedPeer};
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
 use aster_node::{
     BlobDepotLimits, MissionExpectedPeer, MutableSourceInterests, NodeConfig, NodeIdentity,
-    SelectedForwardingConfig, SourceInterestSelector,
+    RunningNode, SelectedForwardingConfig, SourceInterestSelector,
     application::{
-        ApplicationErrorKind, BlobPublishOptions, BlobPublishRequest, BlobPublishStreamRequest,
-        BlobReadPageRequest, BlobReadRequest, MAX_SELECTED_BLOB_PAGE_BYTES,
-        MAX_SELECTED_BLOB_STREAM_BYTES, Priority, Scope, Topic,
+        ApplicationErrorKind, BlobPublicationInspectionRequest, BlobPublicationPhase,
+        BlobPublishOptions, BlobPublishRequest, BlobPublishStreamRequest, BlobReadPageRequest,
+        BlobReadRequest, MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES, Priority,
+        Scope, Topic,
     },
     mission::UnprotectedReferenceMission,
     start_node_with_forwarding,
@@ -30,6 +31,46 @@ struct Participant {
     state: PathBuf,
     mission: UnprotectedReferenceMission,
     carrier: EndpointId,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BenchmarkArguments {
+    root: PathBuf,
+    len: u64,
+    deadline: u64,
+    interrupt_after_bytes: Option<u64>,
+}
+
+fn parse_benchmark_arguments(args: &[String]) -> Result<BenchmarkArguments, E> {
+    if !matches!(args.len(), 4 | 6) {
+        return Err(
+            "usage: blob_benchmark ROOT BYTES DEADLINE_SECONDS [--interrupt-after-bytes BYTES]"
+                .into(),
+        );
+    }
+    let len = args[2].parse::<u64>()?;
+    let deadline = args[3].parse::<u64>()?;
+    if len == 0 || deadline == 0 {
+        return Err("benchmark bytes and deadline must be positive".into());
+    }
+    let interrupt_after_bytes = if args.len() == 6 {
+        if args[4] != "--interrupt-after-bytes" {
+            return Err("unknown benchmark option".into());
+        }
+        let threshold = args[5].parse::<u64>()?;
+        if threshold == 0 || threshold >= len {
+            return Err("interruption threshold must be greater than zero and below BYTES".into());
+        }
+        Some(threshold)
+    } else {
+        None
+    };
+    Ok(BenchmarkArguments {
+        root: PathBuf::from(&args[1]),
+        len,
+        deadline,
+        interrupt_after_bytes,
+    })
 }
 
 #[cfg(unix)]
@@ -102,6 +143,54 @@ fn forwarding(total_len: u64) -> Result<SelectedForwardingConfig, E> {
         )?),
     )
 }
+
+async fn start_connected_pair(
+    publisher: &Participant,
+    receiver: &Participant,
+    topic: &Topic,
+    scope: &Scope,
+    total_len: u64,
+) -> Result<(RunningNode, RunningNode, SocketAddr, SocketAddr), E> {
+    let local = SocketAddr::from(([127, 0, 0, 1], 0));
+    let publisher_socket = UdpSocket::bind(local)?;
+    let receiver_socket = UdpSocket::bind(local)?;
+    let publisher_address = publisher_socket.local_addr()?;
+    let receiver_address = receiver_socket.local_addr()?;
+    drop((publisher_socket, receiver_socket));
+    let publisher_config = config(
+        publisher,
+        publisher_address,
+        Some((receiver, receiver_address)),
+        topic,
+        scope,
+    );
+    let receiver_config = config(
+        receiver,
+        receiver_address,
+        Some((publisher, publisher_address)),
+        topic,
+        scope,
+    );
+    let (publisher_node, receiver_node) = if publisher.carrier > receiver.carrier {
+        let publisher_node =
+            start_node_with_forwarding(publisher_config, forwarding(total_len)?).await?;
+        let receiver_node =
+            start_node_with_forwarding(receiver_config, forwarding(total_len)?).await?;
+        (publisher_node, receiver_node)
+    } else {
+        let receiver_node =
+            start_node_with_forwarding(receiver_config, forwarding(total_len)?).await?;
+        let publisher_node =
+            start_node_with_forwarding(publisher_config, forwarding(total_len)?).await?;
+        (publisher_node, receiver_node)
+    };
+    Ok((
+        publisher_node,
+        receiver_node,
+        publisher_address,
+        receiver_address,
+    ))
+}
 fn receipt(name: &str, r: &aster_node::NodeReceipt) {
     println!(
         "BENCH_RECEIPT {{\"node\":\"{name}\",\"contacts\":{},\"direct_contacts\":{},\"relay_contacts\":{},\"unknown_path_contacts\":{},\"contact_errors\":{},\"blobs\":{},\"pending_blobs\":{},\"blob_ranges_fetched\":{},\"blob_bytes_fetched\":{},\"committed_chunks\":{},\"network_staging_bytes\":{}}}",
@@ -148,6 +237,41 @@ fn fixture_bytes(offset: u64, len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn benchmark_arguments_accept_one_bounded_interruption() {
+        let args = vec![
+            "blob_benchmark".into(),
+            "/tmp/state".into(),
+            "1048576".into(),
+            "300".into(),
+            "--interrupt-after-bytes".into(),
+            "524288".into(),
+        ];
+
+        let parsed = parse_benchmark_arguments(&args).unwrap();
+
+        assert_eq!(parsed.root, PathBuf::from("/tmp/state"));
+        assert_eq!(parsed.len, 1_048_576);
+        assert_eq!(parsed.deadline, 300);
+        assert_eq!(parsed.interrupt_after_bytes, Some(524_288));
+    }
+
+    #[test]
+    fn benchmark_arguments_reject_invalid_interruption_boundaries() {
+        for threshold in ["0", "1048576", "1048577"] {
+            let args = vec![
+                "blob_benchmark".into(),
+                "/tmp/state".into(),
+                "1048576".into(),
+                "300".into(),
+                "--interrupt-after-bytes".into(),
+                threshold.into(),
+            ];
+
+            assert!(parse_benchmark_arguments(&args).is_err(), "{threshold}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn benchmark_directories_are_owner_only() {
@@ -193,9 +317,10 @@ mod tests {
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<(), E> {
     let args: Vec<_> = std::env::args().collect();
-    let root = PathBuf::from(&args[1]);
-    let len: u64 = args[2].parse()?;
-    let deadline: u64 = args[3].parse()?;
+    let arguments = parse_benchmark_arguments(&args)?;
+    let root = arguments.root.clone();
+    let len = arguments.len;
+    let deadline = arguments.deadline;
     create_owner_only_directory(&root)?;
     let topic = Topic::new("benchmark.blob")?;
     let scope = Scope::new("test/blob-benchmark")?;
@@ -281,63 +406,158 @@ async fn main() -> Result<(), E> {
     let r = peerless.shutdown().await?;
     assert_eq!(r.blobs, 1);
     receipt("publisher_peerless", &r);
-    let a = UdpSocket::bind(local)?;
-    let b = UdpSocket::bind(local)?;
-    let pa = a.local_addr()?;
-    let ra = b.local_addr()?;
-    drop((a, b));
+    let (publisher_node, receiver_node, pa, ra) =
+        start_connected_pair(&publisher, &receiver, &topic, &scope, len).await?;
     println!(
         "BENCH_PATH {{\"publisher_bind\":\"{pa}\",\"receiver_bind\":\"{ra}\",\"transport\":\"direct Iroh QUIC\"}}"
     );
     let transfer = Instant::now();
-    let pc = config(&publisher, pa, Some((&receiver, ra)), &topic, &scope);
-    let rc = config(&receiver, ra, Some((&publisher, pa)), &topic, &scope);
-    let (p, r) = if publisher.carrier > receiver.carrier {
-        let p = start_node_with_forwarding(pc, forwarding(len)?).await?;
-        let r = start_node_with_forwarding(rc, forwarding(len)?).await?;
-        (p, r)
-    } else {
-        let r = start_node_with_forwarding(rc, forwarding(len)?).await?;
-        let p = start_node_with_forwarding(pc, forwarding(len)?).await?;
-        (p, r)
-    };
+    let mut publisher_node = Some(publisher_node);
+    let mut receiver_node = Some(receiver_node);
     let request = BlobReadRequest {
         id: published.id,
         topic: topic.clone(),
         scope: scope.clone(),
     };
-    let h = r.selected_blobs();
-    let publisher_events = p.selected_events();
-    let receiver_events = r.selected_events();
+    let inspection_request = BlobPublicationInspectionRequest {
+        publication_id: published
+            .publication_id
+            .ok_or("streaming publication has no publication identity")?,
+        topic: topic.clone(),
+        scope: scope.clone(),
+    };
+    let mut blob_handle = receiver_node
+        .as_ref()
+        .expect("receiver is running")
+        .selected_blobs();
+    let mut publisher_events = publisher_node
+        .as_ref()
+        .expect("publisher is running")
+        .selected_events();
+    let mut receiver_events = receiver_node
+        .as_ref()
+        .expect("receiver is running")
+        .selected_events();
     let mut last = Instant::now();
     let mut content_visible = false;
     let mut transfer_until_visible_ns = None;
     let mut publish_to_visible_ns = None;
-    let completed=timeout(Duration::from_secs(deadline),async {
-  loop {
-   if !content_visible { match h.read_page(BlobReadPageRequest{blob:request.clone(),offset:0,max_bytes:1}).await {
-    Ok(page)=>{
-     assert_eq!(page.total_len,len);
-     assert_eq!(page.id,published.id);
-     content_visible=true;
-     transfer_until_visible_ns=Some(transfer.elapsed().as_nanos());
-     publish_to_visible_ns=Some(total.elapsed().as_nanos());
-    },
-    Err(e) if transfer_is_pending(e.kind())=>{},
-    Err(e)=>break Err(Box::new(e) as E),
-   }}
-   let (publisher_status, receiver_status) = tokio::join!(publisher_events.status(), receiver_events.status());
-   let publisher_status = publisher_status?;
-   let receiver_status = receiver_status?;
-   // Offline peers and slow durable-store reopen can outlive one carrier
-   // attempt. The runtime retries them; keep the cumulative failures visible
-   // in progress/final receipts and let authenticated settlement or the
-   // overall deadline decide the benchmark outcome.
-   if content_visible && publisher_status.authenticated_contacts > 0 && receiver_status.authenticated_contacts > 0 { break Ok::<(),E>(()); }
-  if last.elapsed()>=Duration::from_secs(10){println!("BENCH_PROGRESS {{\"elapsed_ns\":{},\"content_visible\":{},\"publisher_authenticated_contacts\":{},\"receiver_authenticated_contacts\":{},\"publisher_failed_contacts\":{},\"receiver_failed_contacts\":{}}}",transfer.elapsed().as_nanos(),content_visible,publisher_status.authenticated_contacts,receiver_status.authenticated_contacts,publisher_status.failed_contact_attempts,receiver_status.failed_contact_attempts);last=Instant::now();}
-  sleep(Duration::from_millis(20)).await;
- }
- }).await;
+    let mut interrupted = false;
+    let mut interrupted_durable_plaintext_bytes = None;
+    let completed = timeout(Duration::from_secs(deadline), async {
+        loop {
+            let inspection = blob_handle
+                .inspect_publication(inspection_request.clone())
+                .await?;
+            if !interrupted
+                && arguments
+                    .interrupt_after_bytes
+                    .is_some_and(|threshold| inspection.durable_plaintext_bytes >= threshold)
+                && matches!(
+                    inspection.phase,
+                    BlobPublicationPhase::Receiving | BlobPublicationPhase::ReadyToFinalize
+                )
+            {
+                interrupted = true;
+                interrupted_durable_plaintext_bytes = Some(inspection.durable_plaintext_bytes);
+                let shutdown = Instant::now();
+                let (publisher_receipt, receiver_receipt) = tokio::join!(
+                    publisher_node
+                        .take()
+                        .expect("publisher is running before interruption")
+                        .shutdown(),
+                    receiver_node
+                        .take()
+                        .expect("receiver is running before interruption")
+                        .shutdown()
+                );
+                let shutdown_ns = shutdown.elapsed().as_nanos();
+                let publisher_receipt = publisher_receipt?;
+                let receiver_receipt = receiver_receipt?;
+                receipt("publisher_interrupted", &publisher_receipt);
+                receipt("receiver_interrupted", &receiver_receipt);
+                println!(
+                    "BENCH_INTERRUPTION {{\"durable_plaintext_bytes\":{},\"durable_transfer_bytes\":{},\"durable_units\":{},\"shutdown_ns\":{shutdown_ns}}}",
+                    inspection.durable_plaintext_bytes,
+                    inspection.durable_transfer_bytes,
+                    inspection.durable_units
+                );
+                let (next_publisher, next_receiver, next_pa, next_ra) =
+                    start_connected_pair(&publisher, &receiver, &topic, &scope, len).await?;
+                println!(
+                    "BENCH_RESTART_PATH {{\"publisher_bind\":\"{next_pa}\",\"receiver_bind\":\"{next_ra}\",\"transport\":\"direct Iroh QUIC\"}}"
+                );
+                blob_handle = next_receiver.selected_blobs();
+                publisher_events = next_publisher.selected_events();
+                receiver_events = next_receiver.selected_events();
+                publisher_node = Some(next_publisher);
+                receiver_node = Some(next_receiver);
+                continue;
+            }
+            if !content_visible {
+                match blob_handle
+                    .read_page(BlobReadPageRequest {
+                        blob: request.clone(),
+                        offset: 0,
+                        max_bytes: 1,
+                    })
+                    .await
+                {
+                    Ok(page) => {
+                        assert_eq!(page.total_len, len);
+                        assert_eq!(page.id, published.id);
+                        content_visible = true;
+                        transfer_until_visible_ns = Some(transfer.elapsed().as_nanos());
+                        publish_to_visible_ns = Some(total.elapsed().as_nanos());
+                    }
+                    Err(error) if transfer_is_pending(error.kind()) => {}
+                    Err(error) => break Err(Box::new(error) as E),
+                }
+            }
+            let (publisher_status, receiver_status) =
+                tokio::join!(publisher_events.status(), receiver_events.status());
+            let publisher_status = publisher_status?;
+            let receiver_status = receiver_status?;
+            // Offline peers and slow durable-store reopen can outlive one carrier
+            // attempt. The runtime retries them; keep cumulative failures visible
+            // and let authenticated settlement or the overall deadline decide.
+            if content_visible
+                && publisher_status.authenticated_contacts > 0
+                && receiver_status.authenticated_contacts > 0
+            {
+                break Ok::<(), E>(());
+            }
+            if last.elapsed() >= Duration::from_secs(10) {
+                let elapsed = transfer.elapsed();
+                let observed_mib_per_second = if elapsed.is_zero() {
+                    0.0
+                } else {
+                    inspection.durable_plaintext_bytes as f64
+                        / (1024.0 * 1024.0)
+                        / elapsed.as_secs_f64()
+                };
+                println!(
+                    "BENCH_PROGRESS {{\"elapsed_ns\":{},\"content_visible\":{},\"publication_phase\":\"{:?}\",\"durable_plaintext_bytes\":{},\"plaintext_total_bytes\":{},\"durable_transfer_bytes\":{},\"transfer_total_bytes\":{},\"durable_units\":{},\"total_units\":{},\"observed_mib_per_second\":{observed_mib_per_second:.3},\"publisher_authenticated_contacts\":{},\"receiver_authenticated_contacts\":{},\"publisher_failed_contacts\":{},\"receiver_failed_contacts\":{}}}",
+                    elapsed.as_nanos(),
+                    content_visible,
+                    inspection.phase,
+                    inspection.durable_plaintext_bytes,
+                    inspection.plaintext_total_bytes,
+                    inspection.durable_transfer_bytes,
+                    inspection.transfer_total_bytes,
+                    inspection.durable_units,
+                    inspection.total_units,
+                    publisher_status.authenticated_contacts,
+                    receiver_status.authenticated_contacts,
+                    publisher_status.failed_contact_attempts,
+                    receiver_status.failed_contact_attempts
+                );
+                last = Instant::now();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     let settled_ns = transfer.elapsed().as_nanos();
     let publish_to_settled_ns = total.elapsed().as_nanos();
     if let Ok(outcome) = &completed {
@@ -346,13 +566,28 @@ async fn main() -> Result<(), E> {
     // The readiness loop includes terminal contact accounting, so shutdown
     // cannot truncate profile-5 settlement after content becomes visible.
     let connected_shutdown = Instant::now();
-    let (pr, rr) = tokio::join!(p.shutdown(), r.shutdown());
+    let (pr, rr) = tokio::join!(
+        publisher_node
+            .take()
+            .ok_or("publisher stopped before final shutdown")?
+            .shutdown(),
+        receiver_node
+            .take()
+            .ok_or("receiver stopped before final shutdown")?
+            .shutdown()
+    );
     let connected_shutdown_ns = connected_shutdown.elapsed().as_nanos();
     let pr = pr?;
     let rr = rr?;
-    drop(h);
+    drop(blob_handle);
     receipt("publisher_connected", &pr);
     receipt("receiver_connected", &rr);
+    if arguments.interrupt_after_bytes.is_some() && !interrupted {
+        return Err(
+            "requested interruption was not reached before completion; use a source larger than one checkpoint interval"
+                .into(),
+        );
+    }
     for rec in [&pr, &rr] {
         assert!(rec.direct_contacts > 0);
         assert_eq!(rec.direct_contacts, rec.contacts);
@@ -438,8 +673,10 @@ async fn main() -> Result<(), E> {
     receipt("receiver_reopened", &final_receipt);
     assert_eq!(final_receipt.blobs, 1);
     assert_eq!(final_receipt.contacts, 0);
+    let interrupted_durable_plaintext_bytes = interrupted_durable_plaintext_bytes
+        .map_or_else(|| "null".into(), |bytes| bytes.to_string());
     println!(
-        "BENCH_RESULT {{\"status\":\"complete\",\"bytes\":{len},\"verified_bytes\":{offset},\"pages\":{pages},\"source_sha256\":\"{expected}\",\"receiver_sha256\":\"{actual}\",\"publication_ns\":{publication_ns},\"transfer_until_visible_ns\":{},\"transfer_until_ready_ns\":{settled_ns},\"publish_to_visible_ns\":{},\"publish_to_settled_ns\":{publish_to_settled_ns},\"connected_shutdown_ns\":{connected_shutdown_ns},\"durable_inspection_ns\":{durable_inspection_ns},\"transfer_ns\":{transfer_ns},\"restart_ns\":{restart_ns},\"download_verification_ns\":{download_verification_ns},\"verification_ns\":{verification_ns},\"total_ns\":{total_ns}}}",
+        "BENCH_RESULT {{\"status\":\"complete\",\"bytes\":{len},\"verified_bytes\":{offset},\"pages\":{pages},\"source_sha256\":\"{expected}\",\"receiver_sha256\":\"{actual}\",\"interrupted\":{interrupted},\"interrupted_durable_plaintext_bytes\":{interrupted_durable_plaintext_bytes},\"publication_ns\":{publication_ns},\"transfer_until_visible_ns\":{},\"transfer_until_ready_ns\":{settled_ns},\"publish_to_visible_ns\":{},\"publish_to_settled_ns\":{publish_to_settled_ns},\"connected_shutdown_ns\":{connected_shutdown_ns},\"durable_inspection_ns\":{durable_inspection_ns},\"transfer_ns\":{transfer_ns},\"restart_ns\":{restart_ns},\"download_verification_ns\":{download_verification_ns},\"verification_ns\":{verification_ns},\"total_ns\":{total_ns}}}",
         transfer_until_visible_ns.expect("complete transfer became visible"),
         publish_to_visible_ns.expect("complete transfer became visible"),
     );

@@ -29,11 +29,18 @@ def summarize(runs):
     rows = []
     for (variant, size), results in sorted(groups.items()):
         complete = [r for r in results if r["status"] == "complete"]
+        interrupted = [r for r in complete if r.get("interrupted") is True]
         rows.append(dict(
             variant=variant,
             bytes=size,
             samples=len(results),
             completed=len(complete),
+            interrupted=len(interrupted),
+            interruption_durable_median_bytes=(
+                statistics.median(r["interrupted_durable_plaintext_bytes"]
+                                  for r in interrupted)
+                if interrupted else None
+            ),
             visible_median_ns=(
                 statistics.median(r["transfer_until_visible_ns"] for r in complete)
                 if complete else None
@@ -88,6 +95,11 @@ def parse_records(text):
             raise ValueError(
                 "completion requires full verified plaintext and ordered visibility/settlement timing"
             )
+        interrupted_bytes = result.get("interrupted_durable_plaintext_bytes")
+        if ((result.get("interrupted") is True
+             and (not isinstance(interrupted_bytes, int) or interrupted_bytes <= 0))
+                or (result.get("interrupted") is False and interrupted_bytes is not None)):
+            raise ValueError("completion has inconsistent interruption evidence")
     elif result.get("status") not in ("transfer_timeout", "rejected_resource_limit"):
         raise ValueError("unknown result status")
     return records
@@ -138,10 +150,12 @@ def write_json(path, value):
         os.fsync(output.fileno())
 
 
-def run_case(output, state, variant, repo, binary, case):
+def run_case(output, state, variant, repo, binary, case, interrupt_after_bytes=None):
     name, size, deadline = case
     name = variant + "-" + name
     argv = [str(binary), str(state / name), str(size), str(deadline)]
+    if interrupt_after_bytes is not None:
+        argv.extend(["--interrupt-after-bytes", str(interrupt_after_bytes)])
     run = {"variant": variant, "name": name, "argv": argv, "power_before": power()}
     print("START", name, run["power_before"]["timestamp_utc"], flush=True)
     started = time.monotonic_ns()
@@ -162,6 +176,15 @@ def run_case(output, state, variant, repo, binary, case):
     run["power_after"] = power()
     try:
         run["records"] = parse_records(stdout.read_text())
+        if interrupt_after_bytes is not None:
+            interruptions = [record for record in run["records"]
+                             if record["type"] == "BENCH_INTERRUPTION"]
+            result = next(record["data"] for record in run["records"]
+                          if record["type"] == "BENCH_RESULT")
+            if (len(interruptions) != 1 or result.get("interrupted") is not True
+                    or not isinstance(result.get("interrupted_durable_plaintext_bytes"), int)
+                    or result["interrupted_durable_plaintext_bytes"] <= 0):
+                raise ValueError("requested interruption lacks one durable resume receipt")
     except (ValueError, KeyError) as error:
         run["records"] = []
         run["validation_error"] = str(error)
@@ -179,6 +202,8 @@ def main():
     parser.add_argument("--state", type=Path, required=True, help="new scratch fixture directory")
     parser.add_argument("--campaign", choices=CAMPAIGN_SIZES, default="default")
     parser.add_argument("--sizes", type=int, nargs="+", help="optional subset, exact byte sizes")
+    parser.add_argument("--interrupt-after-bytes", type=int,
+                        help="restart both nodes once after this much receiver-durable plaintext")
     args = parser.parse_args()
     os.umask(0o077)
     labels = [v[0] for v in args.variant]
@@ -187,6 +212,10 @@ def main():
     cases = [c for c in campaign(args.campaign) if args.sizes is None or c[1] in args.sizes]
     if not cases or (args.sizes and set(args.sizes) != {c[1] for c in cases}):
         parser.error("sizes must be from the documented campaign")
+    if (args.interrupt_after_bytes is not None
+            and (args.interrupt_after_bytes <= 0
+                 or any(args.interrupt_after_bytes >= case[1] for case in cases))):
+        parser.error("interrupt-after-bytes must be positive and below every selected size")
     args.output.mkdir(parents=True, exist_ok=False)
     args.state.mkdir(parents=True, exist_ok=False)
     variants = [(label, Path(repo).resolve(), Path(binary).resolve()) for label, repo, binary in args.variant]
@@ -195,12 +224,14 @@ def main():
         raise ValueError("variant examples differ")
     write_json(args.output / "metadata.json", {"campaign": args.campaign,
         "variants": identities, "cases": cases,
+        "interrupt_after_bytes": args.interrupt_after_bytes,
         "planned_runs": len(cases) * len(variants), "machine": platform.uname()._asdict(),
         "cpu": command(["lscpu"]), "memory": Path("/proc/meminfo").read_text(),
         "disk": command(["df", "-B1", str(args.state)]), "power_initial": power()})
     for case in cases:
         for label, repo, binary in variants:
-            run_case(args.output, args.state, label, repo, binary, case)
+            run_case(args.output, args.state, label, repo, binary, case,
+                     args.interrupt_after_bytes)
     # Read back durable individual records, rather than trusting an in-memory tally.
     runs = [json.loads(path.read_text()) for path in args.output.glob("*-*.json")]
     if len(runs) != len(cases) * len(variants):

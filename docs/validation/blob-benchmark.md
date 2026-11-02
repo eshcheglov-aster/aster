@@ -49,12 +49,22 @@ python3 tools/blob_benchmark.py \
   --campaign profile5-1g \
   --variant candidate /absolute/repo /absolute/blob_benchmark \
   --output /durable/new-profile5-1g-results \
-  --state /scratch/new-profile5-1g-state
+  --state /scratch/new-profile5-1g-state \
+  --interrupt-after-bytes 402653184
 ```
 
 This campaign has one 1-GiB sample and a 900-second internal reconciliation
 deadline. The runner adds 180 seconds for controlled process teardown. Budget
 at least 4 GiB of disposable state space plus operational reserve.
+
+The optional interruption threshold is receiver-durable plaintext, not bytes
+read from the socket or submitted by the sender. Once reached, the harness
+gracefully stops both nodes, records one `BENCH_INTERRUPTION`, and reopens both
+stores through fresh node and selected-adapter instances on new sockets. A
+requested interruption is fail-closed: completion without an intermediate
+durable checkpoint is an error. The production checkpoint interval is 128 MiB,
+so interruption validation needs a source larger than 128 MiB; the small and
+100-MiB campaigns are unsuitable for this proof.
 
 The core streaming pipeline retains its original generated 101 MiB + 123 byte
 workload as an ignored qualification test. Run only that workload explicitly:
@@ -111,6 +121,14 @@ validation process.
   publication means local durable acceptance, not remote delivery.
 - `transfer_until_visible_ns` brackets connected-node startup through the first
   successful receiver read, polled every 20 ms. It excludes publication.
+- `BENCH_PROGRESS` reports the receiver-local publication phase and durable
+  plaintext, carrier-byte, and segment frontiers separately from authenticated
+  terminal-contact counters. Its observed rate is diagnostic, not a transport
+  throughput result.
+- `BENCH_INTERRUPTION` records the durable frontier and joined shutdown time.
+  The completed `BENCH_RESULT` binds that interruption to full post-restart
+  SHA-256 verification. The summary counts interrupted samples and reports the
+  median durable interruption frontier without pooling it into latency.
 - `transfer_until_ready_ns` extends that interval through terminal authenticated
   contact accounting. It is the settled-contact boundary, not first visibility.
 - `publish_to_visible_ns` and `publish_to_settled_ns` start before local
@@ -130,6 +148,12 @@ validation process.
   full plaintext SHA-256. Historical failed attempts remain explicit in
   receipts; a later authenticated resume may complete the run. Timeouts remain
   incomplete observations, never throughput.
+
+The selected-stack run currently uses the sole production adapter,
+`IrohQuicV1`, chosen through the production `StreamTransportRegistry`. The Blob
+protocol and pipeline consume the selected adapter contract; the benchmark
+does not claim a second adapter, multi-transport selection, failover, BLE, or
+cross-transport resume.
 
 The runner persists each stdout/stderr and fsynced JSON receipt immediately.
 It records read-only AC/battery/profile/governor snapshots before and after
