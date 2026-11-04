@@ -1071,7 +1071,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('if: ${{ always() }}', text)
         self.assertIn('path: artifacts/path-diagnostic/', text)
         self.assertIn('retention-days: 14', text)
-        self.assertEqual(len(re.findall(r'uses: [\w/-]+@[0-9a-f]{40} ', text)), 2)
+        self.assertEqual(len(re.findall(r'uses: [\w/-]+@[0-9a-f]{40} ', text)), 4)
         for forbidden in ('pull_request:', 'push:', 'sudo ', '--privileged',
                           '--network=host', 'docker system prune', 'continue-on-error:'):
             self.assertNotIn(forbidden, text)
@@ -1086,6 +1086,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('--tag aster-path-delivery:local .', self.scripts[1])
         self.assertIn('timeout --signal=TERM --kill-after=300s 50m', self.scripts[2])
         self.assertIn('2>&1 | tee artifacts/path-diagnostic/controller.log', self.scripts[2])
+
+    def test_buildkit_cache_is_persistent_scoped_and_loaded(self):
+        text = self.workflow
+        self.assertIn('uses: docker/setup-buildx-action@', text)
+        self.assertIn('driver: docker-container', text)
+        self.assertIn('uses: crazy-max/ghaction-github-runtime@', text)
+        self.assertLess(text.index('uses: crazy-max/ghaction-github-runtime@'),
+                        text.index('id: build\n'))
+        script = self.scripts[1]
+        self.assertIn('docker buildx build --load --pull=false --progress=plain', script)
+        self.assertIn('--cache-from type=gha,version=2,scope=aster-path-diagnostic-delivery-amd64-v1', script)
+        self.assertIn('--cache-to type=gha,version=2,scope=aster-path-diagnostic-delivery-amd64-v1,mode=max', script)
+        self.assertIn('timeout --signal=TERM --kill-after=30s 30m', script)
+        self.assertNotIn('ignore-error=true', script)
+
+    def test_build_exit_and_logs_survive_success_failure_and_timeout(self):
+        import subprocess
+        for code in (0, 1, 124, 137):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'artifacts/path-diagnostic'
+                root.mkdir(parents=True)
+                result = subprocess.run(
+                    ['bash', '-e', '-o', 'pipefail', '-c',
+                     f'timeout() {{ printf "build-output\\n"; return {code}; }};\n' + self.scripts[1]],
+                    cwd=directory, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code)
+                self.assertEqual((root / 'build-exit-code').read_text().strip(), str(code))
+                self.assertEqual((root / 'build.log').read_text(), 'build-output\n')
 
     def test_preflight_failure_survives_log_pipeline(self):
         import subprocess

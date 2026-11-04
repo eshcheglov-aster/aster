@@ -91,6 +91,24 @@ jobs:
             PYTHONPATH=tools python3 -c 'import os; from aster_path_diagnostic import parse_config; keys={"AGENTS":"agents","EVENTS":"events-per-agent","PAYLOAD":"payload-bytes","RATE":"events-per-second","CPU":"cpu-limit","MEMORY":"memory-mib","DEADLINE":"restore-deadline-seconds","STORAGE_ITEMS":"storage-max-items","STORAGE_MIB":"storage-mib"}; parse_config(["--output","unused"] + [v for k,flag in keys.items() for v in ("--"+flag,os.environ[k])] + ["--profiles"] + (["baseline","impaired","reorder","outage"] if os.environ["PROFILE"] == "all" else [os.environ["PROFILE"]]))'
           } 2>&1 | tee artifacts/path-diagnostic/preflight.log
 
+      - name: Set up diagnostic BuildKit builder
+        # Pin source: https://github.com/docker/setup-buildx-action/releases/tag/v4.4.1
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        timeout-minutes: 3
+        with:
+          driver: docker-container
+          use: true
+          cache-binary: false
+          # No insecure or host-network entitlements are needed by this image.
+          buildkitd-flags: --debug
+
+      - name: Expose GitHub cache runtime for the bounded build command
+        # Docker-documented helper for inline buildx; never print env in a run step.
+        # https://docs.docker.com/build/cache/backends/gha/#authentication
+        # Pin source: https://github.com/crazy-max/ghaction-github-runtime/releases/tag/v4.0.0
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+        timeout-minutes: 1
+
       - name: Build the canonical release image from this checkout
         id: build
         # Same digest-pinned Rust toolchain and Debian snapshot as the smoke.
@@ -98,7 +116,9 @@ jobs:
         run: |
           set +e
           timeout --signal=TERM --kill-after=30s 30m \
-            docker build --pull=false --progress=plain \
+            docker buildx build --load --pull=false --progress=plain \
+              --cache-from type=gha,version=2,scope=aster-path-diagnostic-delivery-amd64-v1 \
+              --cache-to type=gha,version=2,scope=aster-path-diagnostic-delivery-amd64-v1,mode=max \
               --file docker/path-lab/Dockerfile.delivery \
               --tag aster-path-delivery:local . \
             2>&1 | tee artifacts/path-diagnostic/build.log
