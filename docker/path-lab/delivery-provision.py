@@ -28,12 +28,14 @@ def seed_root(parent: Path) -> Path:
     return parent / "mission"
 
 
-def state_targets(lab: Path) -> list[Path]:
-    return [lab / "node-a" / "state", lab / "node-b" / "state"]
+def state_targets(lab: Path, count: int = 2) -> list[Path]:
+    if not 2 <= count <= 20:
+        raise ValueError("node count outside bounds")
+    return [lab / f"node-{chr(97 + i)}" / "state" for i in range(count)]
 
 
-def create_state_targets(lab: Path) -> list[Path]:
-    targets = state_targets(lab)
+def create_state_targets(lab: Path, count: int = 2) -> list[Path]:
+    targets = state_targets(lab, count)
     if any(target.exists() or target.is_symlink() for target in targets):
         raise ValueError("endpoint state already exists")
     for target in targets:
@@ -123,18 +125,18 @@ def run_initializer(argv: list[str], timeout: float) -> bytes:
                 process.stderr.close()
 
 
-def parse_nodes(raw: bytes) -> list[tuple[str, str]]:
+def parse_nodes(raw: bytes, count: int = 2) -> list[tuple[str, str]]:
     if len(raw) > MAX_INITIALIZER_OUTPUT_BYTES:
         raise ValueError("initializer output is oversized")
     try:
         lines = raw.decode("ascii").splitlines()
     except UnicodeError as error:
         raise ValueError("initializer output is malformed") from error
-    if len(lines) != 3 or not lines[0].startswith("PLAYGROUND_INIT status=pass nodes=2 "):
+    if not 2 <= count <= 20 or len(lines) != count + 1 or not lines[0].startswith(f"PLAYGROUND_INIT status=pass nodes={count} "):
         raise ValueError("initializer output is malformed")
     nodes: dict[int, tuple[str, str]] = {}
     pattern = re.compile(
-        r"PLAYGROUND_NODE index=([01]) carrier_id=([0-9a-f]{64}) mission_id=([0-9a-f]{64})"
+        r"PLAYGROUND_NODE index=([0-9]{1,2}) carrier_id=([0-9a-f]{64}) mission_id=([0-9a-f]{64})"
     )
     for line in lines[1:]:
         match = pattern.fullmatch(line)
@@ -144,9 +146,9 @@ def parse_nodes(raw: bytes) -> list[tuple[str, str]]:
         if index in nodes:
             raise ValueError("initializer output is malformed")
         nodes[index] = (match.group(2), match.group(3))
-    if set(nodes) != {0, 1}:
+    if set(nodes) != set(range(count)):
         raise ValueError("initializer output is malformed")
-    return [nodes[0], nodes[1]]
+    return [nodes[i] for i in range(count)]
 
 
 def handoff(target: Path) -> None:
@@ -163,14 +165,15 @@ def main() -> int:
     try:
         set_owner_only_umask()
         lab = Path("/lab")
-        targets = create_state_targets(lab)
+        count = int(sys.argv[1]) if len(sys.argv) == 2 else 2
+        targets = create_state_targets(lab, count)
         with tempfile.TemporaryDirectory(prefix="aster-delivery-seed-") as directory:
             seed = seed_root(Path(directory))
             raw = run_initializer(
-                ["/usr/local/bin/aster", "playground-init", "--nodes", "2", "--root", str(seed)],
+                ["/usr/local/bin/aster", "playground-init", "--nodes", str(count), "--root", str(seed)],
                 timeout=30,
             )
-            identities = parse_nodes(raw)
+            identities = parse_nodes(raw, count)
             for index, target in enumerate(targets):
                 source = seed / f"node-{index}"
                 copy_state(source, target)
@@ -185,15 +188,14 @@ def main() -> int:
                     timeout=10,
                     check=True,
                 )
-            (targets[0] / "peer").write_text(
-                f"{identities[1][0]}@10.77.2.2:4433={identities[1][1]}\n", encoding="ascii"
-            )
-            (targets[1] / "peer").write_text(
-                f"{identities[0][0]}@10.77.1.2:4433={identities[0][1]}\n", encoding="ascii"
-            )
+            for index, target in enumerate(targets):
+                (target / "peer").write_text(''.join(
+                    f"{carrier}@10.77.{other + 1}.2:4433={mission}\n"
+                    for other, (carrier, mission) in enumerate(identities) if other != index),
+                    encoding="ascii")
             for target in targets:
                 handoff(target)
-        print("PROVISION status=pass nodes=2 network=none state=owner-only")
+        print(f"PROVISION status=pass nodes={count} network=none state=owner-only")
         return 0
     except (OSError, ValueError, subprocess.SubprocessError):
         print("delivery-provision: isolated provisioning failed", file=sys.stderr)

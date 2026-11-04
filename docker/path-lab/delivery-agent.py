@@ -11,23 +11,33 @@ import re
 import sys
 
 STATE = Path("/clab/state")
-PEER = re.compile(r"[0-9a-f]{64}@10\.77\.[12]\.2:4433=[0-9a-f]{64}")
+PEER = re.compile(r"[0-9a-f]{64}@10\.77\.([1-9]|1[0-9]|20)\.2:4433=[0-9a-f]{64}")
 
 
 def agent_argv(role: str, state: Path = Path("/clab/state")) -> list[str]:
-    addresses = {"node-a": "10.77.1.2:4433", "node-b": "10.77.2.2:4433"}
+    addresses = {f"node-{chr(97 + i)}": f"10.77.{i + 1}.2:4433" for i in range(20)}
     if role not in addresses:
         raise ValueError("unsupported agent role")
     try:
-        raw = bounded_text(state / "peer", 200)
-        peer = raw.strip()
+        raw = bounded_text(state / "peer", 4000)
+        peers = raw.splitlines()
     except (OSError, UnicodeError) as error:
         raise ValueError("peer configuration is unavailable") from error
-    if len(raw) > 200 or PEER.fullmatch(peer) is None:
+    if not 1 <= len(peers) <= 19 or any(PEER.fullmatch(peer) is None for peer in peers):
         raise ValueError("peer configuration is malformed")
-    expected_peer_ip = "10.77.2.2:4433" if role == "node-a" else "10.77.1.2:4433"
-    if f"@{expected_peer_ip}=" not in peer:
+    segments = [int(PEER.fullmatch(peer).group(1)) for peer in peers]
+    local = ord(role[-1]) - 96
+    if set(segments) != set(range(1, len(peers) + 2)) - {local} or len(set(segments)) != len(peers):
         raise ValueError("peer configuration targets the wrong endpoint")
+    storage = []
+    items = os.environ.get('ASTER_DIAGNOSTIC_STORAGE_ITEMS')
+    size = os.environ.get('ASTER_DIAGNOSTIC_STORAGE_BYTES')
+    if items is not None or size is not None:
+        if (items is None or size is None or re.fullmatch(r'[0-9]{1,7}', items) is None
+                or re.fullmatch(r'[0-9]{1,10}', size) is None
+                or not 4161 <= int(items) <= 1000000 or not 67108864 <= int(size) <= 4294967296):
+            raise ValueError('invalid diagnostic storage limits')
+        storage = ['--storage-max-items', items, '--storage-max-payload-bytes', size]
     return [
         "/usr/local/bin/aster-agent",
         "--state", str(state),
@@ -35,8 +45,9 @@ def agent_argv(role: str, state: Path = Path("/clab/state")) -> list[str]:
         "--listen", "127.0.0.1:8181",
         "--mission-bundle-unprotected-reference", str(state / "mission.unprotected-reference.bundle"),
         "--client-token-file", str(state / "client.token"),
-        "--peer", peer,
+        *[arg for peer in peers for arg in ("--peer", peer)],
         "--sync-ms", "250",
+        *storage,
     ]
 
 
@@ -61,7 +72,7 @@ def verify_live(role: str, proc: Path = Path("/proc"), state: Path = Path("/clab
     validate_privileges(bounded_text(proc / "1/status", 8192))
     if role == "wan":
         return
-    if role not in ("node-a", "node-b"):
+    if re.fullmatch(r"node-[a-t]", role) is None:
         raise ValueError("role-invalid")
     pid = bounded_text(state / "agent.pid", 16)
     if re.fullmatch(r"[1-9][0-9]{0,9}", pid) is None:

@@ -9,10 +9,11 @@ import sys
 from aster_path_delivery import _run_command, _strict_json, ExecutionError
 
 
-def commands(role: str) -> list[list[str]]:
-    if role not in ("node-a", "node-b"):
+def commands(role: str, count: int = 2) -> list[list[str]]:
+    if not 2 <= count <= 20 or role not in tuple(f"node-{chr(97 + i)}" for i in range(count)):
         raise ValueError("unsupported network role")
-    local, remote = (1, 2) if role == "node-a" else (2, 1)
+    local = ord(role[-1]) - 96
+    remote = 2 if local == 1 else 1
     return [
         ["ip", "address", "add", f"10.77.{local}.2/29", "dev", "eth0"],
         ["ip", "link", "set", "dev", "eth0", "up"],
@@ -21,10 +22,11 @@ def commands(role: str) -> list[list[str]]:
     ]
 
 
-def configure(role: str, run=_run_command) -> None:
-    for operation in commands(role):
+def configure(role: str, run=_run_command, count: int = 2) -> None:
+    for operation in commands(role, count):
         run(operation, 5)
-    local, remote = (1, 2) if role == "node-a" else (2, 1)
+    local = ord(role[-1]) - 96
+    remote = 2 if local == 1 else 1
     rows = _strict_json(run(["ip", "-j", "route", "get", f"10.77.{remote}.2"], 5), "route")
     if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
             or rows[0].get("dev") != "eth0"
@@ -34,11 +36,11 @@ def configure(role: str, run=_run_command) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 1:
+    if len(argv) not in (1, 2):
         print("delivery-network-init: exactly one role is required", file=sys.stderr)
         return 2
     try:
-        configure(argv[0])
+        configure(argv[0], count=int(argv[1]) if len(argv) == 2 else 2)
     except (ValueError, OSError, ExecutionError):
         print("delivery-network-init: fixed network setup failed", file=sys.stderr)
         return 2

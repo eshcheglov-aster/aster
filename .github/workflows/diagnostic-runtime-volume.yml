@@ -1,7 +1,49 @@
-name: "Diagnostic: manual runtime-volume test"
+name: "Diagnostic: load, scale and network faults"
 
 on:
   workflow_dispatch:
+    inputs:
+      agents:
+        description: 'Agent count (2..20), all-to-all peers'
+        type: number
+        default: 2
+      events:
+        description: 'Events per agent (1..10000); combined receipt/time budgets apply'
+        type: number
+        default: 600
+      payload:
+        description: 'Payload bytes per Event (1..4096)'
+        type: number
+        default: 1024
+      rate:
+        description: 'Publication rate per agent (1..100 Events/s)'
+        type: number
+        default: 10
+      profile:
+        description: 'Network profile (all runs the four profiles)'
+        type: choice
+        options: [all, baseline, impaired, reorder, outage]
+        default: all
+      cpu:
+        description: 'CPU cores per agent container (0 unrestricted, otherwise 0.1..64)'
+        type: number
+        default: 0
+      memory:
+        description: 'RAM MiB per agent container, no swap (0 unrestricted, otherwise 64..16384)'
+        type: number
+        default: 0
+      deadline:
+        description: 'Delivery deadline seconds after publication or outage restoration (1..600)'
+        type: number
+        default: 120
+      storage_items:
+        description: 'Store max_items per agent (4161..1000000; includes control reserves)'
+        type: number
+        default: 10000
+      storage_mib:
+        description: 'Store max_payload_bytes per agent in MiB (64..4096; includes envelope overhead)'
+        type: number
+        default: 64
 
 permissions:
   contents: read
@@ -12,9 +54,20 @@ defaults:
 
 jobs:
   diagnostic:
-    name: Runtime-volume diagnostic
+    name: Load, scale and network faults
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      AGENTS: ${{ inputs.agents }}
+      EVENTS: ${{ inputs.events }}
+      PAYLOAD: ${{ inputs.payload }}
+      RATE: ${{ inputs.rate }}
+      PROFILE: ${{ inputs.profile }}
+      CPU: ${{ inputs.cpu }}
+      MEMORY: ${{ inputs.memory }}
+      DEADLINE: ${{ inputs.deadline }}
+      STORAGE_ITEMS: ${{ inputs.storage_items }}
+      STORAGE_MIB: ${{ inputs.storage_mib }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,6 +77,7 @@ jobs:
           submodules: false
 
       - name: Validate diagnostic contracts and record environment
+        id: preflight
         run: |
           mkdir -p artifacts/path-diagnostic
           {
@@ -32,30 +86,60 @@ jobs:
             docker version &&
             python3 --version &&
             python3 tools/test_aster_path_diagnostic.py &&
-            python3 tools/test_aster_path_delivery.py
+            python3 tools/test_aster_path_delivery.py &&
+            python3 tools/test_aster_path_summary.py &&
+            PYTHONPATH=tools python3 -c 'import os; from aster_path_diagnostic import parse_config; keys={"AGENTS":"agents","EVENTS":"events-per-agent","PAYLOAD":"payload-bytes","RATE":"events-per-second","CPU":"cpu-limit","MEMORY":"memory-mib","DEADLINE":"restore-deadline-seconds","STORAGE_ITEMS":"storage-max-items","STORAGE_MIB":"storage-mib"}; parse_config(["--output","unused"] + [v for k,flag in keys.items() for v in ("--"+flag,os.environ[k])] + ["--profiles"] + (["baseline","impaired","reorder","outage"] if os.environ["PROFILE"] == "all" else [os.environ["PROFILE"]]))'
           } 2>&1 | tee artifacts/path-diagnostic/preflight.log
 
       - name: Build the canonical release image from this checkout
+        id: build
         # Same digest-pinned Rust toolchain and Debian snapshot as the smoke.
         # No local-image fallback or TLS verification bypass.
         run: |
+          set +e
           timeout --signal=TERM --kill-after=30s 30m \
             docker build --pull=false --progress=plain \
               --file docker/path-lab/Dockerfile.delivery \
               --tag aster-path-delivery:local . \
             2>&1 | tee artifacts/path-diagnostic/build.log
+          result=("${PIPESTATUS[@]}")
+          printf '%s\n' "${result[0]}" > artifacts/path-diagnostic/build-exit-code
+          if (( result[0] != 0 )); then exit "${result[0]}"; fi
+          exit "${result[1]}"
 
-      - name: Run all four default profiles
+      - name: Run selected profiles
+        id: run
         # Controller deadlines and finally blocks own cleanup, including TERM.
         # Leave time before the job limit for cleanup and artifact upload.
         # Never upload the private ownership/credential directories in TMPDIR.
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
+          profiles=(baseline impaired reorder outage)
+          if [[ "$PROFILE" != all ]]; then profiles=("$PROFILE"); fi
+          set +e
           timeout --signal=TERM --kill-after=300s 50m \
             python3 -u tools/aster_path_diagnostic.py \
               --output artifacts/path-diagnostic \
+              --agents "$AGENTS" --events-per-agent "$EVENTS" \
+              --payload-bytes "$PAYLOAD" --events-per-second "$RATE" \
+              --profiles "${profiles[@]}" --cpu-limit "$CPU" \
+              --memory-mib "$MEMORY" --restore-deadline-seconds "$DEADLINE" \
+              --storage-max-items "$STORAGE_ITEMS" --storage-mib "$STORAGE_MIB" \
             2>&1 | tee artifacts/path-diagnostic/controller.log
+          result=("${PIPESTATUS[@]}")
+          printf '%s\n' "${result[0]}" > artifacts/path-diagnostic/run-exit-code
+          if (( result[0] != 0 )); then exit "${result[0]}"; fi
+          exit "${result[1]}"
+
+      - name: Write diagnostic Job Summary tables
+        if: ${{ always() }}
+        env:
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          python3 tools/aster_path_summary.py --input artifacts/path-diagnostic --output "$GITHUB_STEP_SUMMARY"
 
       - name: Retain reports and logs even after failure or timeout
         if: ${{ always() }}

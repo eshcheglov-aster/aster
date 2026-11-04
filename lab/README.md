@@ -129,12 +129,14 @@ The Python `self-contained`, `two-node`, `scale`, and `resource` entrypoints
 are also removed. Their historical results remain evidence for their original
 implementation and revision.
 
-Useful load/resource and impaired-link scenarios are deferred to
-[issue #105](https://github.com/defenseunicorns/aster/issues/105), linked to
-[issue #74](https://github.com/defenseunicorns/aster/issues/74), with resource
-diagnostics coordinated in [issue #73](https://github.com/defenseunicorns/aster/issues/73).
-No workloads were ported in this retirement. The default 101-MiB large-Blob
-workload is retired and is explicitly outside that follow-up.
+The current [path-lab diagnostic](../docker/path-lab/README.md) replaces selected
+Event load/resource and impaired-link scenarios using production agents. It
+supports 2..20 all-to-all peers, per-agent Event counts and CPU/RAM limits,
+baseline/delay-loss/reordering/outage profiles, and exact peerless restart checks.
+Remaining scale/resource work belongs to
+[issue #122](https://github.com/defenseunicorns/aster/issues/122); this increment
+does not close that issue. The default 101-MiB large-Blob workload remains
+retired and outside this follow-up.
 
 The historical virtual 3,000-bit/s, 50%-loss transfer experiment did not converge
 within 120 seconds and was terminated. That negative result remains unchanged;

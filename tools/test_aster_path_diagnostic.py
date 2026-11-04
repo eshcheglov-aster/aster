@@ -10,6 +10,52 @@ from unittest.mock import patch
 import aster_path_diagnostic as diagnostic
 
 
+class StorageInputTests(unittest.TestCase):
+    def test_storage_inputs_reach_initial_and_peerless_agent_argv(self):
+        import importlib.util
+        config = diagnostic.parse_config(['--output', 'unused', '--profiles', 'baseline',
+            '--storage-max-items', '50000', '--storage-mib', '512'])
+        self.assertIn('ASTER_DIAGNOSTIC_STORAGE_ITEMS=50000', diagnostic.resource_options(config))
+        self.assertIn('ASTER_DIAGNOSTIC_STORAGE_BYTES=536870912', diagnostic.resource_options(config))
+        spec = importlib.util.spec_from_file_location('agent', Path(__file__).resolve().parents[1] / 'docker/path-lab/delivery-agent.py')
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / 'peer').write_text('a' * 64 + '@10.77.2.2:4433=' + 'b' * 64)
+            with patch.dict(module.os.environ, {'ASTER_DIAGNOSTIC_STORAGE_ITEMS': '50000', 'ASTER_DIAGNOSTIC_STORAGE_BYTES': '536870912'}):
+                argv = module.agent_argv('node-a', state)
+                self.assertEqual(argv[argv.index('--storage-max-items') + 1], '50000')
+                self.assertEqual(argv[argv.index('--storage-max-payload-bytes') + 1], '536870912')
+            with patch.dict(module.os.environ, {'ASTER_DIAGNOSTIC_STORAGE_ITEMS': '$(bad)', 'ASTER_DIAGNOSTIC_STORAGE_BYTES': '536870912'}):
+                with self.assertRaises(ValueError):
+                    module.agent_argv('node-a', state)
+        for flag, value in [('--storage-max-items', '4160'), ('--storage-max-items', '1000001'), ('--storage-mib', '63'), ('--storage-mib', '4097')]:
+            with self.assertRaises(SystemExit):
+                diagnostic.parse_config(['--output', 'unused', flag, value])
+
+
+class DeliveryOwnershipTests(unittest.TestCase):
+    def test_consumer_recovers_its_own_session_and_contextualizes_mutations(self):
+        calls = []
+        rpc = diagnostic.ConnectJsonClient('http://127.0.0.1:8181', 'a' * 64)
+        def call(method, request):
+            calls.append((method, request))
+            if method == 'BeginEventPublicationSession':
+                return {'session': '1', 'snapshotRevision': '7'}
+            return {'subscriptionId': diagnostic.base64.b64encode(b's' * 32).decode()}
+        rpc.call = call
+        consumer = diagnostic.DeliveryClient(rpc)
+        consumer.subscribe(b'key', 'mesh.messages', 'demo/playground')
+        consumer.call('PollEvents', {'subscriptionId': 'sub'})
+        consumer.call('AcknowledgeEvent', {'subscriptionId': 'sub', 'eventId': 'event'})
+        self.assertEqual([method for method, _ in calls[:2]], ['BeginEventPublicationSession', 'CompleteEventPublicationRecovery'])
+        for _, request in calls[2:]:
+            self.assertEqual(request['client'], {'clientId': diagnostic.base64.b64encode(b'path-diagnostic-consumer').decode(), 'session': '1'})
+        self.assertEqual(calls[1][1]['snapshotRevision'], '7')
+
+
 class NumberedPublicationTests(unittest.TestCase):
     def test_lost_response_recovers_original_intent_without_new_publication(self):
         calls = []
@@ -168,7 +214,15 @@ class OutageRestorationTests(unittest.TestCase):
 
 class OutageProfileTests(unittest.TestCase):
     """Real controller/restorer; deterministic clock and bounded fake Docker/IPC."""
-    def run_outage(self, failure=None):
+    def test_five_agents_all_publish_receive_and_reopen(self):
+        result, changes, _ = self.run_outage(agents=5)
+        self.assertEqual(result['status'], 'pass', result.get('error'))
+        self.assertEqual(len(result['peerless']), 5)
+        self.assertEqual(set(result['delivery_timing']), set(result['peerless']))
+        self.assertEqual({row['exact_events'] for row in result['peerless'].values()}, {3005})
+        self.assertEqual({interface for interface, _, _ in changes}, {f'wan{i}' for i in range(1, 6)})
+
+    def run_outage(self, failure=None, agents=2):
         import threading
         import json
         import os
@@ -177,9 +231,10 @@ class OutageProfileTests(unittest.TestCase):
         restored = threading.Event()
         applying = threading.Event()
         actions = []
-        qdiscs = {'wan1': False, 'wan2': False}
+        qdiscs = {f'wan{i}': False for i in range(1, agents + 1)}
         changes = []
-        events = {role: {} for role in ('node-a', 'node-b')}
+        events = {f'node-{chr(97 + i)}': {} for i in range(agents)}
+        agent_started = set()
         original = diagnostic.OutageRestoration
         record = {}
 
@@ -228,6 +283,8 @@ class OutageProfileTests(unittest.TestCase):
                 self.role = argv[argv.index('-i') + 1]
             def call(self, action, **kwargs):
                 actions.append(action)
+                if action == 'subscribe':
+                    self_test.assertEqual(agent_started, set(events), 'all peers must start before consumer recovery')
                 if action == 'start-workload':
                     for i in range(kwargs['count']):
                         identity = self.role + str(i)
@@ -264,6 +321,8 @@ class OutageProfileTests(unittest.TestCase):
                 pass
 
         def command(argv, timeout):
+            if '--detach' in argv:
+                agent_started.add(argv[argv.index('--detach') + 1])
             if 'inspect' in argv:
                 return b'123'
             if any("os.stat('/target')" in arg for arg in argv):
@@ -300,7 +359,7 @@ class OutageProfileTests(unittest.TestCase):
             return b''
 
         with tempfile.TemporaryDirectory() as directory:
-            config = argparse.Namespace(output=Path(directory), duration_seconds=60,
+            config = argparse.Namespace(output=Path(directory), agents=agents, duration_seconds=60,
                 events_per_second=10, payload_bytes=1024, delay_ms=40, jitter_ms=5,
                 loss_percent=1, rate_mbit=100, reorder_percent=10, outage_at_seconds=0,
                 outage_seconds=10, restore_deadline_seconds=120, sample_seconds=5)
@@ -400,6 +459,86 @@ class OutageProfileTests(unittest.TestCase):
         self.assertIn('end-workload', actions)
 
 
+class ScaleConfigurationTests(unittest.TestCase):
+    def test_explicit_count_drives_duration_and_retains_legacy_defaults(self):
+        config = diagnostic.parse_config(['--output', 'unused', '--agents', '5', '--events-per-agent', '1000', '--profiles', 'baseline'])
+        self.assertEqual((config.agents, config.events_per_agent, config.duration_seconds), (5, 1000, 100))
+        config = diagnostic.parse_config(['--output', 'unused'])
+        self.assertEqual((config.agents, config.events_per_agent, config.duration_seconds), (2, 600, 60))
+        self.assertEqual(config.profiles, ['baseline', 'impaired', 'reorder', 'outage'])
+        config = diagnostic.parse_config(['--output', 'unused', '--events-per-agent', '10000', '--profiles', 'baseline'])
+        self.assertEqual(config.events_per_agent, 10000)
+
+    def test_invalid_or_excessive_inputs_fail_before_docker(self):
+        for args in (['--agents', '21'], ['--agents', '1'], ['--events-per-agent', '0'],
+                     ['--cpu-limit', 'nan'], ['--cpu-limit', '-1'], ['--memory-mib', '1'],
+                     ['--events-per-agent', '10000', '--agents', '20'],
+                     ['--events-per-agent', '10000'], ['--events-per-second', '0']):
+            with self.subTest(args=args), self.assertRaises(SystemExit):
+                diagnostic.parse_config(['--output', 'unused', *args])
+
+    def test_kernel_cgroup_limits_not_just_docker_configuration(self):
+        config = argparse.Namespace(cpu_limit=0.5, memory_mib=512)
+        limits = {'cpu.max': '50000 100000', 'memory.max': '536870912', 'memory.swap.max': '0'}
+        diagnostic.verify_cgroup_limits(config, limits)
+        for key in limits:
+            with self.subTest(key=key), self.assertRaises(diagnostic.ExecutionError):
+                diagnostic.verify_cgroup_limits(config, dict(limits, **{key: 'max'}))
+
+    def test_resource_limits_require_exact_readback(self):
+        config = argparse.Namespace(cpu_limit=0.5, memory_mib=512)
+        self.assertEqual(diagnostic.resource_options(config), ['--cpus', '0.5', '--memory', '536870912', '--memory-swap', '536870912'])
+        host = {'NanoCpus': 500000000, 'Memory': 536870912, 'MemorySwap': 536870912}
+        diagnostic.verify_resource_limits(config, host)
+        for key in host:
+            with self.subTest(key=key), self.assertRaises(diagnostic.ExecutionError):
+                diagnostic.verify_resource_limits(config, dict(host, **{key: 0}))
+
+
+class ScaleHelperTests(unittest.TestCase):
+    def load(self, name):
+        spec = diagnostic.importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'docker/path-lab' / (name + '.py'))
+        module = diagnostic.importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_twenty_private_states_and_strict_initializer_inventory(self):
+        provision = self.load('delivery-provision')
+        raw = ('PLAYGROUND_INIT status=pass nodes=20 root=private\n' + ''.join(
+            f'PLAYGROUND_NODE index={i} carrier_id={i:064x} mission_id={i+20:064x}\n' for i in range(20))).encode()
+        self.assertEqual(len(provision.parse_nodes(raw, 20)), 20)
+        with self.assertRaises(ValueError):
+            provision.parse_nodes(raw.replace(b'index=19 ', b'index=18 '), 20)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(len(provision.create_state_targets(Path(directory), 20)), 20)
+
+    def test_all_to_all_agent_peers_and_default_gateway(self):
+        agent = self.load('delivery-agent')
+        network = self.load('delivery-network-init')
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / 'peer').write_text(''.join(f'{i:064x}@10.77.{i}.2:4433={i:064x}\n' for i in range(1, 20)))
+            argv = agent.agent_argv('node-t', state)
+            self.assertEqual(argv.count('--peer'), 19)
+            self.assertIn('10.77.20.2:4433', argv)
+        commands = network.commands('node-t', 20)
+        self.assertIn(['ip', 'route', 'replace', 'default', 'via', '10.77.20.1'], commands)
+
+    def test_owned_docker_accepts_only_bounded_scale_roles(self):
+        calls = []
+        def run(argv, timeout):
+            calls.append(argv)
+            cidfile = Path(argv[argv.index('--cidfile') + 1])
+            cidfile.write_text('a' * 64)
+            cidfile.chmod(0o600)
+            return b''
+        with tempfile.TemporaryDirectory() as directory:
+            owner = diagnostic.OwnedDocker('docker', Path(directory), run)
+            owner.create('node-t', ['--network', 'none'], ['sleep', '10'])
+            with self.assertRaises(diagnostic.ExecutionError):
+                owner.create('node-u', [], [])
+
+
 class OracleTests(unittest.TestCase):
     def test_image_cannot_become_a_docker_option(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -415,6 +554,101 @@ class OracleTests(unittest.TestCase):
     def test_proc_disappearance_during_shutdown_is_success(self):
         with patch.object(Path, 'read_text', side_effect=ProcessLookupError(3, 'No such process')):
             diagnostic.wait_stopped(123)
+
+    def test_publisher_admission_reserves_two_connections_and_preserves_work(self):
+        import threading
+        release = threading.Event()
+        six_started = threading.Event()
+        overflow = threading.Event()
+        lock = threading.Lock()
+        active = peak = 0
+
+        class Client:
+            def publish_event(self, key, payload):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    if active == 6:
+                        six_started.set()
+                    if active > 6:
+                        overflow.set()
+                release.wait(3)
+                with lock:
+                    active -= 1
+                return {'id': key.decode(), 'payload': payload.decode()}
+
+            def call(self, method, request):
+                return {'deliveries': []}
+
+        workload = diagnostic.Workload(Client(), 'sub', 'probe', 12, 1000, 32)
+        try:
+            self.assertTrue(six_started.wait(2))
+            exceeded = overflow.wait(0.1)
+            release.set()
+            workload.publisher.join(3)
+            result = workload.snapshot()
+            self.assertFalse(exceeded, 'publishing consumed reserved consumer/status slots')
+            self.assertEqual(peak, 6)
+            self.assertEqual(len(result['accepted']), 12)
+            self.assertEqual(result['errors'], [])
+            self.assertGreater(result['max_schedule_lag_seconds'], 0.05)
+        finally:
+            release.set()
+            workload.close()
+
+    def test_publisher_checks_actual_start_not_executor_submission_time(self):
+        import time
+        original_executor = diagnostic.ThreadPoolExecutor
+        calls = []
+
+        class DelayedExecutor(original_executor):
+            def submit(self, function, *args, **kwargs):
+                def delayed():
+                    time.sleep(1.05)
+                    return function(*args, **kwargs)
+                return super().submit(delayed)
+
+        class Client:
+            def publish_event(self, key, payload):
+                calls.append(key)
+                return {'id': key.decode()}
+
+            def call(self, method, request):
+                return {'deliveries': []}
+
+        with patch.object(diagnostic, 'ThreadPoolExecutor', DelayedExecutor):
+            workload = diagnostic.Workload(Client(), 'sub', 'probe', 1, 10, 32)
+            workload.publisher.join(3)
+            result = workload.snapshot()
+            workload.close()
+        self.assertEqual(calls, [])
+        self.assertGreater(result['max_schedule_lag_seconds'], 1)
+        self.assertEqual(result['errors'], ['bounded publisher could not maintain requested pace'])
+
+    def test_publisher_admission_timeout_does_not_smooth_requested_rate(self):
+        import threading
+        release = threading.Event()
+
+        class Client:
+            def publish_event(self, key, payload):
+                release.wait(3)
+                return {'id': key.decode()}
+
+            def call(self, method, request):
+                return {'deliveries': []}
+
+        workload = diagnostic.Workload(Client(), 'sub', 'probe', 7, 1000, 32)
+        try:
+            self.assertFalse(workload.stop.wait(1.2))
+            result = workload.snapshot()
+            self.assertGreater(result['max_schedule_lag_seconds'], 1)
+            self.assertEqual(result['errors'], ['bounded publisher could not maintain requested pace'])
+        finally:
+            release.set()
+            workload.publisher.join(3)
+            workload.close()
+        self.assertEqual(len(workload.snapshot()['accepted']), 6)
 
     def test_paced_workload_counts_rejection_and_unknown_failure(self):
         class Client:
@@ -829,20 +1063,22 @@ class WorkflowTests(unittest.TestCase):
     def test_manual_read_only_pinned_and_always_retained(self):
         import re
         text = self.workflow
-        self.assertIn('on:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n', text)
+        self.assertIn('on:\n  workflow_dispatch:\n    inputs:', text)
+        self.assertIn('permissions:\n  contents: read\n', text)
+        self.assertIn('name: "Diagnostic: load, scale and network faults"', text)
         self.assertIn('persist-credentials: false', text)
         self.assertIn('timeout-minutes: 90', text)
         self.assertIn('if: ${{ always() }}', text)
         self.assertIn('path: artifacts/path-diagnostic/', text)
         self.assertIn('retention-days: 14', text)
         self.assertEqual(len(re.findall(r'uses: [\w/-]+@[0-9a-f]{40} ', text)), 2)
-        for forbidden in ('pull_request:', 'push:', 'inputs:', 'sudo ', '--privileged',
+        for forbidden in ('pull_request:', 'push:', 'sudo ', '--privileged',
                           '--network=host', 'docker system prune', 'continue-on-error:'):
             self.assertNotIn(forbidden, text)
 
     def test_shell_syntax_and_canonical_build(self):
         import subprocess
-        self.assertEqual(len(self.scripts), 3)
+        self.assertEqual(len(self.scripts), 4)
         for script in self.scripts:
             subprocess.run(['bash', '-n'], input=script, text=True, check=True)
             self.assertNotIn('${{', script)
@@ -862,13 +1098,30 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 23)
             self.assertTrue((Path(directory) / 'artifacts/path-diagnostic/preflight.log').is_file())
 
+    def test_controller_exit_survives_tee_and_records_timeout(self):
+        import os
+        import subprocess
+        for code in (1, 124, 137):
+            with tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'artifacts/path-diagnostic').mkdir(parents=True)
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
+                    f'timeout() {{ return {code}; }};\n' + self.scripts[2]], cwd=directory,
+                    env=dict(os.environ, PROFILE='baseline'), capture_output=True, text=True)
+                self.assertEqual(result.returncode, code)
+                self.assertEqual((Path(directory) / 'artifacts/path-diagnostic/run-exit-code').read_text().strip(), str(code))
+
     def test_launch_arguments_use_actual_cli_defaults(self):
         import shlex
         script = self.scripts[2].replace('\\\n', '')
         argv = shlex.split(script)
         start = argv.index('tools/aster_path_diagnostic.py')
         argv = argv[start:argv.index('2>&1')]
-        self.assertEqual(argv[1:], ['--output', 'artifacts/path-diagnostic'])
+        for name in ('agents', 'events-per-agent', 'payload-bytes', 'events-per-second',
+                     'cpu-limit', 'memory-mib', 'restore-deadline-seconds'):
+            self.assertIn('--' + name, argv)
+        for name in ('AGENTS', 'EVENTS', 'PAYLOAD', 'RATE', 'CPU', 'MEMORY', 'DEADLINE', 'PROFILE'):
+            self.assertIn('"$' + name + '"', self.scripts[2])
+        argv = ['diagnostic', '--output', 'artifacts/path-diagnostic']
         configurations = []
 
         def profile(config, name, row):

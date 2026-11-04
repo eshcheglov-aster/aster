@@ -1,12 +1,12 @@
 # Aster path-lab
 
-## Opt-in Event impairment and resource diagnostic
+## Opt-in Event load, scale and network-fault diagnostic
 
 `tools/aster_path_diagnostic.py` shares the delivery image, production agents,
 Connect JSON client and owned-container cleanup with the smoke below. It runs
-four independent two-agent workloads by default:
+four independent two-agent workloads by default, with 2..20 agents supported:
 
-| Profile | Both WAN egress interfaces |
+| Profile | All WAN egress interfaces |
 | --- | --- |
 | baseline | No configured delay, loss, rate limit or reordering |
 | impaired | 40 ms delay, 5 ms jitter, 1% loss, 100 Mbit/s |
@@ -15,7 +15,8 @@ four independent two-agent workloads by default:
 
 Each endpoint attempts 600 durable 1-KiB Events at 10 Events/second, continuously
 polls and acknowledges deliveries, and requires every admitted Event's exact ID,
-logical key and payload at its peer. Each publishing lane owns a durable SDK
+logical key and payload at every other agent. All agents publish and configure
+all other agents as peers, with one routed WAN segment per agent. Each publishing lane owns a durable SDK
 journal and stable client identity. Lost replies are recovered through the
 numbered session and original journaled intent, never a new publication. The
 CLI does not expose structured capacity-rejection details, so resource
@@ -23,12 +24,17 @@ exhaustion alone is not counted as a definite rejection; unresolved outcomes
 fail the run. Journals remain available to the helper's recovery path during the
 run; final owned-state cleanup removes them together with the disposable mission
 credentials, including on failure. Retained receipts are not resumable journals.
+Each agent admits at most **six active publisher tasks**, leaving capacity for
+the independent consumer and controller. This is not a server-socket count:
+connection teardown may overlap. Admission and actual task-start lag must stay
+within one second of the original scheduled time; insufficient CPU/rate capacity
+fails rather than quietly reducing the requested load.
 A run with no admitted Events cannot pass. The outage publishes
-new witness Events only after both 100%-loss qdiscs are read back, checks them
-absent at the peer before restoration, and allows 120 seconds after restoration
+new witness Events only after all 100%-loss qdiscs are read back, checks them
+absent at every other agent before restoration, and allows 120 seconds after restoration
 for delivery. Restoration is armed after the loss replacements, before qdisc
 readback; late or failed readback cannot extend the timer or establish negative
-witness evidence. Both interface change times are retained. Finally both agents
+witness evidence. All interface change times are retained. Finally all agents
 stop, reopen **without peers**, with WAN still
 cut, and query every accepted Event using bounded advancing pagination.
 
@@ -39,19 +45,94 @@ python3 tools/aster_path_diagnostic.py --output artifacts/path-diagnostic
 python3 tools/test_aster_path_diagnostic.py
 ```
 
+### Workload and resource controls
+
+```sh
+# Five agents, each publishing 100 Events over ten seconds.
+python3 tools/aster_path_diagnostic.py --output artifacts/scale-5 \
+  --agents 5 --events-per-agent 100 --profiles baseline
+# 10,000 Events per agent, with CPU and RAM constrained per container.
+python3 tools/aster_path_diagnostic.py --output artifacts/load-limited \
+  --events-per-agent 10000 --events-per-second 20 --profiles baseline \
+  --cpu-limit 1 --memory-mib 1024 --restore-deadline-seconds 600 \
+  --storage-max-items 50000 --storage-mib 512
+```
+
+| Option | Default | Bounds |
+| --- | --- | --- |
+| `--agents` | 2 | 2..20 |
+| `--events-per-agent` | duration × rate (600) | 1..10000 |
+| `--payload-bytes` | 1024 | 1..4096 |
+| `--events-per-second` | 10 | 1..100 per agent |
+| `--cpu-limit` | 0 (unrestricted) | 0, or 0.1..64 cores |
+| `--memory-mib` | 0 (unrestricted) | 0, or 64..16384 MiB |
+| `--restore-deadline-seconds` | 120 | 1..600 |
+| `--storage-max-items` | 10000 | 4161..1000000 per agent |
+| `--storage-mib` | 64 | 64..4096 MiB per agent |
+
+Store limits are explicit startup overrides, retained through peerless restart;
+production defaults are unchanged. MiB is converted to `max_payload_bytes`.
+These are aggregate store allowances, not plaintext Event capacity: control and
+tombstone reserves plus signed/encrypted record overhead consume space too.
+The default 64 MiB is insufficient for 10,000 Events per agent in a two-agent
+run. Raising a quota permits an experiment, not a promise that its workload,
+rate, deadline or RAM budget will pass. The legacy evaluation agent accepts the
+paired `--storage-max-items` / `--storage-max-payload-bytes` flags; the supported
+customer configuration already exposes `storage.max_items/max_payload_bytes`.
+
+An explicit Event count derives the publication window from count/rate;
+`--duration-seconds` remains available for existing callers. Publication takes
+at most 1800 seconds. The sum of publication and delivery windows across
+profiles cannot exceed 2400 seconds. The controller rejects combinations whose
+`agents² × (Events + 1) × (3 × payload bytes + 1024)` exceed its 256-MiB
+receipt/IPC budget. These harness bounds do not assert product capacities.
+
+CPU/RAM limits apply to each agent container, including its local publication
+and consumption helpers, not just the agent PID. RAM-limited containers have no
+swap allowance. Docker HostConfig readback must match CPU, memory and swap
+settings before publication, together with Linux cgroup-v2 kernel readback.
+Unsupported cgroup layouts fail closed. Receipts retain those limits and final container
+exit/OOM state and cgroup OOM-kill counters; samples measure the agent PID separately. A Docker daemon that
+cannot enforce the requested limits is not a qualifying resource environment.
+
 ### Manual GitHub Actions launch
 
-Choose **Actions → Diagnostic: manual runtime-volume test → Run workflow**, then
-select the source branch. `.github/workflows/diagnostic-runtime-volume.yml` must exist on
+Choose **Actions → Diagnostic: load, scale and network faults → Run workflow**, then
+select the source branch and bounded workload/resource inputs. `.github/workflows/diagnostic-runtime-volume.yml` must exist on
 the default branch before GitHub exposes the launch button. This replaces the
 archived runtime-volume launch; it does not revive that implementation or run
 on pushes, pull requests, or as part of `CI / required`.
 
 The Ubuntu 24.04 job builds `Dockerfile.delivery` from the selected checkout,
 using the same digest-pinned Rust base, locked Cargo dependencies and Debian
-snapshot as the delivery smoke. It then runs all four default profiles above,
+snapshot as the delivery smoke. It then runs the selected profiles,
 without privileged containers or host networking. There are no free-form shell
 inputs or pre-existing local image dependencies.
+
+Inputs are validated before building, passed through environment variables and
+quoted arguments, and bounded again by the controller. The Job Summary contains
+only Markdown tables: step/campaign outcomes, requested inputs and per-agent
+observed counts, exact peerless checks, sampled peak RSS and same-process CPU.
+Missing evidence is not a pass. Controller timeout/failure exits remain failures;
+summary and artifact upload are always attempted, but a hard runner cancellation
+can prevent either. No HTML report or charts are generated.
+
+For a fork that already registers this workflow filename on its default branch,
+dispatch the published feature ref without merging it into default:
+
+```sh
+gh workflow run diagnostic-runtime-volume.yml --repo OWNER/aster \
+  --ref feature/122-diagnostic-scale \
+  -f agents=2 -f events=1 -f payload=32 -f rate=1 -f profile=baseline \
+  -f cpu=0 -f memory=0 -f deadline=30 -f storage_items=50000 -f storage_mib=512
+```
+
+The default-branch form can still show the older input-free definition; dispatch
+by CLI against the feature ref for its new inputs. If the filename is not yet
+registered, default-branch registration requires a separately approved change.
+The canonical build verifies TLS normally. A local intercepting proxy's private
+CA is not part of the pinned base image; such a host needs an explicitly trusted
+build environment, not a TLS bypass or a silent local-image fallback.
 
 Download **aster-path-diagnostic-<commit SHA>-<run attempt>** from the run's
 Artifacts section (14-day retention). Its root contains `receipt.json`, per-profile
@@ -71,7 +152,7 @@ veth/netem support, but **not host root, sudo or host NET_ADMIN**. It creates ve
 inside owned containers using NET_ADMIN-only setup helpers and a read-only bind
 of the owned WAN container's network namespace. No host interface, route, qdisc,
 firewall, SYS_ADMIN capability or privileged container is used. Unlike the short
-smoke, the three setup helpers and CHOWN-only provisioner remain for the bounded
+smoke, the per-agent and WAN setup helpers and CHOWN-only provisioner remain for the bounded
 run, so they can change impairments and reclaim private credentials. Agents and
 namespace holders remain UID/GID 10001 with all capabilities dropped. No network
 path bypasses WAN. The diagnostic source helper is bound read-only into nodes;

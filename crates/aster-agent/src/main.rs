@@ -7,14 +7,15 @@ use aster_agent::{
     config::{check_config, load_and_validate_config},
     runtime::{AgentExit, AgentSignal, run_customer_agent},
 };
+#[cfg(feature = "nearby-discovery")]
+use aster_node::MissionNearbyPeer;
 use aster_node::application::{Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{
     MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
-    SourceInterestSelector, ensure_state_accepts_normal_operation, format_path_field, start_node,
+    SelectedForwardingConfig, SourceInterestSelector, StoreLimits,
+    ensure_state_accepts_normal_operation, format_path_field, start_node_with_forwarding,
 };
-#[cfg(feature = "nearby-discovery")]
-use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
 use aster_systemd_credentials::SystemdCredentialLoader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -96,6 +97,26 @@ async fn run() -> Result<Option<AgentExit>, BoxError> {
     }
 }
 
+fn parse_legacy_storage(arguments: &mut Arguments) -> Result<SelectedForwardingConfig, BoxError> {
+    let items = arguments.optional("--storage-max-items")?;
+    let bytes = arguments.optional("--storage-max-payload-bytes")?;
+    let forwarding = SelectedForwardingConfig::default();
+    match (items, bytes) {
+        (None, None) => Ok(forwarding),
+        (Some(items), Some(bytes)) => {
+            let limits = StoreLimits::new(items.parse()?, bytes.parse()?)?;
+            // Same minimum as the supported agent configuration: preserve control
+            // reserves and leave room for one maximum application message.
+            if limits.max_items() < 4_161 || limits.max_total_payload_bytes() < 17_891_328 {
+                return Err("storage limits are below agent minimum".into());
+            }
+            aster_redb_store::CustodyQuota::for_store_limits(limits)?;
+            Ok(forwarding.with_store_limits(limits))
+        }
+        _ => Err("both storage limit flags are required".into()),
+    }
+}
+
 fn agent_exit_code(exit: AgentExit) -> u8 {
     match exit {
         AgentExit::Clean => 0,
@@ -137,11 +158,12 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
             .optional("--sync-ms")?
             .map_or(Ok(500_u64), |value| value.parse())?,
     );
+    let forwarding = parse_legacy_storage(&mut arguments)?;
     arguments.finish()?;
 
     #[cfg(feature = "nearby-discovery")]
-    let (forwarding, nearby_enabled) = apply_nearby_cli(
-        SelectedForwardingConfig::default(),
+    let (forwarding, _) = apply_nearby_cli(
+        forwarding,
         peers.len(),
         nearby_peers,
         discover_lan,
@@ -163,14 +185,7 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
         run_for: None,
         application: NodeApplication::Relay,
     };
-    #[cfg(feature = "nearby-discovery")]
-    let node = if nearby_enabled {
-        start_node_with_forwarding(config, forwarding).await?
-    } else {
-        start_node(config).await?
-    };
-    #[cfg(not(feature = "nearby-discovery"))]
-    let node = start_node(config).await?;
+    let node = start_node_with_forwarding(config, forwarding).await?;
     let pinned_state = node.state_root().to_path_buf();
     let events = node.selected_events();
     let blobs = node.selected_blobs();
@@ -340,6 +355,7 @@ Usage:
     [--state-interest TOPIC@SCOPE ...] \
     [--record-interest TOPIC@SCOPE ...] \
     [--blob-interest TOPIC@SCOPE ...] [--sync-ms N]
+    [--storage-max-items N --storage-max-payload-bytes N]
 
 The plaintext application listener is restricted to loopback and every RPC
 requires an owner-provisioned bearer token from an owner-only regular file.
@@ -433,6 +449,49 @@ impl Arguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_storage_limits_are_opt_in_and_require_a_valid_pair() {
+        let default = parse_legacy_storage(&mut Arguments::new(std::iter::empty())).unwrap();
+        assert_eq!(
+            default.store_limits(),
+            SelectedForwardingConfig::default().store_limits()
+        );
+        let mut args = Arguments::new(
+            [
+                "--storage-max-items",
+                "50000",
+                "--storage-max-payload-bytes",
+                "536870912",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let selected = parse_legacy_storage(&mut args).unwrap();
+        assert_eq!(selected.store_limits().max_items(), 50000);
+        assert_eq!(selected.store_limits().max_total_payload_bytes(), 536870912);
+        args.finish().unwrap();
+        for values in [
+            vec!["--storage-max-items", "50000"],
+            vec![
+                "--storage-max-items",
+                "0",
+                "--storage-max-payload-bytes",
+                "1",
+            ],
+            vec![
+                "--storage-max-items",
+                "no",
+                "--storage-max-payload-bytes",
+                "536870912",
+            ],
+        ] {
+            assert!(
+                parse_legacy_storage(&mut Arguments::new(values.into_iter().map(str::to_owned)))
+                    .is_err()
+            );
+        }
+    }
 
     fn blob_interest_arguments(interests: impl IntoIterator<Item = String>) -> Arguments {
         Arguments::new(

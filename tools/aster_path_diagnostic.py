@@ -111,7 +111,7 @@ class Worker:
                 if not chunk:
                     raise ValueError('worker closed during ' + action)
                 self.buffer += chunk
-                if len(self.buffer) > 16 * 1024 * 1024:
+                if len(self.buffer) > 128 * 1024 * 1024:
                     raise ValueError('worker response bound exceeded')
         line, self.buffer = self.buffer.split(b'\n', 1)
         response = json.loads(line)
@@ -201,6 +201,36 @@ def publish_one(client, key, size):
     return client.publish_event(raw_key, payload)
 
 
+class DeliveryClient:
+    """Fresh consumer-only owner, separate from every publication journal.
+
+    This disposable worker never publishes through this identity. Any unexpected
+    recovered publication is an error rather than an intent we can reconstruct.
+    """
+    def __init__(self, rpc):
+        self.rpc = rpc
+        identity = base64.b64encode(b'path-diagnostic-consumer').decode()
+        recovered = rpc.call('BeginEventPublicationSession', {
+            'clientId': identity, 'expectedSession': '0',
+            'claimNonce': base64.b64encode(os.urandom(32)).decode()})
+        if recovered.get('outstanding') or int(recovered.get('allocatedThrough', 0)):
+            raise ValueError('unexpected consumer publication recovery')
+        self.context = {'clientId': identity, 'session': recovered['session']}
+        rpc.call('CompleteEventPublicationRecovery', {
+            **self.context, 'snapshotRevision': recovered.get('snapshotRevision', '0')})
+
+    def call(self, method, request):
+        if method in ('PollEvents', 'AcknowledgeEvent'):
+            request = dict(request, client=self.context)
+        return self.rpc.call(method, request)
+
+    def subscribe(self, key, topic, scope):
+        return self.rpc.subscribe(key, topic, scope, self.context)
+
+    def __getattr__(self, name):
+        return getattr(self.rpc, name)
+
+
 class Workload:
     """Bounded paced publishers and independent continuous consumption."""
     def __init__(self, client, subscription, prefix, count, rate, size, publisher=None):
@@ -219,10 +249,20 @@ class Workload:
         self.publisher.start()
 
     def publish_loop(self, prefix, count, rate, size):
-        slots = threading.BoundedSemaphore(48)
+        # Each synchronous CLI lane has at most one outstanding connection.
+        # Reserve two of the server's eight unauthenticated slots for the
+        # independent consumer and serialized worker status requests.
+        budget = 6
+        slots = threading.BoundedSemaphore(budget)
 
-        def publish(key):
+        def publish(key, due):
             try:
+                lag = max(0, time.monotonic() - due)
+                with self.lock:
+                    self.max_schedule_lag = max(self.max_schedule_lag, lag)
+                    if lag > 1:
+                        self.errors.append('bounded publisher could not maintain requested pace')
+                        return
                 result = publish_one(self.publications, key, size)
                 with self.lock:
                     if 'rejected' in result:
@@ -235,18 +275,18 @@ class Workload:
             finally:
                 slots.release()
 
-        with ThreadPoolExecutor(max_workers=48) as executor:
+        with ThreadPoolExecutor(max_workers=budget) as executor:
             for index in range(count):
                 due = self.started + index / rate
                 if self.stop.wait(max(0, due - time.monotonic())):
                     break
-                lag = max(0, time.monotonic() - due)
-                self.max_schedule_lag = max(self.max_schedule_lag, lag)
-                if lag > 1 or not slots.acquire(blocking=False):
+                admitted = slots.acquire(timeout=max(0, due + 1 - time.monotonic()))
+                if not admitted:
                     with self.lock:
+                        self.max_schedule_lag = max(self.max_schedule_lag, time.monotonic() - due)
                         self.errors.append('bounded publisher could not maintain requested pace')
                     break
-                executor.submit(publish, f'{prefix}-{index:06d}')
+                executor.submit(publish, f'{prefix}-{index:06d}', due)
         with self.lock:
             self.done = True
             self.finished = time.monotonic()
@@ -316,6 +356,9 @@ def worker_main():
             if action == 'status':
                 result = sample(client)
             elif action == 'subscribe':
+                if subscription is not None:
+                    raise ValueError('consumer already initialized')
+                client = DeliveryClient(client)
                 subscription = client.subscribe(b'path-diagnostic', 'mesh.messages', 'demo/playground')['subscriptionId']
                 result = subscription
             elif action == 'publish':
@@ -358,8 +401,9 @@ def worker_main():
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 argv = module.agent_argv(request['role'])
-                index = argv.index('--peer')
-                del argv[index:index + 2]
+                while '--peer' in argv:
+                    index = argv.index('--peer')
+                    del argv[index:index + 2]
                 process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 Path('/clab/state/agent.pid').write_text(str(process.pid))
                 result = {'pid': process.pid, 'argv': argv}
@@ -384,7 +428,7 @@ class OutageRestoration:
         self.thread = threading.Thread(target=self._run, name='outage-restoration')
 
     def arm(self, applied):
-        # Called after BOTH replacement attempts, before any slow readback.
+        # Called after all replacement attempts, before any slow readback.
         if applied is not None:
             self.record.update(applied_monotonic=applied,
                                restore_target_monotonic=applied + self.seconds)
@@ -438,8 +482,43 @@ class OutageRestoration:
             raise ValueError('outage witness not verified before scheduled restore')
 
 
+def resource_options(config):
+    options = []
+    if hasattr(config, 'storage_max_items'):
+        options += ['--env', f'ASTER_DIAGNOSTIC_STORAGE_ITEMS={config.storage_max_items}',
+                    '--env', f'ASTER_DIAGNOSTIC_STORAGE_BYTES={config.storage_mib * 1024 * 1024}']
+    if getattr(config, 'cpu_limit', 0):
+        options += ['--cpus', str(config.cpu_limit)]
+    if getattr(config, 'memory_mib', 0):
+        memory = str(config.memory_mib * 1024 * 1024)
+        options += ['--memory', memory, '--memory-swap', memory]
+    return options
+
+
+def verify_resource_limits(config, host):
+    expected = {'NanoCpus': round(getattr(config, 'cpu_limit', 0) * 1_000_000_000),
+                'Memory': getattr(config, 'memory_mib', 0) * 1024 * 1024,
+                'MemorySwap': getattr(config, 'memory_mib', 0) * 1024 * 1024}
+    if any(host.get(key) != value for key, value in expected.items()):
+        raise ExecutionError('resource limit readback mismatch')
+
+
+def verify_cgroup_limits(config, limits):
+    try:
+        quota, period = limits['cpu.max'].split()
+        if config.cpu_limit and (quota == 'max' or abs(int(quota) / int(period) - config.cpu_limit) > 0.00001):
+            raise ValueError('CPU quota')
+        if config.memory_mib and (int(limits['memory.max']) != config.memory_mib * 1024 * 1024
+                                  or limits['memory.swap.max'] != '0'):
+            raise ValueError('memory quota')
+    except (KeyError, ValueError, ZeroDivisionError) as error:
+        raise ExecutionError('kernel cgroup limit readback mismatch') from error
+
+
 def run_profile(config, profile, report):
     """Own all containers; never issue a host networking command."""
+    roles = tuple(f'node-{chr(97 + i)}' for i in range(getattr(config, 'agents', 2)))
+    interfaces = tuple(f'wan{i}' for i in range(1, len(roles) + 1))
     run = _pinned_docker(_run_command)
     docker = shutil.which('docker')
     directory = Path(tempfile.mkdtemp(prefix='aster-diagnostic-'))
@@ -468,6 +547,12 @@ def run_profile(config, profile, report):
     def execute(cid, *args, timeout=30):
         return command('exec', cid, *args, timeout=timeout)
 
+    def cgroup(cid):
+        return json.loads(execute(cid, 'python3', '-c',
+            "import json,pathlib; p=pathlib.Path('/sys/fs/cgroup'); "
+            "print(json.dumps({k:(p/k).read_text().strip() for k in "
+            "('cpu.max','memory.max','memory.swap.max','memory.events')}))"))
+
     def create(role, options, argv, caps=()):
         validate()
         cid = owned.create(role, options, argv, caps)
@@ -483,7 +568,7 @@ def run_profile(config, profile, report):
         args = netem_args(which, config.delay_ms, config.jitter_ms, config.loss_percent,
                           config.rate_mbit, config.reorder_percent)
         rows, texts, changes, errors = [], [], [], []
-        for interface in ('wan1', 'wan2'):
+        for interface in interfaces:
             change = {'interface': interface, 'started_monotonic': time.monotonic()}
             changes.append(change)
             try:
@@ -494,12 +579,12 @@ def run_profile(config, profile, report):
             except Exception as error:
                 change['error'] = str(error)
                 errors.append(interface + ': ' + str(error))
-        # Attempt BOTH egresses even if one fails, without retrying a command.
+        # Attempt all egresses even if one fails, without retrying a command.
         # Arm restoration BEFORE readback. Use the first egress application as
-        # the deadline origin; retain both interface timings in the receipt.
+        # the deadline origin; retain all interface timings in the receipt.
         if on_applied is not None:
             on_applied(None if errors else changes[0]['applied_monotonic'])
-        for interface in ('wan1', 'wan2'):
+        for interface in interfaces:
             try:
                 rows.append(json.loads(execute(setup['wan'], 'tc', '-j', '-s', 'qdisc', 'show', 'dev', interface, timeout=5)))
                 texts.append(execute(setup['wan'], 'tc', 'qdisc', 'show', 'dev', interface, timeout=5).decode())
@@ -569,23 +654,30 @@ def run_profile(config, profile, report):
                  getattr(config, 'restore_deadline_seconds', 120) + 420)
     try:
         phase('setup')
-        wan = create('wan', ['--network', 'none', '--sysctl', 'net.ipv4.ip_forward=1'], ['sleep', '1800'])
+        wan = create('wan', ['--network', 'none', '--sysctl', 'net.ipv4.ip_forward=1'], ['sleep', '3600'])
         helper_directory = getattr(config, 'helper_directory', Path(__file__).resolve().parent)
         helper_mounts = []
         for name in HELPER_FILES:
             target = 'diagnostic.py' if name == 'aster_path_diagnostic.py' else name
             helper_mounts += ['--volume', str(helper_directory / name) + ':/' + target + ':ro']
-        for role in ('node-a', 'node-b'):
+        for role in roles:
             (lab / role).mkdir(mode=0o700)
             nodes[role] = create(role, ['--network', 'none', '--volume', str(lab / role) + ':/clab',
-                                      *helper_mounts], ['sleep', '1800'])
+                                      *helper_mounts, *resource_options(config)], ['sleep', '3600'])
+            if hasattr(config, 'cpu_limit'):
+                host = json.loads(command('inspect', '--format', '{{json .HostConfig}}', nodes[role]))
+                report.setdefault('resource_limits', {})[role] = {key: host.get(key) for key in ('NanoCpus', 'Memory', 'MemorySwap')}
+                verify_resource_limits(config, host)
+                limits = cgroup(nodes[role])
+                report['resource_limits'][role]['cgroup'] = limits
+                verify_cgroup_limits(config, limits)
             report['accepted'][role], report['deliveries'][role], report['rejected'][role] = {}, {}, []
         provision = create('provision', ['--network', 'none', '--volume', str(lab) + ':/lab'],
-                           ['sleep', '1800'], ('CHOWN',))
+                           ['sleep', '3600'], ('CHOWN',))
         execute(provision, 'python3', '-c',
                 "import os; os.chown('/lab',0,0); "
-                "[os.chown('/lab/'+r,0,0) for r in ('node-a','node-b')]")
-        execute(provision, LIB + 'delivery-provision.py')
+                f"[os.chown('/lab/'+r,0,0) for r in {roles!r}]")
+        execute(provision, LIB + 'delivery-provision.py', str(len(roles)))
         wan_pid = int(command('inspect', '--format', '{{.State.Pid}}', wan))
         if wan_pid <= 1:
             raise ValueError('WAN namespace holder is not running')
@@ -594,7 +686,7 @@ def run_profile(config, profile, report):
         # namespace entry, SYS_ADMIN, privileged container, or host qdisc.
         for segment, (role, cid) in enumerate(nodes.items(), 1):
             setup[role] = create(role + '-setup', ['--network', 'container:' + cid,
-                '--volume', f'/proc/{wan_pid}/ns/net:/target:ro'], ['sleep', '1800'], ('NET_ADMIN',))
+                '--volume', f'/proc/{wan_pid}/ns/net:/target:ro'], ['sleep', '3600'], ('NET_ADMIN',))
             if int(command('inspect', '--format', '{{.State.Pid}}', wan)) != wan_pid:
                 raise ValueError('WAN namespace identity changed')
             namespace_inodes = json.loads(execute(setup[role], 'python3', '-c',
@@ -603,28 +695,32 @@ def run_profile(config, profile, report):
                 raise ValueError('network namespaces are not isolated')
             execute(setup[role], 'ip', 'link', 'add', 'eth0', 'type', 'veth',
                     'peer', 'name', f'wan{segment}', 'netns', '/target')
-            execute(setup[role], LIB + 'delivery-network-init.py', role)
-        setup['wan'] = create('wan-setup', ['--network', 'container:' + wan], ['sleep', '1800'], ('NET_ADMIN',))
-        for segment in (1, 2):
+            execute(setup[role], LIB + 'delivery-network-init.py', role, str(len(roles)))
+        setup['wan'] = create('wan-setup', ['--network', 'container:' + wan], ['sleep', '3600'], ('NET_ADMIN',))
+        for segment in range(1, len(roles) + 1):
             execute(setup['wan'], 'ip', 'addr', 'add', f'10.77.{segment}.1/29', 'dev', f'wan{segment}')
             execute(setup['wan'], 'ip', 'link', 'set', f'wan{segment}', 'up')
         configure('baseline' if profile == 'outage' else profile)
         report['production_binary_sha256'] = execute(nodes['node-a'], 'sha256sum', '/usr/local/bin/aster-agent').decode().split()[0]
         report['container_image_ids'] = {role: command('inspect', '--format', '{{.Image}}', cid).decode().strip()
                                          for role, cid in nodes.items()}
+        # Bring every peer online before consumer recovery can wait behind a
+        # network contact to a not-yet-started endpoint.
         for role, cid in nodes.items():
             command('exec', '--detach', cid, LIB + 'delivery-agent.py', role)
+        for role, cid in nodes.items():
             workers[role] = Worker([docker, '--host', 'unix:///var/run/docker.sock', 'exec', '-i', cid,
                                    'env', 'PYTHONPATH=' + LIB, 'python3', '/diagnostic.py', '--worker'])
-            ready(workers[role])
-            execute(cid, LIB + 'delivery-agent.py', 'verify', role)
-            workers[role].call('subscribe')
+        for role, worker in workers.items():
+            ready(worker)
+            execute(nodes[role], LIB + 'delivery-agent.py', 'verify', role)
+            worker.call('subscribe')
         execute(wan, LIB + 'delivery-agent.py', 'verify', 'wan')
         report['capabilities'] = 'verified holders and initial agent PIDs'
         sample_all()
         phase('publish-and-continuous-consume')
         publish_start = time.monotonic()
-        count = int(config.duration_seconds * config.events_per_second)
+        count = getattr(config, 'events_per_agent', int(config.duration_seconds * config.events_per_second))
         outage_start = None
         restored = None
         witnesses = {}
@@ -663,11 +759,13 @@ def run_profile(config, profile, report):
                 consume()
                 outage.require_active()
                 for role, identity in witnesses.items():
-                    other = 'node-b' if role == 'node-a' else 'node-a'
-                    present = workers[other].call('query-witness', key=f'{profile}-{role}-witness', identity=identity)
-                    outage.require_active()
-                    if present or identity in report['deliveries'][other]:
-                        raise ValueError('outage witness reached peer before restore')
+                    for other in workers:
+                        if other == role:
+                            continue
+                        present = workers[other].call('query-witness', key=f'{profile}-{role}-witness', identity=identity)
+                        outage.require_active()
+                        if present or identity in report['deliveries'][other]:
+                            raise ValueError('outage witness reached peer before restore')
                 report['outage_witness'].update(absent_before_restore=True,
                     verified_monotonic=time.monotonic())
             if outage is not None:
@@ -699,12 +797,20 @@ def run_profile(config, profile, report):
         while True:
             consume()
             complete = True
-            for role in workers:
-                other = 'node-b' if role == 'node-a' else 'node-a'
-                try:
-                    verify_events(report['accepted'][role], report['deliveries'][other], deadline=deadline)
-                except ValueError:
-                    complete = False
+            for other in workers:
+                received_all = True
+                for role in workers:
+                    if other == role:
+                        continue
+                    try:
+                        verify_events(report['accepted'][role], report['deliveries'][other], deadline=deadline)
+                    except ValueError:
+                        complete = received_all = False
+                if received_all:
+                    report.setdefault('delivery_timing', {}).setdefault(other, {
+                        'observed_monotonic': time.monotonic(),
+                        'since_publication_start_seconds': time.monotonic() - publish_start,
+                        'since_restoration_seconds': time.monotonic() - restored if restored else None})
             if complete:
                 break
             if time.monotonic() >= deadline:
@@ -716,14 +822,14 @@ def run_profile(config, profile, report):
         report['restore_delivery_seconds'] = time.monotonic() - restored if restored else None
         sample_all()
         report['final_qdisc_stats'] = {interface: json.loads(execute(setup['wan'], 'tc', '-j', '-s',
-            'qdisc', 'show', 'dev', interface)) for interface in ('wan1', 'wan2')}
-        phase('stop-both')
+            'qdisc', 'show', 'dev', interface)) for interface in interfaces}
+        phase('stop-all')
         # Drain observes deliveries before their acknowledgement RPC returns.
-        # Join both workloads and check their final errors before reopening.
+        # Join all workloads and check their final errors before reopening.
         consume('end-workload')
         for worker in workers.values():
             worker.call('stop')
-        # Keep both WAN egresses completely cut across peerless reopen too.
+        # Keep all WAN egresses completely cut across peerless reopen too.
         configure('outage')
         phase('peerless-reopen')
         expected = {identity: event for events in report['accepted'].values() for identity, event in events.items()}
@@ -732,7 +838,7 @@ def run_profile(config, profile, report):
             restart = worker.call('peerless', role=role)
             ready(worker)
             execute(nodes[role], LIB + 'delivery-agent.py', 'verify', role)
-            actual = worker.call('query', maximum=count * 2 + 2, timeout=180)
+            actual = worker.call('query', maximum=(count + 1) * len(roles), timeout=180)
             report['peerless'][role] = {'restart': restart, 'exact_events': verify_events(expected, actual, exact=True)}
         sample_all()
         validate()
@@ -799,6 +905,21 @@ def run_profile(config, profile, report):
                         f"os.chown(p,{os.getuid()},{os.getgid()})\n")
             except Exception:
                 cleanup_errors.append('credential-cleanup')
+        report['container_exit_state'] = {}
+        if hasattr(config, 'cpu_limit'):
+            for role, cid in nodes.items():
+                try:
+                    state = json.loads(command('inspect', '--format', '{{json .State}}', cid))
+                    report['container_exit_state'][role] = state
+                    if state.get('Running'):
+                        state['cgroup'] = cgroup(cid)
+                        memory_events = dict(line.split() for line in state['cgroup']['memory.events'].splitlines())
+                        if int(memory_events.get('oom_kill', 0)):
+                            report.update(status='fail', oom_error=role + ': cgroup OOM kill')
+                    if state.get('OOMKilled') or state.get('ExitCode', 0) != 0:
+                        report['status'] = 'fail'
+                except Exception as error:
+                    cleanup_errors.append('exit-state: ' + str(error))
         cleanup_errors.extend(owned.cleanup())
         if not cleanup_errors:
             try:
@@ -817,7 +938,7 @@ def run_profile(config, profile, report):
     return report
 
 
-def main():
+def parse_config(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--output', type=Path)
@@ -825,27 +946,52 @@ def main():
     parser.add_argument('--build-kind', choices=['canonical-release', 'local-debug', 'local-release'], default='canonical-release')
     parser.add_argument('--profiles', nargs='+', choices=['baseline', 'impaired', 'reorder', 'outage'],
                         default=['baseline', 'impaired', 'reorder', 'outage'])
-    bounds = {'duration-seconds': (60, 1, 300), 'events-per-second': (10, 1, 20),
+    parser.add_argument('--events-per-agent', type=int)
+    parser.add_argument('--cpu-limit', type=float, default=0)
+    bounds = {'agents': (2, 2, 20), 'memory-mib': (0, 0, 16384),
+              'storage-max-items': (10000, 4161, 1000000), 'storage-mib': (64, 64, 4096),
+              'duration-seconds': (60, 1, 1800), 'events-per-second': (10, 1, 100),
               'payload-bytes': (1024, 1, 4096), 'delay-ms': (40, 1, 1000),
               'jitter-ms': (5, 0, 100), 'loss-percent': (1, 0, 50),
               'rate-mbit': (100, 1, 1000), 'reorder-percent': (10, 0, 100),
               'outage-seconds': (10, 1, 60), 'outage-at-seconds': (20, 0, 120),
-              'restore-deadline-seconds': (120, 1, 300), 'sample-seconds': (5, 1, 30)}
+              'restore-deadline-seconds': (120, 1, 600), 'sample-seconds': (5, 1, 30)}
     for name, (default, _, _) in bounds.items():
         parser.add_argument('--' + name, type=int, default=default)
-    config = parser.parse_args()
+    config = parser.parse_args(argv)
     if config.worker:
-        worker_main()
-        return 0
+        return config
     if config.output is None:
         parser.error('--output is required')
     for name, (_, low, high) in bounds.items():
         if not low <= getattr(config, name.replace('-', '_')) <= high:
             parser.error(name + ' outside supported bounds')
-    if config.duration_seconds * config.events_per_second * (config.payload_bytes + 1024) > 4 * 1024 * 1024:
-        parser.error('combined workload exceeds bounded receipt/IPC budget')
+    if not (config.cpu_limit == 0 or 0.1 <= config.cpu_limit <= 64):
+        parser.error('cpu-limit must be 0 (unrestricted) or 0.1..64')
+    if config.memory_mib != 0 and config.memory_mib < 64:
+        parser.error('memory-mib must be 0 (unrestricted) or 64..16384')
+    if config.events_per_agent is None:
+        config.events_per_agent = config.duration_seconds * config.events_per_second
+    else:
+        config.duration_seconds = (config.events_per_agent + config.events_per_second - 1) // config.events_per_second
+    if not 1 <= config.events_per_agent <= 10000 or config.duration_seconds > 1800:
+        parser.error('workload must contain 1..10000 Events per agent and take at most 1800 seconds')
+    if config.agents ** 2 * (config.events_per_agent + 1) * (config.payload_bytes * 3 + 1024) > 256 * 1024 * 1024:
+        parser.error('combined workload exceeds 256 MiB receipt/IPC budget')
+    if len(set(config.profiles)) != len(config.profiles):
+        parser.error('duplicate profiles')
+    if len(config.profiles) * (config.duration_seconds + config.restore_deadline_seconds) > 2400:
+        parser.error('combined workload exceeds 2400-second campaign budget')
     if 'outage' in config.profiles and config.outage_at_seconds + config.outage_seconds >= config.duration_seconds:
         parser.error('outage must finish within publication window')
+    return config
+
+
+def main():
+    config = parse_config()
+    if config.worker:
+        worker_main()
+        return 0
     os.umask(0o077)
 
     def interrupted(_signum, _frame):

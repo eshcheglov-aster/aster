@@ -201,7 +201,7 @@ class OwnedDocker:
         return errors
 
     def create(self, role: str, network: list[str], command: list[str], caps: tuple[str, ...] = ()) -> str:
-        if role not in ("wan", "node-a", "node-b", "provision", "node-a-setup", "node-b-setup", "wan-setup"):
+        if role not in ("wan", "provision", "wan-setup") and re.fullmatch(r"node-[a-t](?:-setup)?", role) is None:
             raise ExecutionError("role-invalid")
         expected_caps = ("CHOWN",) if role == "provision" else ("NET_ADMIN",) if role.endswith("-setup") else ()
         if caps != expected_caps:

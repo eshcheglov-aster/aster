@@ -4184,19 +4184,57 @@ async fn await_control_policy_lease(
         .await
 }
 
+#[derive(Clone, Default)]
+struct ContactPolicyLock {
+    application: Arc<RwLock<()>>,
+    contact: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ContactPolicyLock {
+    fn read_owned(self) -> impl Future<Output = OwnedRwLockReadGuard<()>> {
+        self.application.read_owned()
+    }
+
+    fn write_owned(self) -> impl Future<Output = OwnedRwLockWriteGuard<()>> {
+        self.application.write_owned()
+    }
+}
+
+impl std::ops::Deref for ContactPolicyLock {
+    type Target = Arc<RwLock<()>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.application
+    }
+}
+
+type ApplicationPolicyLeaseFuture =
+    Pin<Box<dyn Future<Output = ApplicationPolicyLease> + Send + 'static>>;
+
 async fn acquire_application_policy_lease(
-    policy_lock: Arc<RwLock<()>>,
+    pending: &mut Option<ApplicationPolicyLeaseFuture>,
+    policy_lock: ContactPolicyLock,
     write: bool,
 ) -> ApplicationPolicyLease {
-    if write {
-        ApplicationPolicyLease::Write {
-            _guard: policy_lock.write_owned().await,
-        }
-    } else {
-        ApplicationPolicyLease::Read {
-            _guard: policy_lock.read_owned().await,
-        }
-    }
+    // select! cancels this wrapper when another actor branch wins. Keep the
+    // actual RwLock waiter alive so contacts cannot repeatedly overtake it.
+    let lease = pending
+        .get_or_insert_with(|| {
+            Box::pin(async move {
+                if write {
+                    ApplicationPolicyLease::Write {
+                        _guard: policy_lock.write_owned().await,
+                    }
+                } else {
+                    ApplicationPolicyLease::Read {
+                        _guard: policy_lock.read_owned().await,
+                    }
+                }
+            })
+        })
+        .await;
+    pending.take();
+    lease
 }
 
 fn account_network_event(counter: &mut usize) -> bool {
@@ -17307,7 +17345,7 @@ async fn run_node_actor_inner(
             emit_bridge_delivery("recovered", delivery);
         }
     }
-    let policy_lock = Arc::new(RwLock::new(()));
+    let policy_lock = ContactPolicyLock::default();
     // Prove every retained Event/route source across both the pre-control and
     // final replayed key views before quota replacement or
     // custody maintenance can mutate/delete durable Event state. This also
@@ -17776,6 +17814,7 @@ async fn run_node_actor_inner(
         .set(Some(initial_status_metrics));
     let mut application_commands_open = true;
     let mut pending_application_command = None::<SelectedApplicationCommand>;
+    let mut pending_application_lease = None::<ApplicationPolicyLeaseFuture>;
     let mut control_commands_open = true;
     let mut pending_control_command = None::<SelectedControlCommand>;
     let mut pending_control_lease = None::<ControlPolicyLeaseFuture>;
@@ -17959,6 +17998,21 @@ async fn run_node_actor_inner(
             {
                 application_tick_pending = true;
             }
+            // Only one application arm is enabled. Lend its future to that arm
+            // without moving or recreating it when the network budget changes.
+            let mut inactive_application_lease = None;
+            let (priority_application_lease, ordinary_application_lease) =
+                if network_events_since_application >= NETWORK_EVENT_BUDGET {
+                    (
+                        &mut pending_application_lease,
+                        &mut inactive_application_lease,
+                    )
+                } else {
+                    (
+                        &mut inactive_application_lease,
+                        &mut pending_application_lease,
+                    )
+                };
             tokio::select! {
             biased;
             zeroization = zeroization_receiver.recv() => {
@@ -18591,6 +18645,7 @@ async fn run_node_actor_inner(
                 }
             }
             lease = acquire_application_policy_lease(
+                priority_application_lease,
                 policy_lock.clone(),
                 pending_application_command
                     .as_ref()
@@ -19162,6 +19217,7 @@ async fn run_node_actor_inner(
                 }
             }
             lease = acquire_application_policy_lease(
+                ordinary_application_lease,
                 policy_lock.clone(),
                 pending_application_command
                     .as_ref()
@@ -19234,6 +19290,7 @@ async fn run_node_actor_inner(
     application_receiver.close();
     control_receiver.close();
     pending_control_lease.take();
+    pending_application_lease.take();
     if let Some(command) = pending_application_command.take() {
         command.reject();
     }
@@ -19497,7 +19554,7 @@ async fn sync_once(
         endpoint,
         mission,
         peer,
-        Arc::new(RwLock::new(())),
+        ContactPolicyLock::default(),
         MutableSourceInterests::default(),
     )
     .await?
@@ -19510,7 +19567,7 @@ async fn sync_once_with_policy(
     endpoint: &Endpoint,
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
-    policy_lock: Arc<RwLock<()>>,
+    policy_lock: ContactPolicyLock,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let emission_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
@@ -19547,7 +19604,7 @@ struct OutboundContact {
     peer: ContactPeer,
     #[cfg(feature = "nearby-discovery")]
     automatic_admission: Option<AutomaticNearbyAdmission>,
-    policy_lock: Arc<RwLock<()>>,
+    policy_lock: ContactPolicyLock,
     emission_policy: Arc<LiveEmissionPolicy>,
     emission_snapshot: EmissionPolicySnapshot,
     custody_clock: NodeCustodyClock,
@@ -27202,6 +27259,21 @@ fn local_transfer_profile_offer(
         .map_err(|error| NodeError::Protocol(error.to_string()))
 }
 
+async fn acquire_contact_policy_lease(
+    policy_lock: ContactPolicyLock,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, OwnedRwLockWriteGuard<()>), NodeError> {
+    // Never wait behind another network contact: its peer may already hold a
+    // different node's policy lock while waiting for us. Keep this admission
+    // guard through every lane and lock transition to break that wait cycle.
+    let contact = policy_lock.contact.clone().try_lock_owned().map_err(|_| {
+        NodeError::Carrier(CarrierError::Transport("contact policy lease busy".into()))
+    })?;
+    // Local application work cannot form that distributed cycle. Queue fairly
+    // behind it rather than starving contacts under saturated application load.
+    let policy = policy_lock.write_owned().await;
+    Ok((contact, policy))
+}
+
 async fn sync_transfer_profiles(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
@@ -28040,7 +28112,7 @@ struct OutboundAuthenticatedSession {
     peer: ContactPeer,
     #[cfg(feature = "nearby-discovery")]
     automatic_admission: Option<AutomaticNearbyAdmission>,
-    policy_lock: Arc<RwLock<()>>,
+    policy_lock: ContactPolicyLock,
     event_bridge: Option<SelectedEventBridgeHandle>,
     mutable_interests: MutableSourceInterests,
 }
@@ -28112,7 +28184,7 @@ async fn sync_authenticated_session(
     // Replay and reconcile mission controls under the exclusive policy lease.
     // The verifier must not predate this lease: another contact may have
     // advanced the durable head after mission authentication completed.
-    let policy_write = policy_lock.clone().write_owned().await;
+    let (_contact_lease, policy_write) = acquire_contact_policy_lease(policy_lock.clone()).await?;
     let mut control_verifier = open_replayed_verifier(store, &credentials)?;
     authorize_contact_before_inventory(
         store,
@@ -28129,6 +28201,7 @@ async fn sync_authenticated_session(
         &mut receipt,
     )
     .await?;
+
     drop(policy_write);
 
     // Switching from write to read is intentionally followed by a fresh full
@@ -28582,7 +28655,7 @@ async fn serve_connection(
     connection: aster_iroh::Connection,
     credentials: UnprotectedReferenceMission,
     peer: MissionPeerBinding,
-    policy_lock: Arc<RwLock<()>>,
+    policy_lock: ContactPolicyLock,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let StartupEventVerification {
@@ -28614,7 +28687,7 @@ struct InboundContact {
     expected_peer: Option<MissionPeerBinding>,
     #[cfg(feature = "nearby-discovery")]
     automatic_admission: Option<AutomaticNearbyAdmission>,
-    policy_lock: Arc<RwLock<()>>,
+    policy_lock: ContactPolicyLock,
     emission_policy: Arc<LiveEmissionPolicy>,
     custody_clock: NodeCustodyClock,
     event_route_cache: Arc<AuthenticatedEventRouteCache>,
@@ -30442,7 +30515,7 @@ async fn serve_session(
     credentials: UnprotectedReferenceMission,
     expected_peer: Option<MissionPeerBinding>,
     pre_inventory: InboundPreInventoryAuthorization,
-    policy_lock: Arc<RwLock<()>>,
+    policy_lock: ContactPolicyLock,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let lease_store = store.clone();
@@ -30481,7 +30554,7 @@ async fn serve_session(
         ));
     }
 
-    let policy_write = policy_lock.clone().write_owned().await;
+    let (_contact_lease, policy_write) = acquire_contact_policy_lease(policy_lock.clone()).await?;
     let mut control_verifier = open_replayed_verifier(&store, &credentials)?;
     authorize_contact_before_inventory(
         &store,
@@ -30502,6 +30575,7 @@ async fn serve_session(
     )
     .await
     .map_err(|error| protocol_stage_error("serve control lane", error))?;
+
     drop(policy_write);
 
     let event_lease = policy_lock.read_owned().await;
@@ -33157,6 +33231,99 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+
+    #[tokio::test]
+    async fn contact_policy_admission_rejects_another_contact_without_queueing() {
+        let lock = ContactPolicyLock::default();
+        let contact = lock.contact.clone().lock_owned().await;
+        let mut admission = Box::pin(acquire_contact_policy_lease(lock.clone()));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                admission.as_mut().poll(&mut cx),
+                std::task::Poll::Ready(Err(_))
+            ),
+            "a contact must not queue behind another network contact"
+        );
+        drop(contact);
+        let lease = acquire_contact_policy_lease(lock.clone()).await.unwrap();
+        assert!(
+            lock.try_read().is_err(),
+            "admitted contact must retain exclusive authorization"
+        );
+        drop(lease);
+        assert!(lock.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn contact_policy_admission_waits_fairly_behind_local_application() {
+        let lock = ContactPolicyLock::default();
+        let application = lock.clone().read_owned().await;
+        let mut admission = Box::pin(acquire_contact_policy_lease(lock.clone()));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            admission.as_mut().poll(&mut cx).is_pending(),
+            "local application activity must not reject every contact"
+        );
+        assert!(lock.contact.clone().try_lock_owned().is_err());
+        let mut later_application = Box::pin(lock.clone().write_owned());
+        assert!(later_application.as_mut().poll(&mut cx).is_pending());
+        drop(application);
+        let std::task::Poll::Ready(Ok(lease)) = admission.as_mut().poll(&mut cx) else {
+            panic!("later application overtook the admitted contact");
+        };
+        assert!(later_application.as_mut().poll(&mut cx).is_pending());
+        drop(lease);
+        assert!(later_application.as_mut().poll(&mut cx).is_ready());
+        assert!(lock.contact.clone().try_lock_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_contact_policy_wait_releases_network_admission() {
+        let lock = ContactPolicyLock::default();
+        let application = lock.clone().read_owned().await;
+        let mut admission = Box::pin(acquire_contact_policy_lease(lock.clone()));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(admission.as_mut().poll(&mut cx).is_pending());
+        assert!(lock.contact.clone().try_lock_owned().is_err());
+        drop(admission);
+        assert!(lock.contact.clone().try_lock_owned().is_ok());
+        drop(application);
+        assert!(acquire_contact_policy_lease(lock).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn application_policy_wait_preserves_fifo_across_select_turns() {
+        for write in [false, true] {
+            let lock = ContactPolicyLock::default();
+            let holder = lock.clone().write_owned().await;
+            let mut pending = None;
+            // Poll the application wait, then select unrelated ready work. The
+            // actor must retain the underlying lock future and its FIFO place.
+            tokio::select! {
+                biased;
+                _ = acquire_application_policy_lease(&mut pending, lock.clone(), write) => {
+                    panic!("application acquired a held lock");
+                }
+                _ = std::future::ready(()) => {}
+            }
+            let mut later_contact = Box::pin(lock.clone().write_owned());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(later_contact.as_mut().poll(&mut cx).is_pending());
+            drop(holder);
+            let mut application = Box::pin(acquire_application_policy_lease(
+                &mut pending,
+                lock.clone(),
+                write,
+            ));
+            let std::task::Poll::Ready(lease) = application.as_mut().poll(&mut cx) else {
+                panic!("later contact overtook the pending application after a select turn");
+            };
+            assert!(later_contact.as_mut().poll(&mut cx).is_pending());
+            drop(lease);
+            assert!(later_contact.as_mut().poll(&mut cx).is_ready());
+        }
+    }
 
     #[test]
     fn profile5_blob_error_boundary_does_not_expose_internal_detail() {
@@ -37148,7 +37315,7 @@ mod tests {
         assert_eq!(authenticated_peer, services.member.identity());
         let receive_interest = exact_event_interest(&services.topic, &services.scope);
 
-        let policy_lock = Arc::new(RwLock::new(()));
+        let policy_lock = ContactPolicyLock::default();
         let event_lease = policy_lock.clone().read_owned().await;
         let lane_guard = EventLaneGuard::capture(
             event_lease,
@@ -39438,7 +39605,7 @@ mod tests {
                             connection,
                             credentials,
                             peer,
-                            Arc::new(RwLock::new(())),
+                            ContactPolicyLock::default(),
                             interests,
                         )
                         .await
@@ -39460,7 +39627,7 @@ mod tests {
                         },
                         mission: server_mission.identity,
                     },
-                    Arc::new(RwLock::new(())),
+                    ContactPolicyLock::default(),
                     interests,
                 )
                 .await
@@ -39829,7 +39996,7 @@ mod tests {
                     connection,
                     credentials,
                     peer,
-                    Arc::new(RwLock::new(())),
+                    ContactPolicyLock::default(),
                     interests,
                 )
                 .await
@@ -39846,7 +40013,7 @@ mod tests {
                 },
                 mission: server_mission.identity,
             },
-            Arc::new(RwLock::new(())),
+            ContactPolicyLock::default(),
             interests,
         )
         .await
@@ -40846,7 +41013,7 @@ mod tests {
                     .unwrap();
             let mut verifier = open_test_sealer(credentials);
             let guard = EventLaneGuard::capture(
-                Arc::new(RwLock::new(())).read_owned().await,
+                ContactPolicyLock::default().read_owned().await,
                 &store,
                 verifier.identity(),
                 mission.peer().mission_id(),
@@ -40933,7 +41100,7 @@ mod tests {
                     connection,
                     credentials,
                     peer,
-                    Arc::new(RwLock::new(())),
+                    ContactPolicyLock::default(),
                     MutableSourceInterests::default(),
                 )
                 .await
@@ -51705,7 +51872,7 @@ mod tests {
         let commitments = source_session.peer_route_grant_commitments().to_vec();
         assert_eq!(peer, services.other.identity());
 
-        let lane_lock = Arc::new(RwLock::new(()));
+        let lane_lock = ContactPolicyLock::default();
         let lane_guard = EventLaneGuard::capture(
             lane_lock.read_owned().await,
             &store,
@@ -52577,7 +52744,7 @@ mod tests {
                                                 expected_peer: Some(peer),
                                                 #[cfg(feature = "nearby-discovery")]
                                                 automatic_admission: None,
-                                                policy_lock: Arc::new(RwLock::new(())),
+                                                policy_lock: ContactPolicyLock::default(),
                                                 emission_policy: server_policy,
                                                 custody_clock: NodeCustodyClock::injected(
                                                     [0xb1; 16],
@@ -52626,7 +52793,7 @@ mod tests {
                                         .into(),
                                         #[cfg(feature = "nearby-discovery")]
                                         automatic_admission: None,
-                                        policy_lock: Arc::new(RwLock::new(())),
+                                        policy_lock: ContactPolicyLock::default(),
                                         emission_policy: client_policy,
                                         emission_snapshot: snapshot,
                                         custody_clock: NodeCustodyClock::injected(
@@ -59986,7 +60153,7 @@ mod tests {
                                 expected_peer: Some(peer),
                                 #[cfg(feature = "nearby-discovery")]
                                 automatic_admission: None,
-                                policy_lock: Arc::new(RwLock::new(())),
+                                policy_lock: ContactPolicyLock::default(),
                                 emission_policy: server_policy,
                                 custody_clock: server_clock,
                                 event_route_cache: server_event_route_cache,
@@ -60021,7 +60188,7 @@ mod tests {
                             .into(),
                             #[cfg(feature = "nearby-discovery")]
                             automatic_admission: None,
-                            policy_lock: Arc::new(RwLock::new(())),
+                            policy_lock: ContactPolicyLock::default(),
                             emission_policy: client_policy,
                             emission_snapshot: snapshot,
                             custody_clock: client_clock,
@@ -60488,7 +60655,7 @@ mod tests {
                 peer: expected_peer(0xcafe, 65_000).into(),
                 #[cfg(feature = "nearby-discovery")]
                 automatic_admission: None,
-                policy_lock: Arc::new(RwLock::new(())),
+                policy_lock: ContactPolicyLock::default(),
                 emission_policy: server_policy,
                 emission_snapshot: snapshot,
                 custody_clock: attempted_clock,
@@ -63418,7 +63585,7 @@ mod tests {
             b"mode-carry",
         );
         let stale_guard = EventLaneGuard::capture(
-            Arc::new(RwLock::new(())).read_owned().await,
+            ContactPolicyLock::default().read_owned().await,
             &receiver_store,
             receiver_mission.identity(),
             server_mission.identity(),
@@ -63899,7 +64066,7 @@ mod tests {
         );
         assert_eq!(store.control_stats().expect("control stats").pending, 1);
 
-        let policy_lock = Arc::new(RwLock::new(()));
+        let policy_lock = ContactPolicyLock::default();
         let lease = policy_lock.read_owned().await;
         let contact_error = match EventLaneGuard::capture(
             lease,
@@ -65299,7 +65466,7 @@ mod tests {
                 .expect("verify racing control")
                 .envelope_id(),
         );
-        let policy_lock = Arc::new(RwLock::new(()));
+        let policy_lock = ContactPolicyLock::default();
         let event_lease = policy_lock.clone().read_owned().await;
         let (started_sender, mut started_receiver) = mpsc::channel(1);
         let writer = tokio::spawn({
@@ -65419,7 +65586,7 @@ mod tests {
             &peer_revocation,
         )
         .expect("commit peer revocation");
-        let policy_lock = Arc::new(RwLock::new(()));
+        let policy_lock = ContactPolicyLock::default();
         let lease = policy_lock.read_owned().await;
         let peer_error = match EventLaneGuard::capture(
             lease,
@@ -65707,7 +65874,7 @@ mod tests {
                     connection,
                     credentials,
                     peer,
-                    Arc::new(RwLock::new(())),
+                    ContactPolicyLock::default(),
                     MutableSourceInterests::default(),
                 )
                 .await
@@ -65959,7 +66126,7 @@ mod tests {
                     connection,
                     credentials,
                     wrong_binding,
-                    Arc::new(RwLock::new(())),
+                    ContactPolicyLock::default(),
                     MutableSourceInterests::default(),
                 )
                 .await

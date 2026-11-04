@@ -169,7 +169,7 @@ async fn stream_prefix_conflict_contact(
                 expected_peer: Some(peer),
                 #[cfg(feature = "nearby-discovery")]
                 automatic_admission: None,
-                policy_lock: Arc::new(RwLock::new(())),
+                policy_lock: ContactPolicyLock::default(),
                 emission_policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
                 custody_clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
                 event_route_cache: server_cache,
@@ -195,7 +195,7 @@ async fn stream_prefix_conflict_contact(
             .into(),
             #[cfg(feature = "nearby-discovery")]
             automatic_admission: None,
-            policy_lock: Arc::new(RwLock::new(())),
+            policy_lock: ContactPolicyLock::default(),
             emission_snapshot: policy.snapshot().unwrap(),
             emission_policy: policy,
             custody_clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
