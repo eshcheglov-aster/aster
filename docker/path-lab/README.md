@@ -64,11 +64,27 @@ python3 tools/aster_path_diagnostic.py --output artifacts/load-limited \
 | `--events-per-agent` | duration × rate (600) | 1..10000 |
 | `--payload-bytes` | 1024 | 1..4096 |
 | `--events-per-second` | 10 | 1..100 per agent |
+| `--bandwidth-kbit` | omitted (profile default) | integer 0..1000000 kbit/s per WAN egress; 0 = no limit |
 | `--cpu-limit` | 0 (unrestricted) | 0, or 0.1..64 cores |
 | `--memory-mib` | 0 (unrestricted) | 0, or 64..16384 MiB |
 | `--restore-deadline-seconds` | 120 | 1..600 |
 | `--storage-max-items` | 10000 | 4161..1000000 per agent |
 | `--storage-mib` | 64 | 64..4096 MiB per agent |
+
+Bandwidth is a maximum netem rate on **each WAN egress**, shared by traffic
+headed to that agent (not a per-peer or campaign-wide budget). With two agents
+this limits each direction independently. Manual input `bandwidth_kbit` is
+optional text so blank and zero remain distinct: blank preserves the table's
+profile defaults; `0` removes even the impaired/reorder profiles' default
+100-Mbit/s cap. A positive integer overrides every selected profile, including
+baseline and outage restoration; outage still drops 100% of traffic while active.
+The CLI accepts `--bandwidth-kbit 3` without rounding to Mbit/s. Its upper bound
+matches the existing 1000-Mbit/s limit. `--rate-mbit` remains backward compatible
+(1..1000, default 100, impaired/reorder only); explicit `--bandwidth-kbit` takes
+precedence. Every explicit override is checked against tc JSON bytes/second
+readback on every interface after replacement, and retained in receipt configuration
+and qdisc evidence. Low bandwidth can exceed existing startup/delivery deadlines;
+this field alone makes no low-rate usefulness or qualification claim.
 
 Store limits are explicit startup overrides, retained through peerless restart;
 production defaults are unchanged. MiB is converted to `max_payload_bytes`.

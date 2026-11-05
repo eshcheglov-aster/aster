@@ -78,18 +78,38 @@ def query_all(client, maximum):
     raise ValueError('query page bound exceeded')
 
 
-def netem_args(profile, delay, jitter, loss, rate, reorder):
+def netem_args(profile, delay, jitter, loss, rate, reorder, *, bandwidth_kbit=None):
     if profile == 'baseline':
-        return []
-    if profile == 'outage':
-        return ['loss', '100%']
-    if profile not in ('impaired', 'reorder'):
+        result = []
+    elif profile == 'outage':
+        result = ['loss', '100%']
+    elif profile in ('impaired', 'reorder'):
+        result = ['limit', '1000', 'delay', f'{delay}ms', f'{jitter}ms', 'loss', f'{loss}%']
+        if bandwidth_kbit is None:
+            result += ['rate', f'{rate}mbit']
+        if profile == 'reorder':
+            result += ['reorder', f'{reorder}%']
+    else:
         raise ValueError('unknown profile')
-    result = ['limit', '1000', 'delay', f'{delay}ms', f'{jitter}ms',
-              'loss', f'{loss}%', 'rate', f'{rate}mbit']
-    if profile == 'reorder':
-        result += ['reorder', f'{reorder}%']
+    if bandwidth_kbit:
+        result += ['rate', f'{bandwidth_kbit}kbit']
     return result
+
+
+def verify_bandwidth(rows, bandwidth_kbit):
+    """tc JSON netem rate is bytes/s, not the CLI's decimal kbit/s."""
+    try:
+        if not rows:
+            raise ValueError('missing interfaces')
+        for interface in rows:
+            roots = [row for row in interface if row.get('kind') == 'netem' and row.get('root')]
+            if len(roots) != 1:
+                raise ValueError('missing root netem')
+            actual = roots[0]['options'].get('rate', {}).get('rate', 0)
+            if actual != bandwidth_kbit * 125:
+                raise ValueError('rate mismatch')
+    except (KeyError, TypeError, AttributeError, ValueError) as error:
+        raise ExecutionError('bandwidth readback mismatch') from error
 
 
 class Worker:
@@ -566,7 +586,8 @@ def run_profile(config, profile, report):
 
     def configure(which, *, on_applied=None):
         args = netem_args(which, config.delay_ms, config.jitter_ms, config.loss_percent,
-                          config.rate_mbit, config.reorder_percent)
+                          config.rate_mbit, config.reorder_percent,
+                          bandwidth_kbit=getattr(config, 'bandwidth_kbit', None))
         rows, texts, changes, errors = [], [], [], []
         for interface in interfaces:
             change = {'interface': interface, 'started_monotonic': time.monotonic()}
@@ -595,6 +616,8 @@ def run_profile(config, profile, report):
                                  'changes': changes, 'errors': errors})
         if errors:
             raise ExecutionError('; '.join(errors))
+        if getattr(config, 'bandwidth_kbit', None) is not None:
+            verify_bandwidth(rows, config.bandwidth_kbit)
         if which == 'outage' and any('loss 100%' not in text for text in texts):
             raise ValueError('100 percent outage readback failed')
         if which == 'baseline' and any('loss' in text for text in texts):
@@ -958,7 +981,12 @@ def parse_config(argv=None):
               'restore-deadline-seconds': (120, 1, 600), 'sample-seconds': (5, 1, 30)}
     for name, (default, _, _) in bounds.items():
         parser.add_argument('--' + name, type=int, default=default)
+    parser.add_argument('--bandwidth-kbit', type=int,
+                        help='Bandwidth per WAN egress in kbit/s (0 = no limit; omitted = profile default); overrides --rate-mbit')
     config = parser.parse_args(argv)
+    if config.bandwidth_kbit is not None and not 0 <= config.bandwidth_kbit <= 1000000:
+        # Same upper bound as the existing 1000-mbit netem setting.
+        parser.error('bandwidth-kbit must be an integer in 0..1000000')
     if config.worker:
         return config
     if config.output is None:

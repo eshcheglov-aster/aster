@@ -19,6 +19,11 @@ on:
         description: 'Publication rate per agent (1..100 Events/s)'
         type: number
         default: 10
+      bandwidth_kbit:
+        description: 'Bandwidth limit per WAN egress in kbit/s (0 = no limit; blank = profile default; integer 0..1000000)'
+        type: string
+        required: false
+        default: ''
       profile:
         description: 'Network profile (all runs the four profiles)'
         type: choice
@@ -62,6 +67,7 @@ jobs:
       EVENTS: ${{ inputs.events }}
       PAYLOAD: ${{ inputs.payload }}
       RATE: ${{ inputs.rate }}
+      BANDWIDTH_KBIT: ${{ inputs.bandwidth_kbit }}
       PROFILE: ${{ inputs.profile }}
       CPU: ${{ inputs.cpu }}
       MEMORY: ${{ inputs.memory }}
@@ -88,7 +94,7 @@ jobs:
             python3 tools/test_aster_path_diagnostic.py &&
             python3 tools/test_aster_path_delivery.py &&
             python3 tools/test_aster_path_summary.py &&
-            PYTHONPATH=tools python3 -c 'import os; from aster_path_diagnostic import parse_config; keys={"AGENTS":"agents","EVENTS":"events-per-agent","PAYLOAD":"payload-bytes","RATE":"events-per-second","CPU":"cpu-limit","MEMORY":"memory-mib","DEADLINE":"restore-deadline-seconds","STORAGE_ITEMS":"storage-max-items","STORAGE_MIB":"storage-mib"}; parse_config(["--output","unused"] + [v for k,flag in keys.items() for v in ("--"+flag,os.environ[k])] + ["--profiles"] + (["baseline","impaired","reorder","outage"] if os.environ["PROFILE"] == "all" else [os.environ["PROFILE"]]))'
+            PYTHONPATH=tools python3 -c 'import os; from aster_path_diagnostic import parse_config; keys={"AGENTS":"agents","EVENTS":"events-per-agent","PAYLOAD":"payload-bytes","RATE":"events-per-second","CPU":"cpu-limit","MEMORY":"memory-mib","DEADLINE":"restore-deadline-seconds","STORAGE_ITEMS":"storage-max-items","STORAGE_MIB":"storage-mib"}; parse_config(["--output","unused"] + [v for k,flag in keys.items() for v in ("--"+flag,os.environ[k])] + (["--bandwidth-kbit",os.environ["BANDWIDTH_KBIT"]] if os.environ["BANDWIDTH_KBIT"] != "" else []) + ["--profiles"] + (["baseline","impaired","reorder","outage"] if os.environ["PROFILE"] == "all" else [os.environ["PROFILE"]]))'
           } 2>&1 | tee artifacts/path-diagnostic/preflight.log
 
       - name: Set up diagnostic BuildKit builder
@@ -135,12 +141,14 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
+          bandwidth=()
+          if [[ -n "$BANDWIDTH_KBIT" ]]; then bandwidth=(--bandwidth-kbit "$BANDWIDTH_KBIT"); fi
           profiles=(baseline impaired reorder outage)
           if [[ "$PROFILE" != all ]]; then profiles=("$PROFILE"); fi
           set +e
           timeout --signal=TERM --kill-after=300s 50m \
             python3 -u tools/aster_path_diagnostic.py \
-              --output artifacts/path-diagnostic \
+              --output artifacts/path-diagnostic "${bandwidth[@]}" \
               --agents "$AGENTS" --events-per-agent "$EVENTS" \
               --payload-bytes "$PAYLOAD" --events-per-second "$RATE" \
               --profiles "${profiles[@]}" --cpu-limit "$CPU" \

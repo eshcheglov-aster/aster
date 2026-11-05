@@ -10,6 +10,45 @@ from unittest.mock import patch
 import aster_path_diagnostic as diagnostic
 
 
+class BandwidthInputTests(unittest.TestCase):
+    def test_readback_uses_tc_bytes_per_second_and_fails_closed(self):
+        def rows(rate):
+            return [[{'kind': 'netem', 'root': True, 'options': {'rate': {'rate': rate}}}]]
+        diagnostic.verify_bandwidth(rows(375), 3)
+        diagnostic.verify_bandwidth(rows(125000000), 1000000)
+        diagnostic.verify_bandwidth([[{'kind': 'netem', 'root': True, 'options': {}}]], 0)
+        for actual, expected in [(rows(3), 3), (rows(375), 0), (rows(0), 3), ([], 3), ([[]], 0)]:
+            with self.subTest(actual=actual), self.assertRaisesRegex(diagnostic.ExecutionError, 'bandwidth readback'):
+                diagnostic.verify_bandwidth(actual, expected)
+
+    def test_override_applies_to_every_profile_and_zero_removes_rate(self):
+        defaults = {
+            'baseline': [], 'outage': ['loss', '100%'],
+            'impaired': ['limit', '1000', 'delay', '40ms', '5ms', 'loss', '1%', 'rate', '100mbit'],
+            'reorder': ['limit', '1000', 'delay', '40ms', '5ms', 'loss', '1%', 'rate', '100mbit', 'reorder', '10%'],
+        }
+        for profile, expected in defaults.items():
+            with self.subTest(profile=profile):
+                self.assertEqual(diagnostic.netem_args(profile, 40, 5, 1, 100, 10), expected)
+                uncapped = expected.copy()
+                if 'rate' in uncapped:
+                    index = uncapped.index('rate')
+                    del uncapped[index:index + 2]
+                self.assertEqual(diagnostic.netem_args(profile, 40, 5, 1, 100, 10, bandwidth_kbit=0), uncapped)
+                self.assertEqual(diagnostic.netem_args(profile, 40, 5, 1, 100, 10, bandwidth_kbit=3), uncapped + ['rate', '3kbit'])
+
+    def test_optional_override_preserves_defaults_and_accepts_integer_kbit(self):
+        base = ['--output', 'unused', '--profiles', 'baseline']
+        self.assertIsNone(diagnostic.parse_config(base).bandwidth_kbit)
+        for value in (0, 1, 3, 1000000):
+            config = diagnostic.parse_config(base + ['--bandwidth-kbit', str(value)])
+            self.assertEqual(config.bandwidth_kbit, value)
+        for value in ('-1', '1000001', '3.5', 'nan', '$(id)', ''):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                diagnostic.parse_config(base + ['--bandwidth-kbit', value])
+        self.assertEqual(diagnostic.parse_config(base + ['--rate-mbit', '20']).rate_mbit, 20)
+
+
 class StorageInputTests(unittest.TestCase):
     def test_storage_inputs_reach_initial_and_peerless_agent_argv(self):
         import importlib.util
@@ -795,7 +834,7 @@ class OracleTests(unittest.TestCase):
 class FinalizationTests(unittest.TestCase):
     """Real workload threads, with only Docker/IPC and the RPC peer replaced."""
 
-    def run_profile(self, *, fail_ack=False, extra_event=False, shutdown_timeout=False, provenance_drift=False):
+    def run_profile(self, *, fail_ack=False, extra_event=False, shutdown_timeout=False, provenance_drift=False, bandwidth_kbit=None):
         import json
         import os
         import threading
@@ -905,13 +944,18 @@ class FinalizationTests(unittest.TestCase):
             if 'tc' in argv:
                 if 'replace' in argv:
                     loss[0] = '100%' in argv
+                    if bandwidth_kbit is not None:
+                        testcase.assertEqual(argv[argv.index('netem') + 1:],
+                            (['loss', '100%'] if loss[0] else []) + ['rate', '3kbit'])
+                if '-j' in argv and bandwidth_kbit is not None:
+                    return json.dumps([{'kind': 'netem', 'root': True, 'options': {'rate': {'rate': 375}}}]).encode()
                 return b'[]' if '-j' in argv else (b'loss 100%' if loss[0] else b'delay 0ms')
             return b''
 
         with tempfile.TemporaryDirectory() as directory:
             config = argparse.Namespace(output=Path(directory), duration_seconds=1,
                 events_per_second=2, payload_bytes=1, delay_ms=40, jitter_ms=5,
-                loss_percent=1, rate_mbit=100, reorder_percent=10,
+                loss_percent=1, rate_mbit=100, reorder_percent=10, bandwidth_kbit=bandwidth_kbit,
                 restore_deadline_seconds=5, sample_seconds=5)
             if provenance_drift:
                 config.image = 'sha256:' + 'a' * 64
@@ -931,6 +975,14 @@ class FinalizationTests(unittest.TestCase):
             self.assertFalse(worker.workload.publisher.is_alive())
             self.assertFalse(worker.workload.consumer.is_alive())
         return result, actions
+
+    def test_bandwidth_reaches_all_egresses_and_peerless_cut(self):
+        result, _ = self.run_profile(bandwidth_kbit=3)
+        self.assertEqual(result['status'], 'pass')
+        self.assertEqual([r['arguments'] for r in result['qdiscs']],
+                         [['rate', '3kbit'], ['loss', '100%', 'rate', '3kbit']])
+        for row in result['qdiscs']:
+            self.assertEqual([c['interface'] for c in row['changes']], ['wan1', 'wan2'])
 
     def test_drift_after_peerless_results_prevents_profile_pass(self):
         result, _ = self.run_profile(provenance_drift=True)
@@ -1059,6 +1111,37 @@ class WorkflowTests(unittest.TestCase):
         cls.scripts = re.findall(r'        run: \|\n((?:          .*\n|\n)+)', cls.workflow)
         cls.scripts = ['\n'.join(line[10:] for line in block.splitlines())
                        for block in cls.scripts]
+
+    def test_optional_bandwidth_is_forwarded_without_shell_interpolation(self):
+        import os
+        import subprocess
+        import shlex
+        # Execute the exact preflight parser invocation and controller shell.
+        preflight = next(line.strip() for line in self.scripts[0].splitlines()
+                         if line.strip().startswith('PYTHONPATH=tools'))
+        python_code = shlex.split(preflight)[3]
+        root = str(Path(__file__).resolve().parents[1])
+        base = dict(os.environ, PYTHONPATH=root + '/tools', AGENTS='2', EVENTS='600',
+                    PAYLOAD='1024', RATE='10', CPU='0', MEMORY='0', DEADLINE='120',
+                    STORAGE_ITEMS='10000', STORAGE_MIB='64', PROFILE='all')
+        for value in ('', '0', '3', '1000000', '-1', '3.5', '1000001', '$(id)'):
+            env = dict(base, BANDWIDTH_KBIT=value)
+            valid = value in ('', '0', '3', '1000000')
+            result = subprocess.run([sys.executable, '-c', python_code], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, valid, value)
+            if not valid:
+                continue
+            with tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'artifacts/path-diagnostic').mkdir(parents=True)
+                launched = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
+                    'timeout() { printf "%s\\n" "$@"; };\n' + self.scripts[2]],
+                    cwd=directory, env=env, capture_output=True, text=True)
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                argv = launched.stdout.splitlines()
+                self.assertEqual('--bandwidth-kbit' in argv, value != '')
+                if value:
+                    self.assertEqual(argv[argv.index('--bandwidth-kbit') + 1], value)
 
     def test_manual_read_only_pinned_and_always_retained(self):
         import re

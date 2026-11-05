@@ -63,6 +63,10 @@ def render(root, env):
         value = env.get(key, '')
         if (key == 'PROFILE' and value in (*PROFILES, 'all')) or (key != 'PROFILE' and re.fullmatch(r'[0-9]{1,12}(\.[0-9]{1,6})?', value)):
             lines.append(f'| {key} | {value} |')
+    bandwidth = env.get('BANDWIDTH_KBIT')
+    if bandwidth == '' or (isinstance(bandwidth, str) and re.fullmatch(r'[0-9]{1,7}', bandwidth) and int(bandwidth) <= 1000000):
+        value = 'profile default' if bandwidth == '' else 'no limit' if int(bandwidth) == 0 else bandwidth
+        lines.append(f'| Bandwidth per WAN egress (kbit/s) | {value} |')
     lines += ['', '| Profile | Status | Agent | Accepted | Observed deliveries | Peerless exact | Sampled peak RSS MiB | CPU % (one core) |',
               '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |']
     rows = {r.get('profile'): r for r in (receipt or {}).get('profiles', []) if isinstance(r, dict)}

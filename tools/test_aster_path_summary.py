@@ -10,6 +10,16 @@ import unittest
 
 
 class SummaryTests(unittest.TestCase):
+    def test_selected_bandwidth_is_labeled_and_allowlisted(self):
+        import aster_path_summary as summary
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for value, expected in [('', 'profile default'), ('0', 'no limit'), ('3', '3'), ('1000000', '1000000')]:
+                self.assertIn('| Bandwidth per WAN egress (kbit/s) | ' + expected + ' |',
+                              summary.render(root, {'BANDWIDTH_KBIT': value}))
+            for value in ('SECRET', '3.5', '-1', '1000001'):
+                self.assertNotIn('| Bandwidth per WAN egress', summary.render(root, {'BANDWIDTH_KBIT': value}))
+
     def test_summary_handles_failure_timeout_and_allowlists_evidence(self):
         path = Path(__file__).with_name('aster_path_summary.py')
         self.assertTrue(path.exists(), 'summary implementation is missing')
