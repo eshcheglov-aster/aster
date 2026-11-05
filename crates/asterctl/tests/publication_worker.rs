@@ -49,6 +49,8 @@ fn lost_response_reopens_original_sequence_and_retries_only_original_intent() {
             "CompleteEventPublicationRecovery",
             "BeginEventPublicationSession",
             "CompleteEventPublicationRecovery",
+            "BeginEventPublicationSession",
+            "CompleteEventPublicationRecovery",
             "PublishNumberedEvent",
             "AcknowledgeEventPublicationResult",
         ] {
@@ -87,6 +89,9 @@ fn lost_response_reopens_original_sequence_and_retries_only_original_intent() {
                     .encode_to_vec()
                 }
                 "CompleteEventPublicationRecovery" => {
+                    if session == 2 {
+                        continue; // Lose an explicit recovery response too.
+                    }
                     api::CompleteEventPublicationRecoveryResponse::default().encode_to_vec()
                 }
                 "PublishNumberedEvent" => {
@@ -145,12 +150,32 @@ fn lost_response_reopens_original_sequence_and_retries_only_original_intent() {
     };
     let mut child = spawn();
     let publish = json!({"action":"publish", "intent":{"topic":"mesh.messages", "scope":"demo/playground", "priority":"PRIORITY_ROUTINE", "logicalKey":"aw==", "payload":"cGF5bG9hZA=="}});
-    assert!(exchange(&mut child, publish.clone()).get("error").is_some());
-    assert!(exchange(&mut child, publish).get("error").is_some());
+    let failed = exchange(&mut child, publish.clone());
+    assert!(failed.get("error").is_some());
+    for phase in ["startup-recovery", "journal", "sdk-publish"] {
+        assert!(failed["timing_seconds"][phase].as_f64().unwrap() >= 0.0);
+    }
+    assert_eq!(
+        failed["phase_outcomes"],
+        json!({"startup-recovery":"success", "journal":"success", "sdk-publish":"error"})
+    );
+    let blocked = exchange(&mut child, publish);
+    assert!(blocked.get("error").is_some());
+    assert_eq!(blocked["phase_outcomes"], json!({}));
+    let failed_recovery = exchange(&mut child, json!({"action":"publication-recover"}));
+    assert!(failed_recovery.get("error").is_some());
+    assert_eq!(
+        failed_recovery["phase_outcomes"],
+        json!({"sdk-recover":"error"})
+    );
     child.kill().unwrap();
     child.wait().unwrap();
     let mut child = spawn();
     let recovered = exchange(&mut child, json!({"action":"publication-recover"}));
+    assert_eq!(
+        recovered["phase_outcomes"],
+        json!({"startup-recovery":"success", "sdk-recover":"success"})
+    );
     assert_eq!(
         recovered["result"]["operations"],
         json!([{"operationSequence":"1", "state":"pending"}])
@@ -276,6 +301,10 @@ fn repeated_publications_keep_one_session_across_idle_and_http_disconnect() {
         let mut line = String::new();
         output.read_line(&mut line).unwrap();
         let response: Value = serde_json::from_str(&line).expect("worker must reply with JSON");
+        for phase in ["journal", "sdk-publish"] {
+            assert!(response["timing_seconds"][phase].as_f64().unwrap() >= 0.0);
+            assert_eq!(response["phase_outcomes"][phase], "success");
+        }
         assert_eq!(
             response["result"]["result"]["operationSequence"],
             sequence.to_string()
@@ -298,11 +327,17 @@ fn repeated_publications_keep_one_session_across_idle_and_http_disconnect() {
         .unwrap();
         line.clear();
         output.read_line(&mut line).unwrap();
+        let acknowledgement: Value = serde_json::from_str(&line).unwrap();
+        assert!(acknowledgement.get("error").is_none());
+        assert_eq!(
+            acknowledgement["phase_outcomes"],
+            json!({"sdk-ack":"success"})
+        );
         assert!(
-            serde_json::from_str::<Value>(&line)
+            acknowledgement["timing_seconds"]["sdk-ack"]
+                .as_f64()
                 .unwrap()
-                .get("error")
-                .is_none()
+                >= 0.0
         );
         thread::sleep(Duration::from_millis(150));
     }

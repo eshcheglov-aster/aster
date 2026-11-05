@@ -438,7 +438,9 @@ class OutageProfileTests(unittest.TestCase):
                         advance(10)
                     return {'accepted': dict(events[self.role]), 'deliveries': {k: v for rows in events.values() for k, v in rows.items()} if restored.is_set() and failure != 'delivery-timeout' else {},
                             'rejected': [], 'errors': errors, 'done': restored.is_set(),
-                            'started': 100, 'finished': clock(), 'max_schedule_lag_seconds': 0}
+                            'started': 100, 'finished': clock(), 'max_schedule_lag_seconds': 0,
+                            'pacing_telemetry': {'resources': {'monotonic': clock()}, 'operations': {}},
+                            'failure_telemetry': {'active': [{'operation': 'ipc-response:publish', 'age_seconds': 1.25}]} if errors else None}
                 if action == 'query':
                     return {k: v for rows in events.values() for k, v in rows.items()}
                 return {}
@@ -498,6 +500,13 @@ class OutageProfileTests(unittest.TestCase):
                 previous = diagnostic.signal.signal(diagnostic.signal.SIGTERM, terminate)
                 try:
                     result = diagnostic.run_profile(config, 'outage', {})
+                    retained = json.loads((config.output / 'outage.json').read_text())
+                    if failure == 'slot-limit':
+                        self.assertEqual(set(retained['failure_telemetry']), set(events))
+                        for role in events:
+                            self.assertEqual(retained['failure_telemetry'][role]['active'][0]['age_seconds'], 1.25)
+                            self.assertTrue(retained['resource_timeline'][role])
+                            self.assertIn(role, retained['pacing_telemetry'])
                     self.assertIs(diagnostic.signal.getsignal(diagnostic.signal.SIGTERM), terminate)
                 finally:
                     diagnostic.signal.signal(diagnostic.signal.SIGTERM, previous)

@@ -4,9 +4,10 @@ use aster_agent::sdk::{NumberedEventSdk, RecoveredState, RecoveryReport};
 use connectrpc::client::HttpClient;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Read, Write};
 use std::num::NonZeroU64;
+use std::time::Instant;
 
 // Base64 plus JSON for the SDK's bounded Event payload, not an unbounded stream.
 const MAX_LINE: u64 = 4 * 1024 * 1024;
@@ -56,7 +57,9 @@ fn report_json(report: RecoveryReport) -> Value {
 }
 
 pub async fn serve(sdk: NumberedEventSdk<HttpClient>) -> Result<(), String> {
+    let started = Instant::now();
     let report = sdk.recover().await.map_err(describe_error)?;
+    let mut startup_seconds = Some(started.elapsed().as_secs_f64());
     let mut pending = outstanding(&report);
     // A dedicated OS reader, rather than blocking this current-thread runtime
     // or Tokio's blocking pool. The reactor stays live between IPC requests;
@@ -87,13 +90,21 @@ pub async fn serve(sdk: NumberedEventSdk<HttpClient>) -> Result<(), String> {
         }
     });
     while let Some(request) = receive.recv().await {
+        let mut timing = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+        if let Some(seconds) = startup_seconds.take() {
+            timing.insert("startup-recovery", seconds);
+            outcomes.insert("startup-recovery", "success");
+        }
         let result = match request {
-            Ok(request) => execute(&sdk, &mut pending, request).await,
+            Ok(request) => execute(&sdk, &mut pending, request, &mut timing, &mut outcomes).await,
             Err(error) => Err(error),
         };
         let response = match result {
-            Ok(result) => json!({"result":result}),
-            Err(error) => json!({"error":error}),
+            Ok(result) => {
+                json!({"result":result,"timing_seconds":timing,"phase_outcomes":outcomes})
+            }
+            Err(error) => json!({"error":error,"timing_seconds":timing,"phase_outcomes":outcomes}),
         };
         let mut output = io::stdout().lock();
         writeln!(output, "{response}")
@@ -107,7 +118,20 @@ async fn execute(
     sdk: &NumberedEventSdk<HttpClient>,
     pending: &mut BTreeSet<u64>,
     request: Request,
+    timing: &mut BTreeMap<&'static str, f64>,
+    outcomes: &mut BTreeMap<&'static str, &'static str>,
 ) -> Result<Value, String> {
+    // Wall time at SDK boundaries, including scheduling. SDK methods include
+    // local journal work as well as RPC; these are not server-only timings.
+    macro_rules! measured {
+        ($name:literal, $operation:expr) => {{
+            let started = Instant::now();
+            let result = $operation;
+            timing.insert($name, started.elapsed().as_secs_f64());
+            outcomes.insert($name, if result.is_err() { "error" } else { "success" });
+            result
+        }};
+    }
     match request {
         Request::Publish { intent } => {
             if !pending.is_empty() {
@@ -116,37 +140,31 @@ async fn execute(
                         .to_owned(),
                 );
             }
-            let sequence = sdk.journal_publication(*intent).map_err(describe_error)?;
+            let sequence =
+                measured!("journal", sdk.journal_publication(*intent)).map_err(describe_error)?;
             pending.insert(sequence);
-            let result = sdk
-                .publish_journaled_outcome(sequence)
-                .await
+            let result = measured!("sdk-publish", sdk.publish_journaled_outcome(sequence).await)
                 .map_err(describe_error)?;
             Ok(json!(result))
         }
         Request::Recover => {
-            let report = sdk.recover().await.map_err(describe_error)?;
+            let report = measured!("sdk-recover", sdk.recover().await).map_err(describe_error)?;
             *pending = outstanding(&report);
             Ok(report_json(report))
         }
         Request::Show { sequence } => {
-            let intent = sdk
-                .journaled_intent(sequence.get())
+            let intent = measured!("journal-show", sdk.journaled_intent(sequence.get()))
                 .map_err(describe_error)?
                 .ok_or("sequence has no retained journaled intent")?;
             Ok(json!(intent))
         }
         Request::Retry { sequence } => {
-            let result = sdk
-                .publish_journaled(sequence.get())
-                .await
+            let result = measured!("sdk-retry", sdk.publish_journaled(sequence.get()).await)
                 .map_err(describe_error)?;
             Ok(json!(result))
         }
         Request::Ack { sequence } => {
-            sdk.acknowledge(sequence.get())
-                .await
-                .map_err(describe_error)?;
+            measured!("sdk-ack", sdk.acknowledge(sequence.get()).await).map_err(describe_error)?;
             pending.remove(&sequence.get());
             Ok(Value::Null)
         }

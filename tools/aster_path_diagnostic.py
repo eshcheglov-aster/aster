@@ -9,6 +9,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -21,8 +22,9 @@ import tempfile
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
-from aster_lan_mvp import ConnectJsonClient, RpcError, read_token_file, canonical_event_id, OperatorError
+from aster_lan_mvp import ConnectJsonClient as BaseConnectJsonClient, RpcError, read_token_file, canonical_event_id, OperatorError
 from aster_mesh_playground import NumberedPublisher, RpcError as PublicationRpcError, safe_text
 from aster_path_delivery import OwnedDocker, ExecutionError, _run_command, _pinned_docker
 
@@ -181,37 +183,41 @@ class PublicationWorker(Worker):
         deadline = time.monotonic() + timeout
         with selectors.DefaultSelector() as selector:
             selector.register(self.process.stdin, selectors.EVENT_WRITE)
-            while data:
-                self._ready(selector, deadline)
-                try:
-                    data = data[os.write(self.process.stdin.fileno(), data):]
-                except BlockingIOError:
-                    continue
+            with TELEMETRY.span('ipc-write', action):
+                while data:
+                    self._ready(selector, deadline)
+                    try:
+                        data = data[os.write(self.process.stdin.fileno(), data):]
+                    except BlockingIOError:
+                        continue
             selector.unregister(self.process.stdin)
             selector.register(self.process.stdout, selectors.EVENT_READ)
-            while b'\n' not in self.buffer:
-                self._ready(selector, deadline)
-                try:
-                    chunk = os.read(self.process.stdout.fileno(), 65536)
-                except BlockingIOError:
-                    continue
-                if not chunk:
+            with TELEMETRY.span('ipc-response', action):
+                while b'\n' not in self.buffer:
+                    self._ready(selector, deadline)
                     try:
-                        detail = os.read(self.process.stderr.fileno(), 4096).decode('utf-8', errors='replace')
+                        chunk = os.read(self.process.stdout.fileno(), 65536)
                     except BlockingIOError:
-                        detail = ''
-                    raise ValueError('publication worker closed: ' + safe_text(detail, 400))
-                self.buffer += chunk
-                if len(self.buffer) > 4 * 1024 * 1024:
-                    raise ValueError('publication response bound exceeded')
-        line, self.buffer = self.buffer.split(b'\n', 1)
-        response = json.loads(line)
-        if isinstance(response, dict) and isinstance(response.get('error'), str):
-            # asterctl strips untrusted remote text, retaining only SDK stage/code.
-            raise ValueError(safe_text(response['error'], 400))
-        if not isinstance(response, dict) or 'result' not in response:
-            raise ValueError('publication worker rejected request; journal retained')
-        return response['result']
+                        continue
+                    if not chunk:
+                        try:
+                            detail = os.read(self.process.stderr.fileno(), 4096).decode('utf-8', errors='replace')
+                        except BlockingIOError:
+                            detail = ''
+                        raise ValueError('publication worker closed: ' + safe_text(detail, 400))
+                    self.buffer += chunk
+                    if len(self.buffer) > 4 * 1024 * 1024:
+                        raise ValueError('publication response bound exceeded')
+                line, self.buffer = self.buffer.split(b'\n', 1)
+                response = json.loads(line)
+                if isinstance(response, dict):
+                    TELEMETRY.sdk_timings(response.get('timing_seconds'), response.get('phase_outcomes'))
+                if isinstance(response, dict) and isinstance(response.get('error'), str):
+                    # asterctl strips untrusted remote text, retaining only SDK stage/code.
+                    raise ValueError(safe_text(response['error'], 400))
+                if not isinstance(response, dict) or 'result' not in response:
+                    raise ValueError('publication worker rejected request; journal retained')
+                return response['result']
 
 
 def sample(client):
@@ -222,7 +228,117 @@ def sample(client):
             'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
             'rss_bytes': int(fields[21]) * os.sysconf('SC_PAGE_SIZE'),
             'application_status': client.status(),
+            'status_finished_monotonic': time.monotonic(),
             'queue_label': 'application delivery backlog; not Iroh send queue'}
+
+
+class PacingTelemetry:
+    """Payload-free bounded helper observations, not production RPC timings.
+
+    Child CPU excludes live persistent SDK helpers; use cgroup CPU for total
+    container work, never attribute RUSAGE_CHILDREN deltas to concurrent calls.
+    All durations use this process's monotonic clock. Nested spans are not additive.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.operations = {}
+        self.active = {}
+
+    @contextmanager
+    def span(self, kind, operation):
+        start = time.monotonic()
+        identity = (threading.get_ident(), kind, operation)
+        key = kind + ':' + operation
+        with self.lock:
+            self.active[identity] = start
+        failed = False
+        try:
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            end = time.monotonic()
+            with self.lock:
+                self.active.pop(identity, None)
+                self._observe(key, end - start, failed)
+
+    def _observe(self, key, seconds, failed=False):
+        # Caller owns lock. Only fixed local phase names reach this map.
+        row = self.operations.setdefault(key, {'count': 0, 'errors': 0,
+            'wall_seconds': 0.0, 'max_seconds': 0.0, 'recent_seconds': []})
+        row['count'] += 1
+        row['errors'] += int(failed)
+        row['wall_seconds'] += seconds
+        row['max_seconds'] = max(row['max_seconds'], seconds)
+        row['recent_seconds'].append(seconds)
+        del row['recent_seconds'][:-128]
+
+    def sdk_timings(self, timing, outcomes=None):
+        if not isinstance(timing, dict):
+            return
+        outcomes = outcomes if isinstance(outcomes, dict) else {}
+        with self.lock:
+            for name in ('startup-recovery', 'journal', 'sdk-publish', 'sdk-ack',
+                         'sdk-recover', 'journal-show', 'sdk-retry'):
+                seconds = timing.get(name)
+                if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
+                    self._observe('sdk:' + name, seconds, outcomes.get(name) == 'error')
+
+    def snapshot(self):
+        import resource
+        start_cpu = time.thread_time()
+        def read(path):
+            try:
+                return Path(path).read_text().strip()
+            except OSError:
+                return None
+        child = resource.getrusage(resource.RUSAGE_CHILDREN)
+        resources = {'monotonic': time.monotonic(),
+            'worker_cpu_seconds': time.process_time(),
+            'children_cpu_seconds': child.ru_utime + child.ru_stime,
+            'children_cpu_scope': 'cumulative reaped children; live persistent SDK CPU is in cgroup_cpu_stat',
+            'cpu_count': os.cpu_count(), 'affinity_count': len(os.sched_getaffinity(0)),
+            'host_cpu_stat': (read('/proc/stat') or '').splitlines()[:1],
+            'cpu_pressure': read('/proc/pressure/cpu'),
+            'io_pressure': read('/proc/pressure/io'),
+            'cgroup_cpu_stat': read('/sys/fs/cgroup/cpu.stat'),
+            'cgroup_cpu_pressure': read('/sys/fs/cgroup/cpu.pressure'),
+            'cgroup_cpu_max': read('/sys/fs/cgroup/cpu.max'),
+            'cgroup_io_stat': read('/sys/fs/cgroup/io.stat'),
+            'cgroup_io_pressure': read('/sys/fs/cgroup/io.pressure'),
+            'cgroup_cpuset': read('/sys/fs/cgroup/cpuset.cpus.effective')}
+        pid = read('/clab/state/agent.pid')
+        if pid and pid.isdigit():
+            raw = read('/proc/' + pid + '/stat')
+            if raw:
+                fields = raw.rsplit(')', 1)[1].split()
+                resources['agent_pid'] = int(pid)
+                resources['agent_cpu_seconds'] = (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
+        with self.lock:
+            result = {'operations': {key: dict(value, recent_seconds=list(value['recent_seconds']))
+                                     for key, value in self.operations.items()},
+                      'active': [{'operation': kind + ':' + operation, 'thread_id': thread_id,
+                                  'started_monotonic': at, 'age_seconds': time.monotonic() - at}
+                                 for (thread_id, kind, operation), at in self.active.items()],
+                      'resources': resources}
+        resources['finished_monotonic'] = time.monotonic()
+        resources['observer_snapshot_cpu_seconds'] = time.thread_time() - start_cpu
+        return result
+
+
+TELEMETRY = PacingTelemetry()
+
+
+class ConnectJsonClient(BaseConnectJsonClient):
+    def call(self, method, payload):
+        # Only method names, never request/response bodies or exception text.
+        allowed = {'GetStatus', 'PollEvents', 'AcknowledgeEvent', 'QueryEvents',
+                   'BeginEventPublicationSession', 'CompleteEventPublicationRecovery',
+                   'CreateEventSubscription'}
+        label = method if method in allowed else 'other'
+        with TELEMETRY.span('python-rpc', label):
+            return super().call(method, payload)
 
 
 class DiagnosticPublisher(NumberedPublisher):
@@ -393,6 +509,7 @@ class Workload:
         self.started = time.monotonic()
         self.finished = None
         self.max_schedule_lag = 0.0
+        self.failure_telemetry = None
         self.publisher = threading.Thread(target=self.publish_loop, args=(prefix, count, rate, size), daemon=True)
         self.consumer = threading.Thread(target=self.consume_loop, daemon=True)
         self.consumer.start()
@@ -411,9 +528,12 @@ class Workload:
                 with self.lock:
                     self.max_schedule_lag = max(self.max_schedule_lag, lag)
                     if lag > 1:
+                        if self.failure_telemetry is None:
+                            self.failure_telemetry = TELEMETRY.snapshot()
                         self.errors.append('bounded publisher could not maintain requested pace')
                         return
-                result = publish_one(self.publications, key, size)
+                with TELEMETRY.span('publication', 'complete-lane-cycle'):
+                    result = publish_one(self.publications, key, size)
                 with self.lock:
                     if 'rejected' in result:
                         self.rejected.append(result)
@@ -430,10 +550,13 @@ class Workload:
                 due = self.started + index / rate
                 if self.stop.wait(max(0, due - time.monotonic())):
                     break
-                admitted = slots.acquire(timeout=max(0, due + 1 - time.monotonic()))
+                with TELEMETRY.span('scheduler', 'slot-wait'):
+                    admitted = slots.acquire(timeout=max(0, due + 1 - time.monotonic()))
                 if not admitted:
                     with self.lock:
                         self.max_schedule_lag = max(self.max_schedule_lag, time.monotonic() - due)
+                        if self.failure_telemetry is None:
+                            self.failure_telemetry = TELEMETRY.snapshot()
                         self.errors.append('bounded publisher could not maintain requested pace')
                     break
                 executor.submit(publish, f'{prefix}-{index:06d}', due)
@@ -459,11 +582,13 @@ class Workload:
                 self.errors.append(str(error))
 
     def snapshot(self):
+        telemetry = TELEMETRY.snapshot()
         with self.lock:
             return {'accepted': dict(self.accepted), 'deliveries': dict(self.deliveries),
                     'rejected': list(self.rejected), 'errors': list(self.errors), 'done': self.done,
                     'started': self.started, 'finished': self.finished,
-                    'max_schedule_lag_seconds': self.max_schedule_lag}
+                    'max_schedule_lag_seconds': self.max_schedule_lag,
+                    'pacing_telemetry': telemetry, 'failure_telemetry': self.failure_telemetry}
 
     def close(self):
         self.stop.set()
@@ -771,6 +896,14 @@ def run_profile(config, profile, report):
             report['rejected'][role] = progress['rejected']
             report.setdefault('workload_timing', {})[role] = {key: progress[key] for key in
                 ('done', 'started', 'finished', 'max_schedule_lag_seconds')}
+            if 'pacing_telemetry' in progress:
+                telemetry = progress['pacing_telemetry']
+                report.setdefault('pacing_telemetry', {})[role] = telemetry
+                history = report.setdefault('resource_timeline', {}).setdefault(role, [])
+                history.append(telemetry['resources'])
+                del history[:-1200]
+            if progress.get('failure_telemetry') is not None:
+                report.setdefault('failure_telemetry', {})[role] = progress['failure_telemetry']
             done = done and progress['done']
             errors.extend(role + ': ' + error for error in progress['errors'])
         if errors:
