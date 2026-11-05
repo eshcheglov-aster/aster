@@ -1129,6 +1129,14 @@ fn connect_client_uses_the_real_live_event_authority() {
             .await
             .expect_err("missing streaming credentials must fail");
         assert_authentication_error(&stream_error, api::PublicErrorDetail::FULL_NAME);
+        let mut denied_publications = unauthenticated_client.publish_numbered_events().await.expect("stream start");
+        denied_publications.send(api::PublishNumberedEventsRequest {
+            publication: api::PublishNumberedEventRequest::default().into(),
+            ..Default::default()
+        }).await.expect("enqueue unauthenticated frame");
+        let error = denied_publications.message::<api::PublishNumberedEventsResponse>().await
+            .expect_err("publication streams require authentication before any frame");
+        assert_authentication_error(&error, api::PublicErrorDetail::FULL_NAME);
 
         let base_uri = format!("http://{address}");
         let unauthenticated_grpc_web = api::AsterApplicationServiceClient::new(
@@ -2172,7 +2180,10 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
     // Exercise the journal-backed numbered pipeline over real native HTTP/2,
     // with eight retained entries. The explicit test-support feature lowers
     // only the network window to four and observes refill within one stream.
-    for (index, protocol) in [Protocol::Connect, Protocol::Grpc].into_iter().enumerate() {
+    for (index, protocol) in [Protocol::Connect, Protocol::Grpc, Protocol::Connect]
+        .into_iter()
+        .enumerate()
+    {
         let client_id = format!("numbered-pipeline-{index}");
         let path = state.0.join(format!("pipeline-{index}.redb"));
         PublicationJournal::initialize(&path, client_id.as_bytes()).unwrap();
@@ -2207,29 +2218,41 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
                 .is_err(),
             "all eight journal slots remain occupied"
         );
-        #[cfg(feature = "sdk-test-support")]
-        let results = {
-            let (results, stats) = tokio::time::timeout(
-                Duration::from_secs(30),
-                sdk.publish_journaled_pipeline_with_window_for_test(&sequences, 1, 4),
+        let results = if index == 2 {
+            let mut pacing = aster_agent::sdk::PublicationPacing::new(
+                tokio::time::Instant::now(),
+                Duration::from_millis(100),
             )
-            .await
-            .expect("one invocation must refill the four-request window")
-            .expect("numbered native pipeline");
-            assert_eq!(stats.stream_sessions, 1, "refill must use the same stream");
-            assert_eq!(stats.requests_sent, 8, "all eight requests use that stream");
-            assert_eq!(stats.max_in_flight, 4, "the actual network window is four");
-            assert!(
-                stats.send_batches > 1,
-                "the stream must refill after results"
-            );
+            .unwrap();
+            sdk.publish_journaled_pipeline_paced(&sequences, 1, &mut pacing)
+                .await
+                .expect("paced native pipeline")
+        } else {
+            #[cfg(feature = "sdk-test-support")]
+            let results = {
+                let (results, stats) = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    sdk.publish_journaled_pipeline_with_window_for_test(&sequences, 1, 4),
+                )
+                .await
+                .expect("one invocation must refill the four-request window")
+                .expect("numbered native pipeline");
+                assert_eq!(stats.stream_sessions, 1, "refill must use the same stream");
+                assert_eq!(stats.requests_sent, 8, "all eight requests use that stream");
+                assert_eq!(stats.max_in_flight, 4, "the actual network window is four");
+                assert!(
+                    stats.send_batches > 1,
+                    "the stream must refill after results"
+                );
+                results
+            };
+            #[cfg(not(feature = "sdk-test-support"))]
+            let results = sdk
+                .publish_journaled_pipeline(&sequences, 1)
+                .await
+                .expect("numbered native pipeline with production window");
             results
         };
-        #[cfg(not(feature = "sdk-test-support"))]
-        let results = sdk
-            .publish_journaled_pipeline(&sequences, 1)
-            .await
-            .expect("numbered native pipeline with production window");
         assert_eq!(
             results
                 .iter()
@@ -2240,6 +2263,62 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         assert_eq!(sequences, (1..=8).collect::<Vec<u64>>());
         for sequence in sequences {
             sdk.acknowledge(sequence).await.unwrap();
+        }
+        if index == 2 {
+            let (send, input) = tokio::sync::mpsc::channel(8);
+            let (output, mut receive) =
+                tokio::sync::mpsc::channel::<aster_agent::sdk::RollingPublication>(8);
+            let mut pacing = aster_agent::sdk::PublicationPacing::new(
+                tokio::time::Instant::now(),
+                Duration::from_millis(750),
+            )
+            .unwrap();
+            let produce = async move {
+                for suffix in 9..=20 {
+                    send.send(api::PublishNumberedEventRequest {
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        logical_key: vec![suffix],
+                        payload: vec![suffix],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                }
+            };
+            let apply = async {
+                let mut sequences = Vec::new();
+                while let Some(publication) = receive.recv().await {
+                    assert_eq!(
+                        publication.intent.payload,
+                        vec![publication.result.operation_sequence as u8]
+                    );
+                    assert_eq!(publication.result.receipt.event_id.len(), 32);
+                    sequences.push(publication.result.operation_sequence);
+                    publication.applied.send(()).unwrap();
+                }
+                assert_eq!(sequences, (9..=20).collect::<Vec<_>>());
+            };
+            // The producer drops the final sender at EOF.
+            let (result, (), ()) = tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::join!(
+                    sdk.publish_rolling(input, output, &mut pacing, 1),
+                    produce,
+                    apply
+                )
+            })
+            .await
+            .expect("bounded rolling native stream");
+            result.unwrap();
+            assert!(
+                pacing
+                    .trace()
+                    .iter()
+                    .filter(|row| row.stage == "open-start")
+                    .count()
+                    >= 2
+            );
         }
         drop(sdk);
         let reopened = NumberedEventSdk::open(

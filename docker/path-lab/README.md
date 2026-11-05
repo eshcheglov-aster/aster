@@ -24,9 +24,9 @@ exhaustion alone is not counted as a definite rejection; unresolved outcomes
 fail the run. Journals remain available to the helper's recovery path during the
 run; final owned-state cleanup removes them together with the disposable mission
 credentials, including on failure. Retained receipts are not resumable journals.
-Each agent admits at most **six active publisher tasks**, leaving capacity for
-the independent consumer and controller. This is not a server-socket count:
-connection teardown may overlap. Admission and actual task-start lag must stay
+Each agent uses one publication stream with at most eight outstanding journal
+entries, alongside an independent consumer and controller. This is not a
+server-socket count: connection teardown may overlap. Send-admission lag must stay
 within one second of the original scheduled time; insufficient CPU/rate capacity
 fails rather than quietly reducing the requested load.
 A run with no admitted Events cannot pass. The outage publishes
@@ -192,12 +192,47 @@ wipes private credentials;
 owned-resource cleanup must then succeed before ownership metadata is removed.
 Failed cleanup retains its ownership locator. No credentials are included in the receipt.
 
-The publisher schedules locally inside each persistent helper, independently of
-continuous polling/acknowledgement. At most 48 publication RPCs per endpoint may
-be outstanding; exhausting that diagnostic bound fails instead of silently
-slowing the requested pace. Connect JSON calls have a 30-second timeout; numbered
-publication uses `asterctl --timeout 10` with a 35-second subprocess bound per
-CLI invocation (recovery may require several invocations). The peerless query
+The sustained publisher uses one persistent SDK owner per agent and the native
+`PublishNumberedEvents` stream with a rolling eight-entry durable journal.
+Receipt reception, individually paced sends, and result acknowledgements run
+concurrently. Each acknowledged journal slot can accept the next original intent;
+there is no full-batch receipt/application/acknowledgement barrier. The bounded
+IPC source and result channels each hold at most eight entries. Every receipt is
+journaled before exposure, and the controller applies it before signalling the
+SDK to acknowledge it. One-off witnesses and the unary CLI remain unary.
+
+The network window is eight unacknowledged stream frames, **not** six concurrent
+unary lanes and not a reservation of unauthenticated connection slots. At 10
+Events/s each fresh frame is due at `start + index / 10`; the SDK retains this
+absolute schedule throughout the source and its eight-second stream rotations.
+Wake jitter can shorten subsequent intervals rather than accumulate as drift;
+normal on-time operation sends individual frames at their deadlines, not batches.
+Catch-up is bounded by the eight-entry window and unchanged one-second cutoff.
+More than one second of send-admission lag fails the workload; it is
+not an RPC completion deadline. Journal preparation, result application and
+acknowledgement consume the same schedule budget. Consumption remains independent.
+Authentication remains per stream under the existing server contract.
+
+Failed streams retry only the original numbered intent within the SDK's bounded
+retry budget. After exhaustion, recovery records committed results but leaves
+pending intents journaled for explicit recovery; it does not publish replacements
+or turn a failed pacing run into a pass. Closing a workload cancels its helper
+and retains uncertain journal entries. Telemetry includes maximum `schedule-lag`
+and the final 128 payload-free SDK boundary timestamps (journaled, send, receipt,
+saved, acknowledged, and stream opening). Their clock starts at schedule creation.
+Receipt wait includes transport and server work; saved-to-ack includes application
+IPC, acknowledgement RPC and durable removal. Neither is server-only execution.
+Original-sequence replays retain their identity and do not advance the fresh
+schedule. Replay waits still consume schedule budget: a pacing failure alone is
+not an Aster capacity measurement.
+
+The controller drains helper stdout concurrently with bounded IPC writes, with
+at most eight queued responses plus one bounded response being read. Rust stdout
+writes run off the async reactor. A large receipt cannot deadlock a caller still
+filling the input window; IPC deadlines and terminate/kill cleanup remain active.
+
+Connect JSON calls have a 30-second timeout; the persistent numbered helper uses
+`asterctl --timeout 10` with a 35-second IPC bound per command. The peerless query
 has a separate 180-second deadline per node, and each profile has an overall
 publication + restoration + 420-second deadline. These are diagnostic bounds,
 not changed application capacities.

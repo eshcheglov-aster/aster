@@ -96,6 +96,169 @@ class DeliveryOwnershipTests(unittest.TestCase):
 
 
 class NumberedPublicationTests(unittest.TestCase):
+    def test_failed_stream_recovers_committed_originals_but_does_not_publish_pending_intents(self):
+        publisher = diagnostic.DiagnosticPublisher(Path('unused'), Path('unused'), 'client')
+        calls, applied = [], []
+        telemetry = diagnostic.PacingTelemetry()
+        def failed(*args, **kwargs):
+            calls.append('publish-batch')
+            telemetry.sdk_timings({'sdk-stream': 2.0, 'schedule-lag': 1.2}, {'sdk-stream': 'error'})
+            raise diagnostic.PublicationRpcError('bounded publisher could not maintain requested pace')
+        def recover(action, options=(), **kwargs):
+            calls.append(action)
+            if action == 'publication-recover':
+                return {'operations': [
+                    {'operationSequence': '7', 'state': 'committed', 'result': {'operationSequence': '7', 'receipt': {'eventId': diagnostic.base64.b64encode(b'x' * 32).decode()}}},
+                    {'operationSequence': '8', 'state': 'pending'}]}
+            if action == 'publication-show':
+                self.assertEqual(options, ['--sequence', '7'])
+                return {'logicalKey': 'aw==', 'payload': 'cA=='}
+        publisher._call = failed
+        publisher._run = recover
+        with patch.object(diagnostic, 'TELEMETRY', telemetry):
+            with self.assertRaisesRegex(diagnostic.RpcError, 'requested pace') as failure:
+                publisher.publish_batch([(b'k', b'p'), (b'next', b'p')], 10, diagnostic.time.monotonic(), applied.append)
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(calls, ['publish-batch', 'publication-recover', 'publication-show', 'publication-ack'])
+        self.assertEqual(failure.exception.failure_telemetry['operations']['sdk:sdk-stream']['errors'], 1)
+
+    def test_stream_batch_applies_every_result_before_acknowledging(self):
+        calls = []
+        class Session:
+            def call(self, action, **arguments):
+                calls.append((action, arguments))
+                if action == 'publish-batch':
+                    return {'results': [{'operationSequence': str(i + 1), 'receipt': {'eventId': diagnostic.base64.b64encode(bytes([i + 1]) * 32).decode()}} for i in range(3)], 'max_schedule_lag_seconds': 0.02}
+        publisher = diagnostic.DiagnosticPublisher(Path('unused'), Path('unused'), 'client')
+        publisher.session = Session()
+        applied = []
+        lag = publisher.publish_batch([(b'k0', b'p0'), (b'k1', b'p1'), (b'k2', b'p2')], 10, diagnostic.time.monotonic(), applied.append)
+        self.assertEqual(lag, 0.02)
+        self.assertEqual(len(applied), 3)
+        self.assertEqual([c[0] for c in calls], ['publish-batch'] + ['publication-ack'] * 3)
+        self.assertEqual(len(calls[0][1]['intents']), 3)
+        self.assertEqual(calls[0][1]['intents'][0]['priority'], 'PRIORITY_ROUTINE')
+        self.assertEqual([c[1]['sequence'] for c in calls[1:]], [1, 2, 3])
+
+    def test_rolling_refills_on_each_applied_result_not_full_batch(self):
+        calls, applied = [], []
+        test = self
+        class Session:
+            def __init__(self):
+                self.intents = []
+                self.index = 0
+            def call(self, action, **kwargs):
+                calls.append(action)
+                return {'ready': True}
+            def send(self, action, **kwargs):
+                calls.append(action)
+                if action == 'stream-item':
+                    self.intents.append(kwargs['intent'])
+                    test.assertLessEqual(len(self.intents) - self.index, 8)
+                if action == 'stream-applied':
+                    test.assertEqual(len(applied), self.index)
+            def read(self, *args, **kwargs):
+                if self.index == 9:
+                    return {'finished': True, 'max_schedule_lag_seconds': .02}
+                if self.index == 1:
+                    test.assertEqual(len(self.intents), 9, 'ninth input must precede second receipt')
+                intent = self.intents[self.index]
+                self.index += 1
+                return {'intent': intent, 'publication': {'operationSequence': str(self.index),
+                    'receipt': {'eventId': diagnostic.base64.b64encode(bytes([self.index]) * 32).decode()}}}
+        publisher = diagnostic.DiagnosticPublisher(Path('unused'), Path('unused'), 'client')
+        publisher.session = Session()
+        lag = publisher.publish_stream(((str(i).encode(), b'p') for i in range(9)), 10,
+                                       diagnostic.time.monotonic(), applied.append)
+        self.assertEqual(lag, .02)
+        self.assertEqual(len(applied), 9)
+        self.assertEqual(calls.count('stream-item'), 9)
+        self.assertEqual(calls.count('stream-applied'), 9)
+
+    def test_rolling_failure_recovers_original_committed_only_without_replacement(self):
+        calls, applied = [], []
+        class Session:
+            def call(self, action, **kwargs):
+                calls.append(action)
+                return {'ready': True}
+            def send(self, action, **kwargs):
+                calls.append(action)
+                if action == 'stream-item':
+                    self.intent = kwargs['intent']
+            def read(self):
+                raise ValueError('bounded publisher could not maintain requested pace')
+            def close(self):
+                calls.append('close')
+        session = Session()
+        publisher = diagnostic.DiagnosticPublisher(Path('unused'), Path('unused'), 'client')
+        publisher.session = session
+        def recover(action, options=(), **kwargs):
+            calls.append(action)
+            if action == 'publication-recover':
+                return {'operations': [
+                    {'operationSequence': '7', 'state': 'committed', 'result': {'receipt': {'eventId': diagnostic.base64.b64encode(b'x' * 32).decode()}}},
+                    {'operationSequence': '8', 'state': 'pending'}]}
+            if action == 'publication-show':
+                self.assertEqual(options, ['--sequence', '7'])
+                return session.intent
+            if action == 'publication-ack':
+                self.assertEqual(len(applied), 1)
+                self.assertEqual(options, ['--sequence', '7'])
+        publisher._run = recover
+        with self.assertRaisesRegex(diagnostic.RpcError, 'requested pace'):
+            publisher.publish_stream(iter([(b'k', b'p')]), 10, diagnostic.time.monotonic(), applied.append)
+        self.assertEqual(calls, ['stream-start', 'stream-item', 'stream-finish', 'close',
+            'publication-recover', 'publication-show', 'publication-ack'])
+
+    def test_worker_drains_actual_pipes_while_filling_eight_item_window(self):
+        import base64
+        import fcntl
+        # 4096 is the diagnostic maximum; 65536 is the SDK journal maximum.
+        # 128 KiB is not supported by the helper's journal payload contract.
+        # Force small actual kernel pipes so neither case relies on pipe size.
+        for size in (4096, 65536):
+            with self.subTest(size=size):
+                worker = diagnostic.PublicationWorker([sys.executable, '-u', '-c',
+                    'import sys,json\nfor line in sys.stdin:\n'
+                    ' request=json.loads(line); print(json.dumps({"result":request}),flush=True)\n'])
+                try:
+                    for pipe in (worker.process.stdin, worker.process.stdout):
+                        fcntl.fcntl(pipe.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+                    payload = base64.b64encode(b'p' * size).decode()
+                    for sequence in range(8):
+                        worker.send('stream-item', timeout=2, intent={
+                            'logicalKey': str(sequence), 'payload': payload})
+                    for sequence in range(8):
+                        response = worker.read(timeout=2)
+                        self.assertEqual(response['intent'], {
+                            'logicalKey': str(sequence), 'payload': payload})
+                finally:
+                    worker.close()
+
+    def test_worker_drainer_is_bounded_and_close_joins_it(self):
+        import time
+        worker = diagnostic.PublicationWorker([sys.executable, '-u', '-c',
+            'import json,time\nfor i in range(20): print(json.dumps({"result":i}),flush=True)\ntime.sleep(60)'])
+        try:
+            deadline = time.monotonic() + 2
+            while worker.responses.qsize() < 8 and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(worker.responses.qsize(), 8)
+        finally:
+            worker.close()
+        self.assertFalse(worker.drainer.is_alive())
+        self.assertIsNotNone(worker.process.poll())
+
+    def test_worker_read_deadline_still_expires_with_background_drainer(self):
+        worker = diagnostic.PublicationWorker([sys.executable, '-u', '-c',
+            'import time; time.sleep(60)'])
+        try:
+            with self.assertRaisesRegex(TimeoutError, 'IPC deadline'):
+                worker.read(timeout=.05)
+        finally:
+            worker.close()
+        self.assertFalse(worker.drainer.is_alive())
+
     def test_worker_startup_error_is_retained(self):
         worker = diagnostic.PublicationWorker([sys.executable, '-u', '-c',
             'import sys; print("asterctl: publication journal unavailable",file=sys.stderr); sys.exit(1)'])
@@ -126,6 +289,12 @@ class NumberedPublicationTests(unittest.TestCase):
             'logicalKey':'aw==', 'payload':'cA==', 'priority':'PRIORITY_ROUTINE'})
 
     def test_shutdown_cancels_blocked_publication_and_prevents_restart(self):
+        self.check_cancelled_publication(False)
+
+    def test_shutdown_cancels_rolling_stream_and_prevents_recovery_restart(self):
+        self.check_cancelled_publication(True)
+
+    def check_cancelled_publication(self, streaming):
         import threading
         import time
         with tempfile.TemporaryDirectory() as directory:
@@ -137,7 +306,10 @@ class NumberedPublicationTests(unittest.TestCase):
             errors = []
             def blocked():
                 try:
-                    publisher.publish_event(b'key', b'x' * 100000)
+                    if streaming:
+                        publisher.publish_stream(iter([(b'key', b'x' * 100000)] * 8), 10, time.monotonic(), lambda result: None)
+                    else:
+                        publisher.publish_event(b'key', b'x' * 100000)
                 except diagnostic.RpcError as error:
                     errors.append(error)
             thread = threading.Thread(target=blocked)
@@ -689,103 +861,52 @@ class OracleTests(unittest.TestCase):
         with patch.object(Path, 'read_text', side_effect=ProcessLookupError(3, 'No such process')):
             diagnostic.wait_stopped(123)
 
-    def test_publisher_admission_reserves_two_connections_and_preserves_work(self):
-        import threading
-        release = threading.Event()
-        six_started = threading.Event()
-        overflow = threading.Event()
-        lock = threading.Lock()
-        active = peak = 0
-
-        class Client:
-            def publish_event(self, key, payload):
-                nonlocal active, peak
-                with lock:
-                    active += 1
-                    peak = max(peak, active)
-                    if active == 6:
-                        six_started.set()
-                    if active > 6:
-                        overflow.set()
-                release.wait(3)
-                with lock:
-                    active -= 1
-                return {'id': key.decode(), 'payload': payload.decode()}
-
-            def call(self, method, request):
-                return {'deliveries': []}
-
-        workload = diagnostic.Workload(Client(), 'sub', 'probe', 12, 1000, 32)
-        try:
-            self.assertTrue(six_started.wait(2))
-            exceeded = overflow.wait(0.1)
-            release.set()
-            workload.publisher.join(3)
-            result = workload.snapshot()
-            self.assertFalse(exceeded, 'publishing consumed reserved consumer/status slots')
-            self.assertEqual(peak, 6)
-            self.assertEqual(len(result['accepted']), 12)
-            self.assertEqual(result['errors'], [])
-            self.assertGreater(result['max_schedule_lag_seconds'], 0.05)
-        finally:
-            release.set()
-            workload.close()
-
-    def test_publisher_checks_actual_start_not_executor_submission_time(self):
-        import time
-        original_executor = diagnostic.ThreadPoolExecutor
+    def test_stream_workload_uses_one_lazy_source_and_retains_absolute_schedule(self):
         calls = []
-
-        class DelayedExecutor(original_executor):
-            def submit(self, function, *args, **kwargs):
-                def delayed():
-                    time.sleep(1.05)
-                    return function(*args, **kwargs)
-                return super().submit(delayed)
-
         class Client:
-            def publish_event(self, key, payload):
-                calls.append(key)
-                return {'id': key.decode()}
-
+            def publish_stream(self, items, rate, due, apply):
+                items = list(items)
+                calls.append((items, rate, due))
+                for key, payload in items:
+                    apply({'id': key.decode(), 'payload': payload.decode()})
+                return 0.02
             def call(self, method, request):
                 return {'deliveries': []}
+        workload = diagnostic.Workload(Client(), 'sub', 'probe', 19, 10, 32)
+        workload.publisher.join(3)
+        result = workload.snapshot()
+        workload.close()
+        self.assertEqual([len(c[0]) for c in calls], [19])
+        self.assertEqual([c[1] for c in calls], [10])
+        self.assertEqual(calls[0][2], workload.started)
+        self.assertEqual(len(result['accepted']), 19)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['max_schedule_lag_seconds'], 0.02)
 
-        with patch.object(diagnostic, 'ThreadPoolExecutor', DelayedExecutor):
-            workload = diagnostic.Workload(Client(), 'sub', 'probe', 1, 10, 32)
-            workload.publisher.join(3)
-            result = workload.snapshot()
-            workload.close()
-        self.assertEqual(calls, [])
-        self.assertGreater(result['max_schedule_lag_seconds'], 1)
+    def test_stream_pacing_failure_retains_applied_set_and_stops_new_batches(self):
+        calls = []
+        class Client:
+            def publish_stream(self, items, rate, due, apply):
+                calls.append(items)
+                apply({'id': 'already-committed'})
+                raise ValueError('bounded publisher could not maintain requested pace')
+            def call(self, method, request):
+                return {'deliveries': []}
+        workload = diagnostic.Workload(Client(), 'sub', 'probe', 19, 10, 32)
+        workload.publisher.join(3)
+        result = workload.snapshot()
+        workload.close()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(result['accepted']), {'already-committed'})
         self.assertEqual(result['errors'], ['bounded publisher could not maintain requested pace'])
-
-    def test_publisher_admission_timeout_does_not_smooth_requested_rate(self):
-        import threading
-        release = threading.Event()
-
-        class Client:
-            def publish_event(self, key, payload):
-                release.wait(3)
-                return {'id': key.decode()}
-
-            def call(self, method, request):
-                return {'deliveries': []}
-
-        workload = diagnostic.Workload(Client(), 'sub', 'probe', 7, 1000, 32)
-        try:
-            self.assertFalse(workload.stop.wait(1.2))
-            result = workload.snapshot()
-            self.assertGreater(result['max_schedule_lag_seconds'], 1)
-            self.assertEqual(result['errors'], ['bounded publisher could not maintain requested pace'])
-        finally:
-            release.set()
-            workload.publisher.join(3)
-            workload.close()
-        self.assertEqual(len(workload.snapshot()['accepted']), 6)
+        self.assertIsNotNone(result['failure_telemetry'])
 
     def test_paced_workload_counts_rejection_and_unknown_failure(self):
         class Client:
+            def publish_stream(self, items, rate, due, apply):
+                for key, payload in items:
+                    apply(self.publish_event(key, payload))
+                return 0.0
             def publish_event(self, key, payload):
                 if key.endswith(b'000001'):
                     return {'key': key.decode(), 'rejected': 'explicit test rejection'}
@@ -949,6 +1070,11 @@ class FinalizationTests(unittest.TestCase):
             def __init__(self, role):
                 self.role = role
                 self.polled = False
+
+            def publish_stream(self, items, rate, due, apply):
+                for key, payload in items:
+                    apply(self.publish_event(key, payload))
+                return 0.0
 
             def publish_event(self, key, payload):
                 if key.endswith(b'000001'):

@@ -127,6 +127,102 @@ impl std::error::Error for PublicationError {
 }
 type Result<T> = std::result::Result<T, NumberedEventSdkError>;
 
+/// Payload-free timestamps retained in a bounded diagnostic ring.
+#[derive(Clone, Debug, Serialize)]
+pub struct PublicationTrace {
+    pub stage: &'static str,
+    pub sequence: u64,
+    pub seconds: f64,
+}
+
+/// Retained absolute schedule across rotations and journal refills. Fresh frames
+/// use their original deadlines, allowing wake jitter to recover without drift.
+/// Admission fails above one second of lag; the rolling window remains bounded.
+pub struct PublicationPacing {
+    origin: tokio::time::Instant,
+    trace: VecDeque<PublicationTrace>,
+    next_due: tokio::time::Instant,
+    interval: Duration,
+    last_send: Option<tokio::time::Instant>,
+    last_sequence: u64,
+    max_lag: Duration,
+}
+
+impl PublicationPacing {
+    pub fn new(first_due: tokio::time::Instant, interval: Duration) -> Result<Self> {
+        if interval.is_zero() || interval > Duration::from_secs(3600) {
+            return Err(NumberedEventSdkError::Protocol(
+                "invalid publication interval".to_owned(),
+            ));
+        }
+        Ok(Self {
+            origin: tokio::time::Instant::now(),
+            trace: VecDeque::new(),
+            next_due: first_due,
+            interval,
+            last_send: None,
+            last_sequence: 0,
+            max_lag: Duration::ZERO,
+        })
+    }
+
+    pub fn trace(&self) -> &VecDeque<PublicationTrace> {
+        &self.trace
+    }
+
+    fn observe(&mut self, stage: &'static str, sequence: u64) {
+        if self.trace.len() == 128 {
+            self.trace.pop_front();
+        }
+        self.trace.push_back(PublicationTrace {
+            stage,
+            sequence,
+            seconds: self.origin.elapsed().as_secs_f64(),
+        });
+    }
+
+    pub fn max_schedule_lag(&self) -> Duration {
+        self.max_lag
+    }
+
+    fn ready_at(&self, sequence: u64) -> tokio::time::Instant {
+        if sequence > self.last_sequence {
+            self.next_due
+        } else {
+            // Replays do not consume a fresh schedule position. Keep their
+            // readiness stable and bounded by the previous send.
+            self.last_send
+                .map_or(self.next_due, |last| last + self.interval)
+        }
+    }
+
+    fn sending(&mut self, sequence: u64) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        if sequence > self.last_sequence {
+            let lag = now.saturating_duration_since(self.next_due);
+            self.max_lag = self.max_lag.max(lag);
+            if lag > Duration::from_secs(1) {
+                return Err(NumberedEventSdkError::Protocol(
+                    "bounded publisher could not maintain requested pace".to_owned(),
+                ));
+            }
+            self.next_due += self.interval;
+            self.last_sequence = sequence;
+        }
+        self.last_send = Some(now);
+        self.observe("send", sequence);
+        Ok(())
+    }
+}
+
+/// A durably saved result. Signal `applied` only after application processing;
+/// dropping it stops the stream without acknowledging the original journal row.
+pub struct RollingPublication {
+    pub intent: api::PublishNumberedEventRequest,
+    pub result: api::CommittedPublicationResult,
+    pub applied: tokio::sync::oneshot::Sender<()>,
+}
+
 struct NumberedPipelinedPublicationState {
     pending: VecDeque<api::PublishNumberedEventRequest>,
     sent: usize,
@@ -232,10 +328,26 @@ where
     }
 
     /// Publishes a finite ordered set over one or more bounded native streams.
+    #[cfg(test)]
     async fn publish_all<F>(
         &self,
         requests: Vec<api::PublishNumberedEventRequest>,
+        persist: F,
+    ) -> Result<Vec<api::PublishNumberedEventsResponse>>
+    where
+        F: FnMut(
+            &api::PublishNumberedEventRequest,
+            &api::PublishNumberedEventsResponse,
+        ) -> Result<()>,
+    {
+        self.publish_all_paced(requests, persist, None).await
+    }
+
+    async fn publish_all_paced<F>(
+        &self,
+        requests: Vec<api::PublishNumberedEventRequest>,
         mut persist: F,
+        mut pacing: Option<&mut PublicationPacing>,
     ) -> Result<Vec<api::PublishNumberedEventsResponse>>
     where
         F: FnMut(
@@ -257,7 +369,18 @@ where
             let mut session_made_progress = false;
 
             while !state.is_complete() && !rotate {
-                let batch = state.fill_window(self.window);
+                let send_window = if let Some(pacing) = pacing.as_deref() {
+                    if state.pending.get(state.sent).is_some_and(|request| {
+                        pacing.ready_at(request.operation_sequence) <= tokio::time::Instant::now()
+                    }) {
+                        (state.sent + 1).min(self.window)
+                    } else {
+                        state.sent
+                    }
+                } else {
+                    self.window
+                };
+                let batch = state.fill_window(send_window);
                 #[cfg(feature = "sdk-test-support")]
                 if !batch.is_empty()
                     && let Some(stats) = &self.test_stats
@@ -267,6 +390,9 @@ where
                     stats.max_in_flight = stats.max_in_flight.max(state.sent);
                 }
                 for request in batch {
+                    if let Some(pacing) = pacing.as_deref_mut() {
+                        pacing.sending(request.operation_sequence)?;
+                    }
                     let send = stream.send(api::PublishNumberedEventsRequest {
                         publication: request.into(),
                         ..Default::default()
@@ -302,15 +428,28 @@ where
                     continue;
                 }
 
+                // message() retains its decoder and pending response initialization
+                // when the pacing timer cancels the wait. Do not wait for a receipt
+                // before admitting the next due frame while window capacity remains.
+                let wake = pacing
+                    .as_deref()
+                    .and_then(|pacing| {
+                        (state.sent < self.window)
+                            .then(|| state.pending.get(state.sent))
+                            .flatten()
+                            .map(|request| pacing.ready_at(request.operation_sequence))
+                    })
+                    .map_or(deadline, |due| due.min(deadline));
                 match tokio::time::timeout_at(
-                    deadline,
+                    wake,
                     stream.message::<api::PublishNumberedEventsResponse>(),
                 )
                 .await
                 {
+                    Err(_) if wake < deadline => continue,
                     Err(_) => {
                         record_no_progress_rotation(
-                            session_made_progress,
+                            session_made_progress || state.sent == 0,
                             &mut consecutive_disconnects,
                             self.max_disconnect_retries,
                         )?;
@@ -1097,6 +1236,185 @@ where
         Ok(self.journal.entry(sequence)?.map(|entry| entry.intent))
     }
 
+    /// Sustained bounded publication on one native stream, rotated every eight
+    /// seconds. Input and result channels must be bounded to at most eight.
+    /// Journal slots are reused individually after application and server ack;
+    /// receipt reception and paced sends continue while acknowledgements wait.
+    /// Cancel by dropping this future: assigned original intents remain durable.
+    pub async fn publish_rolling(
+        &self,
+        mut input: tokio::sync::mpsc::Receiver<api::PublishNumberedEventRequest>,
+        output: tokio::sync::mpsc::Sender<RollingPublication>,
+        pacing: &mut PublicationPacing,
+        max_disconnect_retries: usize,
+    ) -> Result<()>
+    where
+        T::ResponseBody: Unpin,
+    {
+        use futures::StreamExt;
+        if input.max_capacity() > PIPELINED_PUBLICATION_WINDOW
+            || output.max_capacity() > PIPELINED_PUBLICATION_WINDOW
+        {
+            return Err(journal_capacity_error());
+        }
+        let state = self.journal.read_state()?;
+        require_recovered(&state)?;
+        if state.next_sequence != state.allocated_through.checked_add(1)
+            || self
+                .journal
+                .database
+                .begin_read()
+                .map_err(|error| journal_error(self.journal.path(), "stream read", error))?
+                .open_table(JOURNAL_ENTRIES)
+                .map_err(|error| journal_error(self.journal.path(), "stream entries", error))?
+                .len()
+                .map_err(|error| journal_error(self.journal.path(), "stream count", error))?
+                != 0
+        {
+            return Err(NumberedEventSdkError::Protocol(
+                "recover and apply outstanding work before streaming".into(),
+            ));
+        }
+        let mut pending = VecDeque::<api::PublishNumberedEventRequest>::new();
+        let mut acknowledgements = futures::stream::FuturesUnordered::new();
+        let mut outstanding = 0;
+        let mut source_closed = false;
+        let mut disconnects = 0;
+        loop {
+            pacing.observe("open-start", 0);
+            let mut stream = self.client.publish_numbered_events().await?;
+            pacing.observe("open-finish", 0);
+            let deadline = tokio::time::Instant::now() + PIPELINED_PUBLICATION_SESSION;
+            let mut sent = 0;
+            let mut progress = false;
+            loop {
+                if source_closed && outstanding == 0 {
+                    stream.close_send();
+                    return Ok(());
+                }
+                let now = tokio::time::Instant::now();
+                let backlog = !input.is_empty()
+                    || pending
+                        .iter()
+                        .any(|request| request.operation_sequence > pacing.last_sequence);
+                let admission_deadline =
+                    pacing.next_due + Duration::from_secs(1) + Duration::from_nanos(1);
+                if backlog && now >= admission_deadline {
+                    pacing.sending(pacing.last_sequence + 1)?;
+                }
+                if now >= deadline {
+                    record_no_progress_rotation(
+                        progress || sent == 0,
+                        &mut disconnects,
+                        max_disconnect_retries,
+                    )?;
+                    break;
+                }
+                if let Some(request) = pending.get(sent)
+                    && pacing.ready_at(request.operation_sequence) <= now
+                {
+                    pacing.sending(request.operation_sequence)?;
+                    match tokio::time::timeout_at(
+                        deadline,
+                        stream.send(api::PublishNumberedEventsRequest {
+                            publication: request.clone().into(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            sent += 1;
+                        }
+                        error => {
+                            if disconnects >= max_disconnect_retries {
+                                return Err(match error {
+                                    Ok(Err(error)) => error.into(),
+                                    _ => NumberedEventSdkError::Protocol(
+                                        "publication stream send deadline".into(),
+                                    ),
+                                });
+                            }
+                            disconnects += 1;
+                            break;
+                        }
+                    }
+                }
+                let wake = pending
+                    .get(sent)
+                    .map(|request| pacing.ready_at(request.operation_sequence))
+                    .unwrap_or(deadline)
+                    .min(deadline);
+                let wake = if backlog {
+                    wake.min(admission_deadline)
+                } else {
+                    wake
+                };
+                tokio::select! {
+                    acknowledged = acknowledgements.next(), if !acknowledgements.is_empty() => {
+                        let sequence = acknowledged.expect("nonempty acknowledgement set")?;
+                        pacing.observe("acknowledged", sequence);
+                        outstanding -= 1;
+                    }
+                    intent = input.recv(), if !source_closed && outstanding < PIPELINED_PUBLICATION_WINDOW => {
+                        match intent {
+                            Some(intent) => {
+                                let sequence = self.journal_publication(intent)?;
+                                pacing.observe("journaled", sequence);
+                                pending.push_back(self.journaled_intent(sequence)?.expect("just journaled"));
+                                outstanding += 1;
+                            }
+                            None => source_closed = true,
+                        }
+                    }
+                    _ = tokio::time::sleep_until(wake) => {}
+                    response = stream.message::<api::PublishNumberedEventsResponse>(), if sent > 0 => {
+                        let response = match response {
+                            Ok(Some(response)) => response.to_owned_message(),
+                            other => {
+                                if disconnects >= max_disconnect_retries {
+                                    return Err(match other {
+                                        Err(error) => error.into(),
+                                        _ => NumberedEventSdkError::Protocol("publication stream ended before receipt".into()),
+                                    });
+                                }
+                                disconnects += 1;
+                                break;
+                            }
+                        };
+                        let request = pending.front().expect("sent request");
+                        let result = match response.outcome {
+                            Some(api::publish_numbered_events_response::Outcome::Published(published)) =>
+                                published.result.into_option().ok_or_else(|| NumberedEventSdkError::Protocol("publication omitted result".into()))?,
+                            _ => return Err(NumberedEventSdkError::Protocol("publication rejected; original intent retained".into())),
+                        };
+                        validate_committed_result(&result)?;
+                        if result.operation_sequence != request.operation_sequence {
+                            return Err(NumberedEventSdkError::Protocol("publication returned different sequence".into()));
+                        }
+                        pacing.observe("receipt", result.operation_sequence);
+                        self.save_publication_result(state.session, &result)?;
+                        pacing.observe("saved", result.operation_sequence);
+                        let intent = pending.pop_front().expect("saved request");
+                        sent -= 1;
+                        let sequence = result.operation_sequence;
+                        let (applied, application) = tokio::sync::oneshot::channel();
+                        output.try_send(RollingPublication { intent, result, applied })
+                            .map_err(|_| NumberedEventSdkError::Protocol("application result channel closed or full; journal retained".into()))?;
+                        acknowledgements.push(async move {
+                            application.await.map_err(|_| NumberedEventSdkError::Protocol("application did not apply result; journal retained".into()))?;
+                            self.acknowledge(sequence).await?;
+                            Ok::<_, NumberedEventSdkError>(sequence)
+                        });
+                        progress = true;
+                        disconnects = 0;
+                    }
+                }
+            }
+            stream.close_send();
+        }
+    }
+
     /// Pipelines a contiguous range of journaled operations. Every successful
     /// receipt is durably saved before releasing another slot. A rejected
     /// operation stops the pipeline and remains journaled for explicit repair
@@ -1113,6 +1431,29 @@ where
             sequences,
             max_disconnect_retries,
             PIPELINED_PUBLICATION_WINDOW,
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        )
+        .await
+    }
+
+    /// Publishes a finite journal batch at a retained absolute pace. The network
+    /// window is still eight; pacing gates individual frames, not whole batches.
+    pub async fn publish_journaled_pipeline_paced(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+        pacing: &mut PublicationPacing,
+    ) -> Result<Vec<api::CommittedPublicationResult>>
+    where
+        T::ResponseBody: Unpin,
+    {
+        self.publish_journaled_pipeline_inner(
+            sequences,
+            max_disconnect_retries,
+            PIPELINED_PUBLICATION_WINDOW,
+            Some(pacing),
             #[cfg(feature = "sdk-test-support")]
             None,
         )
@@ -1143,6 +1484,7 @@ where
                 sequences,
                 max_disconnect_retries,
                 window,
+                None,
                 Some(stats.clone()),
             )
             .await?;
@@ -1155,6 +1497,7 @@ where
         sequences: &[u64],
         max_disconnect_retries: usize,
         window: usize,
+        pacing: Option<&mut PublicationPacing>,
         #[cfg(feature = "sdk-test-support")] test_stats: Option<
             std::sync::Arc<std::sync::Mutex<PublicationPipelineTestStats>>,
         >,
@@ -1202,36 +1545,40 @@ where
             publisher.test_stats = test_stats;
         }
         let responses = publisher
-            .publish_all(requests, |request, response| {
-                let published = match &response.outcome {
-                    Some(api::publish_numbered_events_response::Outcome::Published(published)) => {
-                        published
-                    }
-                    Some(api::publish_numbered_events_response::Outcome::Failure(failure)) => {
-                        return Err(NumberedEventSdkError::Protocol(format!(
-                            "sequence {} was rejected: {:?}; intent remains journaled",
-                            request.operation_sequence, failure.reason
-                        )));
-                    }
-                    None => {
+            .publish_all_paced(
+                requests,
+                |request, response| {
+                    let published = match &response.outcome {
+                        Some(api::publish_numbered_events_response::Outcome::Published(
+                            published,
+                        )) => published,
+                        Some(api::publish_numbered_events_response::Outcome::Failure(failure)) => {
+                            return Err(NumberedEventSdkError::Protocol(format!(
+                                "sequence {} was rejected: {:?}; intent remains journaled",
+                                request.operation_sequence, failure.reason
+                            )));
+                        }
+                        None => {
+                            return Err(NumberedEventSdkError::Protocol(
+                                "publication stream omitted its outcome".to_owned(),
+                            ));
+                        }
+                    };
+                    let result = published.result.as_option().ok_or_else(|| {
+                        NumberedEventSdkError::Protocol(
+                            "publication response omitted its committed result".to_owned(),
+                        )
+                    })?;
+                    validate_committed_result(result)?;
+                    if result.operation_sequence != request.operation_sequence {
                         return Err(NumberedEventSdkError::Protocol(
-                            "publication stream omitted its outcome".to_owned(),
+                            "publication response returned a different sequence".to_owned(),
                         ));
                     }
-                };
-                let result = published.result.as_option().ok_or_else(|| {
-                    NumberedEventSdkError::Protocol(
-                        "publication response omitted its committed result".to_owned(),
-                    )
-                })?;
-                validate_committed_result(result)?;
-                if result.operation_sequence != request.operation_sequence {
-                    return Err(NumberedEventSdkError::Protocol(
-                        "publication response returned a different sequence".to_owned(),
-                    ));
-                }
-                self.save_publication_result(state.session, result)
-            })
+                    self.save_publication_result(state.session, result)
+                },
+                pacing,
+            )
             .await?;
         Ok(responses
             .into_iter()
@@ -2221,6 +2568,145 @@ mod tests {
         assert_eq!(session.fill_window(1)[0].logical_key, b"unchanged".to_vec());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn pacing_two_ms_wake_jitter_does_not_accumulate_over_600_events() {
+        let start = tokio::time::Instant::now();
+        let mut pacing = PublicationPacing::new(start, Duration::from_millis(100)).unwrap();
+        for sequence in 1..=600 {
+            let due = start + Duration::from_millis((sequence - 1) * 100);
+            assert_eq!(pacing.ready_at(sequence), due);
+            tokio::time::sleep_until(pacing.ready_at(sequence)).await;
+            tokio::time::advance(Duration::from_millis(2)).await;
+            pacing.sending(sequence).unwrap();
+        }
+        assert_eq!(pacing.max_schedule_lag(), Duration::from_millis(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_ready_time_does_not_move_forward_while_clock_advances() {
+        let start = tokio::time::Instant::now();
+        let mut pacing = PublicationPacing::new(start, Duration::from_millis(100)).unwrap();
+        pacing.sending(1).unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let ready = pacing.ready_at(1);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(
+            pacing.ready_at(1),
+            ready,
+            "replay readiness cannot chase the clock"
+        );
+        assert!(ready <= tokio::time::Instant::now());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacing_recovers_absolute_deadlines_and_keeps_one_second_limit() {
+        let start = tokio::time::Instant::now();
+        let mut pacing = PublicationPacing::new(start, Duration::from_millis(100)).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        pacing.sending(1).unwrap();
+        assert_eq!(pacing.ready_at(2), start + Duration::from_millis(100));
+        tokio::time::sleep_until(pacing.ready_at(2)).await;
+        pacing.sending(2).unwrap();
+        assert_eq!(pacing.max_schedule_lag(), Duration::from_millis(500));
+        for sequence in 3..=7 {
+            let due = start + Duration::from_millis((sequence - 1) * 100);
+            assert_eq!(pacing.ready_at(sequence), due);
+            tokio::time::sleep_until(due).await;
+            pacing.sending(sequence).unwrap();
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(600)
+        );
+        tokio::time::sleep_until(start + Duration::from_millis(1701)).await;
+        assert!(pacing.sending(8).is_err());
+        assert_eq!(pacing.last_sequence, 7, "late intent was not admitted");
+        assert!(pacing.max_schedule_lag() > Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn paced_transport_sends_multiple_frames_and_keeps_due_times_across_rotation() {
+        paced_transport_schedule(
+            Duration::from_millis(200),
+            Duration::from_secs(3),
+            vec![0, 0, 0, 1],
+        )
+        .await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn paced_transport_rotates_while_idle_without_spending_disconnect_budget() {
+        paced_transport_schedule(
+            Duration::from_secs(9),
+            Duration::from_millis(100),
+            vec![1, 1, 1, 1],
+        )
+        .await;
+    }
+
+    #[cfg(feature = "server")]
+    async fn paced_transport_schedule(
+        first: Duration,
+        interval: Duration,
+        expected_sessions: Vec<usize>,
+    ) {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = sessions.clone();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
+                let captured = captured.clone();
+                let session = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    connectrpc::Response::stream_ok(requests.map(move |request| {
+                        let request = request?;
+                        captured.lock().unwrap().push((
+                            session,
+                            request.publication.operation_sequence,
+                            tokio::time::Instant::now(),
+                        ));
+                        Ok(publication_outcome())
+                    }))
+                }
+            },
+        );
+        let router = connectrpc::Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishNumberedEvents",
+            handler,
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 0);
+        let start = tokio::time::Instant::now();
+        let mut pacing = PublicationPacing::new(start + first, interval).unwrap();
+        let requests = (1..=4)
+            .map(|operation_sequence| api::PublishNumberedEventRequest {
+                operation_sequence,
+                ..Default::default()
+            })
+            .collect();
+        publisher
+            .publish_all_paced(requests, |_, _| Ok(()), Some(&mut pacing))
+            .await
+            .unwrap();
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 4);
+        assert_eq!(
+            observed.iter().map(|r| r.0).collect::<Vec<_>>(),
+            expected_sessions
+        );
+        for (index, (_, sequence, at)) in observed.iter().enumerate() {
+            assert_eq!(*sequence, index as u64 + 1);
+            assert_eq!(*at - start, first + interval * index as u32);
+        }
+    }
+
     #[cfg(feature = "server")]
     #[tokio::test]
     async fn numbered_transport_transport_replays_only_sent_unanswered_keys_after_disconnect() {
@@ -2485,9 +2971,215 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_stream_refills_before_previous_window_acknowledgements_finish() {
+        rolling_stream_case(0).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_stream_replays_original_sequence_after_lost_response() {
+        rolling_stream_case(1).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_stream_rotates_at_eight_seconds_without_resetting_schedule() {
+        rolling_stream_case(2).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_stream_unapplied_results_bound_journal_and_fail_pace() {
+        rolling_stream_case(3).await;
+    }
+
+    #[cfg(feature = "server")]
+    async fn rolling_stream_case(mode: u8) {
+        let disconnect = mode == 1;
+        let interval = Duration::from_millis(if mode == 2 { 1100 } else { 100 });
+        let path = journal_path(if disconnect {
+            "rolling-replay"
+        } else {
+            "rolling-refill"
+        });
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_sessions = sessions.clone();
+        let ninth = Arc::new(tokio::sync::Notify::new());
+        let arrived = ninth.clone();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
+                let captured = captured.clone();
+                let arrived = arrived.clone();
+                let session = count_sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    connectrpc::Response::stream_ok(requests.map(move |request| {
+                        let sequence = request?.publication.operation_sequence;
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push((sequence, tokio::time::Instant::now()));
+                        if disconnect && session == 0 && sequence == 2 {
+                            return Err(connectrpc::ConnectError::unavailable("lost receipt"));
+                        }
+                        if sequence == 9 {
+                            arrived.notify_waiters();
+                        }
+                        Ok(api::PublishNumberedEventsResponse {
+                            outcome: Some(
+                                api::publish_numbered_events_response::Outcome::Published(
+                                    Box::new(api::PublishNumberedEventResponse {
+                                        result: result(sequence).into(),
+                                        ..Default::default()
+                                    }),
+                                ),
+                            ),
+                            ..Default::default()
+                        })
+                    }))
+                }
+            },
+        );
+        let ack = connectrpc::handler_fn(
+            move |_ctx, request: api::AcknowledgeEventPublicationResultRequest| {
+                let ninth = ninth.clone();
+                async move {
+                    if (2..=8).contains(&request.operation_sequence) {
+                        ninth.notified().await;
+                    }
+                    Ok(connectrpc::Response::new(
+                        api::AcknowledgeEventPublicationResultResponse::default(),
+                    ))
+                }
+            },
+        );
+        let router = connectrpc::Router::new()
+            .route_bidi_stream(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "PublishNumberedEvents",
+                handler,
+            )
+            .route(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "AcknowledgeEventPublicationResult",
+                ack,
+            );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .write(|state, _| {
+                state.session = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        let (input, receive) = tokio::sync::mpsc::channel(8);
+        let (output, mut results) = tokio::sync::mpsc::channel::<RollingPublication>(8);
+        let start = tokio::time::Instant::now();
+        let mut pacing = PublicationPacing::new(start, interval).unwrap();
+        let application = async {
+            for _ in 0..8 {
+                input.send(intent()).await.unwrap();
+            }
+            let mut count = 0;
+            let mut unapplied = Vec::new();
+            while let Some(publication) = results.recv().await {
+                count += 1;
+                if mode == 3 {
+                    unapplied.push(publication.applied);
+                } else {
+                    publication.applied.send(()).unwrap();
+                }
+                if count == 1 {
+                    input.send(intent()).await.unwrap();
+                }
+                if count == 9 {
+                    break;
+                }
+            }
+            drop(input);
+            assert_eq!(count, if mode == 3 { 8 } else { 9 });
+        };
+        let (published, ()) = tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::join!(
+                sdk.publish_rolling(receive, output, &mut pacing, 1),
+                application
+            )
+        })
+        .await
+        .expect("refill must not wait for acknowledgements 2 through 8");
+        if mode == 3 {
+            assert!(
+                published
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requested pace")
+            );
+            assert!(
+                sdk.journal.entry(9).unwrap().is_none(),
+                "full journal cannot assign ninth intent"
+            );
+            for sequence in 1..=8 {
+                assert!(
+                    sdk.journal
+                        .entry(sequence)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .is_some()
+                );
+            }
+            drop(sdk);
+            std::fs::remove_file(path).unwrap();
+            return;
+        }
+        published.unwrap();
+        if mode == 2 {
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), if disconnect { 10 } else { 9 });
+        if disconnect {
+            assert_eq!(
+                observed.iter().map(|r| r.0).collect::<Vec<_>>(),
+                vec![1, 2, 2, 3, 4, 5, 6, 7, 8, 9]
+            );
+        }
+        for (index, (sequence, at)) in observed.iter().enumerate().filter(|_| !disconnect) {
+            assert_eq!(*sequence, index as u64 + 1);
+            assert_eq!(*at - start, interval * index as u32);
+        }
+        assert!(sdk.journal.entry(9).unwrap().is_none());
+        drop(observed);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn numbered_pipeline_persists_each_response_and_replays_unanswered_sequences() {
-        let path = journal_path("numbered-pipeline-replay");
+        pipeline_replay(false).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn paced_pipeline_persists_each_response_and_replays_original_sequence() {
+        pipeline_replay(true).await;
+    }
+
+    #[cfg(feature = "server")]
+    async fn pipeline_replay(paced: bool) {
+        let path = journal_path(if paced {
+            "paced-pipeline-replay"
+        } else {
+            "numbered-pipeline-replay"
+        });
         PublicationJournal::initialize(&path, b"client").expect("initialize");
         let sessions = Arc::new(Mutex::new(
             Vec::<Vec<api::PublishNumberedEventRequest>>::new(),
@@ -2548,10 +3240,39 @@ mod tests {
         let sequences: Vec<_> = (0..3)
             .map(|_| sdk.journal_publication(intent()).unwrap())
             .collect();
-        assert_eq!(
-            sdk.publish_journaled_pipeline(&sequences, 1).await.unwrap(),
-            vec![result(1), result(2), result(3)]
-        );
+        let results = if paced {
+            let mut pacing = PublicationPacing::new(
+                tokio::time::Instant::now() + Duration::from_millis(100),
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    sdk.publish_journaled_pipeline_paced(&sequences, 1, &mut pacing)
+                )
+                .await
+                .is_err()
+            );
+            assert!(sessions.lock().unwrap().iter().all(Vec::is_empty));
+            sessions.lock().unwrap().clear();
+            for &sequence in &sequences {
+                assert!(
+                    sdk.journal
+                        .entry(sequence)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .is_none()
+                );
+            }
+            sdk.publish_journaled_pipeline_paced(&sequences, 1, &mut pacing)
+                .await
+                .unwrap()
+        } else {
+            sdk.publish_journaled_pipeline(&sequences, 1).await.unwrap()
+        };
+        assert_eq!(results, vec![result(1), result(2), result(3)]);
         assert_eq!(sdk.journal.read_state().unwrap().allocated_through, 3);
         for sequence in sequences {
             assert_eq!(

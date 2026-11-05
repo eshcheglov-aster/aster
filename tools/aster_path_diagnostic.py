@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import os
+import queue
 import re
 from pathlib import Path
 import selectors
@@ -159,11 +160,32 @@ class PublicationWorker(Worker):
         os.set_blocking(self.process.stderr.fileno(), False)
         os.set_blocking(self.process.stdin.fileno(), False)
         os.set_blocking(self.process.stdout.fileno(), False)
+        # Drain independently of writes: a receipt can exceed the OS pipe while
+        # the caller is still filling the eight-item admission window.
+        self.responses = queue.Queue(maxsize=8)
+        self.drainer = threading.Thread(target=self._drain, name='publication-drainer')
+        self.drainer.start()
+
+    def _drain(self):
+        while not self.cancelled.is_set():
+            try:
+                response = self._read_response(timeout=float('inf'))
+            except Exception as error:
+                response = error
+            while not self.cancelled.is_set():
+                try:
+                    self.responses.put(response, timeout=.1)
+                    break
+                except queue.Full:
+                    continue
+            if isinstance(response, Exception):
+                return
 
     def close(self):
         self.cancelled.set()
         if self.process.poll() is None:
             self.process.terminate()
+        self.drainer.join()
         super().close()
         self.process.stderr.close()
 
@@ -177,6 +199,10 @@ class PublicationWorker(Worker):
         raise ValueError('publication worker cancelled')
 
     def call(self, action, timeout=35, **arguments):
+        self.send(action, timeout=timeout, **arguments)
+        return self.read(action, timeout=timeout)
+
+    def send(self, action, timeout=35, **arguments):
         data = json.dumps(dict(action=action, **arguments)).encode() + b'\n'
         if len(data) > 4 * 1024 * 1024:
             raise ValueError('publication request bound exceeded')
@@ -190,7 +216,25 @@ class PublicationWorker(Worker):
                         data = data[os.write(self.process.stdin.fileno(), data):]
                     except BlockingIOError:
                         continue
-            selector.unregister(self.process.stdin)
+
+    def read(self, action='stream-result', timeout=35):
+        deadline = time.monotonic() + timeout
+        while not self.cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('publication IPC deadline')
+            try:
+                response = self.responses.get(timeout=min(.1, remaining))
+            except queue.Empty:
+                continue
+            if isinstance(response, Exception):
+                raise response
+            return response
+        raise ValueError('publication worker cancelled')
+
+    def _read_response(self, action='stream-result', timeout=35):
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
             selector.register(self.process.stdout, selectors.EVENT_READ)
             with TELEMETRY.span('ipc-response', action):
                 while b'\n' not in self.buffer:
@@ -243,6 +287,7 @@ class PacingTelemetry:
         self.lock = threading.Lock()
         self.operations = {}
         self.active = {}
+        self.publication_trace = []
 
     @contextmanager
     def span(self, kind, operation):
@@ -280,7 +325,7 @@ class PacingTelemetry:
         outcomes = outcomes if isinstance(outcomes, dict) else {}
         with self.lock:
             for name in ('startup-recovery', 'journal', 'sdk-publish', 'sdk-ack',
-                         'sdk-recover', 'journal-show', 'sdk-retry'):
+                         'sdk-recover', 'journal-show', 'sdk-retry', 'journal-batch', 'sdk-stream', 'schedule-lag'):
                 seconds = timing.get(name)
                 if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
                     self._observe('sdk:' + name, seconds, outcomes.get(name) == 'error')
@@ -321,7 +366,7 @@ class PacingTelemetry:
                       'active': [{'operation': kind + ':' + operation, 'thread_id': thread_id,
                                   'started_monotonic': at, 'age_seconds': time.monotonic() - at}
                                  for (thread_id, kind, operation), at in self.active.items()],
-                      'resources': resources}
+                      'resources': resources, 'publication_trace': list(self.publication_trace)}
         resources['finished_monotonic'] = time.monotonic()
         resources['observer_snapshot_cpu_seconds'] = time.thread_time() - start_cpu
         return result
@@ -364,9 +409,7 @@ class DiagnosticPublisher(NumberedPublisher):
             self.closed = True
         self._close_session()
 
-    def _run(self, action, options=(), payload=None, *, local=False, json_response=False):
-        if local:
-            return super()._run(action, options, payload, local=True, json_response=json_response)
+    def _call(self, action, **arguments):
         with self.session_lock:
             if self.closed:
                 raise PublicationRpcError('publisher closed; original journal retained')
@@ -378,6 +421,16 @@ class DiagnosticPublisher(NumberedPublisher):
                     '--port', str(self.port), '--timeout', '10', 'publication-worker',
                     '--journal', str(self.journal), '--client-id', self.client_id])
             session = self.session
+        try:
+            return session.call(action, timeout=35, **arguments)
+        except (OSError, ValueError, TimeoutError) as error:
+            self._close_session()
+            raise PublicationRpcError('publication worker failed; original journal retained: ' +
+                                      safe_text(str(error), 400)) from error
+
+    def _run(self, action, options=(), payload=None, *, local=False, json_response=False):
+        if local:
+            return super()._run(action, options, payload, local=True, json_response=json_response)
         arguments = {}
         if action == 'publish':
             values = dict(zip(options[::2], options[1::2]))
@@ -387,13 +440,129 @@ class DiagnosticPublisher(NumberedPublisher):
                 'payload': base64.b64encode(payload).decode()}
         elif options:
             arguments['sequence'] = int(options[1])
+        result = self._call(action, **arguments)
+        return result if json_response else None
+
+    def publish_stream(self, items, rate, due, apply):
+        items = iter(items)
+        expected = {}
+        exhausted = False
+        def refill():
+            nonlocal exhausted
+            if exhausted:
+                return
+            try:
+                key, payload = next(items)
+            except StopIteration:
+                exhausted = True
+                self.session.send('stream-finish')
+                return
+            intent = {'topic': 'mesh.messages', 'scope': 'demo/playground',
+                'priority': 'PRIORITY_ROUTINE', 'logicalKey': base64.b64encode(key).decode(),
+                'payload': base64.b64encode(payload).decode()}
+            if intent['logicalKey'] in expected:
+                raise ValueError('duplicate stream logical key')
+            expected[intent['logicalKey']] = intent
+            self.session.send('stream-item', intent=intent)
+        def accept(intent, result):
+            original = expected.get(intent.get('logicalKey'))
+            if original is None or any(intent.get(k) != v for k, v in original.items()):
+                raise ValueError('stream receipt does not match original intent')
+            identity = canonical_event_id(result['receipt']['eventId'])
+            apply({'id': identity, 'logicalKey': original['logicalKey'], 'payload': original['payload']})
         try:
-            result = session.call(action, timeout=35, **arguments)
-            return result if json_response else None
-        except (OSError, ValueError, TimeoutError) as error:
+            ready = self._call('stream-start', interval_seconds=1 / rate,
+                               first_delay_seconds=due - time.monotonic())
+            if ready != {'ready': True}:
+                raise ValueError('stream did not start')
+            for _ in range(8):
+                refill()
+            while True:
+                response = self.session.read()
+                if response.get('telemetry'):
+                    with TELEMETRY.lock:
+                        TELEMETRY.publication_trace = response.get('publication_trace', [])[-128:]
+                    continue
+                if response.get('finished'):
+                    if expected or not exhausted:
+                        raise ValueError('stream omitted results')
+                    return response['max_schedule_lag_seconds']
+                intent, result = response['intent'], response['publication']
+                accept(intent, result)
+                self.session.send('stream-applied', sequence=int(result['operationSequence']))
+                del expected[intent['logicalKey']]
+                refill()
+        except Exception as failure:
+            failure_snapshot = TELEMETRY.snapshot()
             self._close_session()
-            raise PublicationRpcError('publication worker failed; original journal retained: ' +
-                                      safe_text(str(error), 400)) from error
+            message = safe_text(str(failure), 500)
+            try:
+                report = self._run('publication-recover', json_response=True)
+                for operation in report['operations']:
+                    if operation['state'] == 'committed':
+                        sequence = operation['operationSequence']
+                        intent = self._run('publication-show', ['--sequence', str(sequence)], json_response=True)
+                        # Already-applied results whose ack was uncertain are safe to
+                        # apply idempotently; validate against the original source.
+                        if intent.get('logicalKey') in expected:
+                            accept(intent, operation['result'])
+                        else:
+                            # The original durable journal also retains already
+                            # applied entries whose server ack response was lost.
+                            identity = canonical_event_id(operation['result']['receipt']['eventId'])
+                            apply({'id': identity, 'logicalKey': intent['logicalKey'], 'payload': intent['payload']})
+                        self._run('publication-ack', ['--sequence', str(sequence)])
+            except Exception as error:
+                message += '; recovery failed, journal retained: ' + safe_text(str(error), 400)
+            error = RpcError(message)
+            error.failure_telemetry = failure_snapshot
+            raise error from failure
+
+    def publish_batch(self, items, rate, due, apply):
+        if not 1 <= len(items) <= 8:
+            raise ValueError('publication batch must contain one to eight intents')
+        intents = [{'topic': 'mesh.messages', 'scope': 'demo/playground',
+            'priority': 'PRIORITY_ROUTINE', 'logicalKey': base64.b64encode(key).decode(),
+            'payload': base64.b64encode(payload).decode()} for key, payload in items]
+        expected = {intent['logicalKey']: intent for intent in intents}
+
+        def accept(intent, result, *unused):
+            original = expected.get(intent.get('logicalKey'))
+            if original is None or intent.get('payload') != original['payload']:
+                raise RpcError('recovered publication does not match original batch')
+            identity = canonical_event_id(result['receipt']['eventId'])
+            apply({'id': identity, 'logicalKey': original['logicalKey'], 'payload': original['payload']})
+            return identity
+
+        try:
+            response = self._call('publish-batch', intents=intents, interval_seconds=1 / rate,
+                                  first_delay_seconds=due - time.monotonic())
+            results = response['results']
+            if len(results) != len(intents):
+                raise ValueError('publication batch omitted results')
+            for intent, result in zip(intents, results):
+                accept(intent, result)
+                self._run('publication-ack', ['--sequence', str(result['operationSequence'])])
+            return response['max_schedule_lag_seconds']
+        except (PublicationRpcError, OperatorError, KeyError, TypeError, ValueError) as failure:
+            failure_snapshot = TELEMETRY.snapshot()
+            message = safe_text(str(failure), 500)
+            # Preserve the failed workload even if recovery succeeds. Never assign
+            # replacement sequences. Committed entries may be applied/acknowledged;
+            # unsent pending intents stay durable for explicit operator recovery.
+            try:
+                report = self._run('publication-recover', json_response=True)
+                for operation in report['operations']:
+                    if operation['state'] == 'committed':
+                        sequence = operation['operationSequence']
+                        intent = self._run('publication-show', ['--sequence', str(sequence)], json_response=True)
+                        accept(intent, operation['result'])
+                        self._run('publication-ack', ['--sequence', str(sequence)])
+            except Exception as recovery_error:
+                message += '; recovery failed, original journal retained: ' + safe_text(str(recovery_error), 400)
+            error = RpcError(message)
+            error.failure_telemetry = failure_snapshot
+            raise error from failure
 
     def publish_event(self, key, payload):
         observed = {}
@@ -429,36 +598,45 @@ class DiagnosticPublisher(NumberedPublisher):
 
 
 class PublicationLanes:
+    """One durable SDK owner with a rolling eight-entry journal window."""
     def __init__(self, root=Path('/clab/state')):
         self.root = root
-        self.local = threading.local()
         self.lock = threading.Lock()
-        self.next_lane = 0
-        self.publishers = []
+        self.publisher = None
         self.closed = False
 
     def close(self):
         with self.lock:
             self.closed = True
-            publishers = list(self.publishers)
-        for publisher in publishers:
+            publisher = self.publisher
+        if publisher is not None:
             publisher.close()
 
-    def publish_event(self, key, payload):
-        if not hasattr(self.local, 'publisher'):
-            with self.lock:
-                if self.closed:
-                    raise PublicationRpcError('publication lanes closed')
-                lane = self.next_lane
-                self.next_lane += 1
-                publisher = DiagnosticPublisher(Path('/usr/local/bin/asterctl'),
-                                            self.root / f'diagnostic-publication-{lane}.redb',
-                                            f'path-diagnostic-{lane}')
-                self.publishers.append(publisher)
+    def _get(self):
+        with self.lock:
+            if self.closed:
+                raise PublicationRpcError('publication stream closed')
+            initialize = self.publisher is None
+            if initialize:
+                self.publisher = DiagnosticPublisher(Path('/usr/local/bin/asterctl'),
+                    self.root / 'diagnostic-publication-0.redb', 'path-diagnostic-0')
+            publisher = self.publisher
+        if initialize:
             publisher.initialize()
             publisher.connect('http://127.0.0.1:8181', self.root / 'client.token')
-            self.local.publisher = publisher
-        return self.local.publisher.publish_event(key, payload)
+            # Do not hold the owner lock over IPC: close must cancel startup too.
+            publisher._run('publication-recover', json_response=True)
+        return publisher
+
+    def publish_stream(self, items, rate, due, apply):
+        return self._get().publish_stream(items, rate, due, apply)
+
+    def publish_batch(self, items, rate, due, apply):
+        return self._get().publish_batch(items, rate, due, apply)
+
+    def publish_event(self, key, payload):
+        # Explicit one-off witnesses retain the backward-compatible unary path.
+        return self._get().publish_event(key, payload)
 
 
 def publish_one(client, key, size):
@@ -516,53 +694,37 @@ class Workload:
         self.publisher.start()
 
     def publish_loop(self, prefix, count, rate, size):
-        # Each persistent SDK lane has at most one outstanding publication.
-        # Reserve two of the server's eight unauthenticated slots for the
-        # independent consumer and serialized worker status requests.
-        budget = 6
-        slots = threading.BoundedSemaphore(budget)
+        # One persistent rolling stream, not a finite receipt/ack batch loop.
+        # Eight bounds the durable journal, not unauthenticated connections.
+        def apply(result):
+            with self.lock:
+                if 'rejected' in result:
+                    self.rejected.append(result)
+                else:
+                    self.accepted[result['id']] = result
 
-        def publish(key, due):
-            try:
-                lag = max(0, time.monotonic() - due)
-                with self.lock:
-                    self.max_schedule_lag = max(self.max_schedule_lag, lag)
-                    if lag > 1:
-                        if self.failure_telemetry is None:
-                            self.failure_telemetry = TELEMETRY.snapshot()
-                        self.errors.append('bounded publisher could not maintain requested pace')
+        try:
+            def items():
+                for index in range(count):
+                    if self.stop.is_set():
                         return
-                with TELEMETRY.span('publication', 'complete-lane-cycle'):
-                    result = publish_one(self.publications, key, size)
-                with self.lock:
-                    if 'rejected' in result:
-                        self.rejected.append(result)
-                    else:
-                        self.accepted[result['id']] = result
-            except Exception as error:
-                with self.lock:
-                    self.errors.append(str(error))
-            finally:
-                slots.release()
-
-        with ThreadPoolExecutor(max_workers=budget) as executor:
-            for index in range(count):
-                due = self.started + index / rate
-                if self.stop.wait(max(0, due - time.monotonic())):
-                    break
-                with TELEMETRY.span('scheduler', 'slot-wait'):
-                    admitted = slots.acquire(timeout=max(0, due + 1 - time.monotonic()))
-                if not admitted:
-                    with self.lock:
-                        self.max_schedule_lag = max(self.max_schedule_lag, time.monotonic() - due)
-                        if self.failure_telemetry is None:
-                            self.failure_telemetry = TELEMETRY.snapshot()
-                        self.errors.append('bounded publisher could not maintain requested pace')
-                    break
-                executor.submit(publish, f'{prefix}-{index:06d}', due)
-        with self.lock:
-            self.done = True
-            self.finished = time.monotonic()
+                    key = f'{prefix}-{index:06d}'.encode()
+                    yield key, (key + b':' + b'x' * size)[:size]
+            with TELEMETRY.span('publication', 'rolling-stream'):
+                lag = self.publications.publish_stream(items(), rate, self.started, apply)
+            with self.lock:
+                self.max_schedule_lag = max(self.max_schedule_lag, lag)
+        except Exception as error:
+            with self.lock:
+                if self.failure_telemetry is None:
+                    self.failure_telemetry = getattr(error, 'failure_telemetry', None) or TELEMETRY.snapshot()
+                self.max_schedule_lag = max(self.max_schedule_lag,
+                    self.failure_telemetry['operations'].get('sdk:schedule-lag', {}).get('max_seconds', 0.0))
+                self.errors.append(str(error))
+        finally:
+            with self.lock:
+                self.done = True
+                self.finished = time.monotonic()
 
     def consume_loop(self):
         try:
