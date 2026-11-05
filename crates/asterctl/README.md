@@ -273,6 +273,38 @@ See `asterctl publish --help` or [asterctl-publish(1)](asterctl-publish.1) for
 publication options. Subscription creation retains its existing operation-key
 model until the separate client-ownership increment.
 
+### Persistent publication worker
+
+Workload generators can retain one SDK owner instead of launching a command
+for each publication and acknowledgement:
+
+```sh
+asterctl --token-file ./client.token publication-worker \
+    --journal ./publisher.redb --client-id chat-controller
+```
+
+Initialize the journal first. The worker opens and recovers it once, then reads
+one JSON request per line and flushes one JSON response per request. Its async
+runtime remains active while waiting for input. Requests and responses have a
+4 MiB line bound in the diagnostic adapter; the SDK's smaller Event and journal
+bounds still apply.
+
+Send `{"action":"publish","intent":{"topic":"chat.events","scope":"mission/team","priority":"PRIORITY_ROUTINE","logicalKey":"aw==","payload":"aGVsbG8="}}`.
+The intent uses the numbered-publication ProtoJSON fields (bytes are Base64).
+The worker returns `{"result":{"result":{...},"inserted":true}}` only after
+saving the numbered result. Apply it, then send
+`{"action":"publication-ack","sequence":1}` and wait for `{"result":null}`.
+The worker permits one new intent at a time, until acknowledgement.
+
+After an error, use `{"action":"publication-recover"}`, inspect each retained
+intent with `{"action":"publication-show","sequence":1}`, and retry pending
+work with `{"action":"publication-retry","sequence":1}`. These return recovery
+operations, the original intent and the committed receipt, respectively,
+inside `result`. Errors return `{"error":"..."}`. Never replace uncertain work
+with a newly assigned sequence. Restart a disconnected worker with the same
+journal and identity and recover before continuing. EOF ends the worker;
+termination leaves durable work available for recovery.
+
 ## Query
 
 ```sh

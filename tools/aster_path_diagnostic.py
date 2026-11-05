@@ -23,7 +23,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from aster_lan_mvp import ConnectJsonClient, RpcError, read_token_file, canonical_event_id, OperatorError
-from aster_mesh_playground import NumberedPublisher, RpcError as PublicationRpcError
+from aster_mesh_playground import NumberedPublisher, RpcError as PublicationRpcError, safe_text
 from aster_path_delivery import OwnedDocker, ExecutionError, _run_command, _pinned_docker
 
 LIB = '/usr/local/libexec/aster/'
@@ -114,9 +114,9 @@ def verify_bandwidth(rows, bandwidth_kbit):
 
 class Worker:
     """One persistent nonroot helper per endpoint; bounded line IPC."""
-    def __init__(self, argv):
+    def __init__(self, argv, *, stderr=subprocess.DEVNULL):
         self.process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, bufsize=0)
+                                        stderr=stderr, bufsize=0)
         self.buffer = b''
 
     def call(self, action, timeout=45, **arguments):
@@ -149,6 +149,71 @@ class Worker:
         self.process.stdout.close()
 
 
+class PublicationWorker(Worker):
+    """Bound both IPC directions so cancellation can stop a blocked SDK lane."""
+    def __init__(self, argv):
+        super().__init__(argv, stderr=subprocess.PIPE)
+        self.cancelled = threading.Event()
+        os.set_blocking(self.process.stderr.fileno(), False)
+        os.set_blocking(self.process.stdin.fileno(), False)
+        os.set_blocking(self.process.stdout.fileno(), False)
+
+    def close(self):
+        self.cancelled.set()
+        if self.process.poll() is None:
+            self.process.terminate()
+        super().close()
+        self.process.stderr.close()
+
+    def _ready(self, selector, deadline):
+        while not self.cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('publication IPC deadline')
+            if selector.select(min(.1, remaining)):
+                return
+        raise ValueError('publication worker cancelled')
+
+    def call(self, action, timeout=35, **arguments):
+        data = json.dumps(dict(action=action, **arguments)).encode() + b'\n'
+        if len(data) > 4 * 1024 * 1024:
+            raise ValueError('publication request bound exceeded')
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.process.stdin, selectors.EVENT_WRITE)
+            while data:
+                self._ready(selector, deadline)
+                try:
+                    data = data[os.write(self.process.stdin.fileno(), data):]
+                except BlockingIOError:
+                    continue
+            selector.unregister(self.process.stdin)
+            selector.register(self.process.stdout, selectors.EVENT_READ)
+            while b'\n' not in self.buffer:
+                self._ready(selector, deadline)
+                try:
+                    chunk = os.read(self.process.stdout.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    try:
+                        detail = os.read(self.process.stderr.fileno(), 4096).decode('utf-8', errors='replace')
+                    except BlockingIOError:
+                        detail = ''
+                    raise ValueError('publication worker closed: ' + safe_text(detail, 400))
+                self.buffer += chunk
+                if len(self.buffer) > 4 * 1024 * 1024:
+                    raise ValueError('publication response bound exceeded')
+        line, self.buffer = self.buffer.split(b'\n', 1)
+        response = json.loads(line)
+        if isinstance(response, dict) and isinstance(response.get('error'), str):
+            # asterctl strips untrusted remote text, retaining only SDK stage/code.
+            raise ValueError(safe_text(response['error'], 400))
+        if not isinstance(response, dict) or 'result' not in response:
+            raise ValueError('publication worker rejected request; journal retained')
+        return response['result']
+
+
 def sample(client):
     pid = int(Path('/clab/state/agent.pid').read_text())
     fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
@@ -162,6 +227,58 @@ def sample(client):
 
 class DiagnosticPublisher(NumberedPublisher):
     """One serialized SDK journal per publishing lane, never operation-key replay."""
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.session = None
+        self.closed = False
+        self.session_lock = threading.Lock()
+
+    def connect(self, url, token_path):
+        self._close_session()
+        super().connect(url, token_path)
+
+    def _close_session(self):
+        with self.session_lock:
+            session, self.session = self.session, None
+        if session is not None:
+            session.close()
+
+    def close(self):
+        with self.session_lock:
+            self.closed = True
+        self._close_session()
+
+    def _run(self, action, options=(), payload=None, *, local=False, json_response=False):
+        if local:
+            return super()._run(action, options, payload, local=True, json_response=json_response)
+        with self.session_lock:
+            if self.closed:
+                raise PublicationRpcError('publisher closed; original journal retained')
+            if self.session is None:
+                if self.host is None or self.token_path is None:
+                    raise PublicationRpcError('publisher is not connected')
+                self.session = PublicationWorker([
+                    str(self.cli), '--token-file', str(self.token_path), '--host', self.host,
+                    '--port', str(self.port), '--timeout', '10', 'publication-worker',
+                    '--journal', str(self.journal), '--client-id', self.client_id])
+            session = self.session
+        arguments = {}
+        if action == 'publish':
+            values = dict(zip(options[::2], options[1::2]))
+            arguments['intent'] = {'topic': values['--topic'], 'scope': values['--scope'],
+                'priority': 'PRIORITY_ROUTINE',
+                'logicalKey': base64.b64encode(values['--logical-key'].encode()).decode(),
+                'payload': base64.b64encode(payload).decode()}
+        elif options:
+            arguments['sequence'] = int(options[1])
+        try:
+            result = session.call(action, timeout=35, **arguments)
+            return result if json_response else None
+        except (OSError, ValueError, TimeoutError) as error:
+            self._close_session()
+            raise PublicationRpcError('publication worker failed; original journal retained: ' +
+                                      safe_text(str(error), 400)) from error
+
     def publish_event(self, key, payload):
         observed = {}
 
@@ -188,7 +305,8 @@ class DiagnosticPublisher(NumberedPublisher):
             try:
                 self.recover(apply)
             except Exception as error:
-                raise RpcError('numbered publication outcome unknown; original journal retained') from error
+                raise RpcError('numbered publication outcome unknown; original journal retained: ' +
+                               safe_text(str(error), 500)) from error
             if not observed:
                 raise RpcError('numbered publication outcome unknown; original journal retained')
         return observed
@@ -200,15 +318,27 @@ class PublicationLanes:
         self.local = threading.local()
         self.lock = threading.Lock()
         self.next_lane = 0
+        self.publishers = []
+        self.closed = False
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            publishers = list(self.publishers)
+        for publisher in publishers:
+            publisher.close()
 
     def publish_event(self, key, payload):
         if not hasattr(self.local, 'publisher'):
             with self.lock:
+                if self.closed:
+                    raise PublicationRpcError('publication lanes closed')
                 lane = self.next_lane
                 self.next_lane += 1
-            publisher = DiagnosticPublisher(Path('/usr/local/bin/asterctl'),
+                publisher = DiagnosticPublisher(Path('/usr/local/bin/asterctl'),
                                             self.root / f'diagnostic-publication-{lane}.redb',
                                             f'path-diagnostic-{lane}')
+                self.publishers.append(publisher)
             publisher.initialize()
             publisher.connect('http://127.0.0.1:8181', self.root / 'client.token')
             self.local.publisher = publisher
@@ -269,7 +399,7 @@ class Workload:
         self.publisher.start()
 
     def publish_loop(self, prefix, count, rate, size):
-        # Each synchronous CLI lane has at most one outstanding connection.
+        # Each persistent SDK lane has at most one outstanding publication.
         # Reserve two of the server's eight unauthenticated slots for the
         # independent consumer and serialized worker status requests.
         budget = 6
@@ -337,6 +467,8 @@ class Workload:
 
     def close(self):
         self.stop.set()
+        if isinstance(self.publications, PublicationLanes):
+            self.publications.close()
         self.publisher.join(10)
         self.consumer.join(10)
         if self.publisher.is_alive() or self.consumer.is_alive():
@@ -364,74 +496,79 @@ def worker_main():
     subscription = None
     workload = None
     publications = PublicationLanes()
-    while True:
-        line = sys.stdin.readline(16385)
-        if not line:
-            break
-        if len(line) > 16384:
-            raise ValueError('worker request bound exceeded')
-        try:
-            request = json.loads(line)
-            action = request['action']
-            if action == 'status':
-                result = sample(client)
-            elif action == 'subscribe':
-                if subscription is not None:
-                    raise ValueError('consumer already initialized')
-                client = DeliveryClient(client)
-                subscription = client.subscribe(b'path-diagnostic', 'mesh.messages', 'demo/playground')['subscriptionId']
-                result = subscription
-            elif action == 'publish':
-                result = publish_one(publications, request['key'], request['size'])
-            elif action == 'start-workload':
-                if workload is not None:
-                    raise ValueError('workload already started')
-                workload = Workload(client, subscription, request['prefix'], request['count'], request['rate'], request['size'], publications)
-                result = {'started': workload.started}
-            elif action == 'progress':
-                result = workload.snapshot()
-            elif action == 'end-workload':
-                workload.close()
-                result = workload.snapshot()
-            elif action == 'poll':
-                result = []
-                response = client.call('PollEvents', {'subscriptionId': subscription,
-                                                     'deliveryLimit': 128, 'scanLimit': 1024})
-                for delivery in response.get('deliveries', []):
-                    event = delivery['event']
-                    result.append(event)
-                    client.call('AcknowledgeEvent', {'subscriptionId': subscription, 'eventId': event['id']})
-            elif action == 'query-witness':
-                events, _ = client.query_events('mesh.messages', 'demo/playground', request['key'].encode())
-                result = any(event['id'] == request['identity'] for event in events)
-            elif action == 'query':
-                result = query_all(client, request['maximum'])
-            elif action == 'stop':
-                if workload is not None:
+    try:
+        while True:
+            line = sys.stdin.readline(16385)
+            if not line:
+                break
+            if len(line) > 16384:
+                raise ValueError('worker request bound exceeded')
+            try:
+                request = json.loads(line)
+                action = request['action']
+                if action == 'status':
+                    result = sample(client)
+                elif action == 'subscribe':
+                    if subscription is not None:
+                        raise ValueError('consumer already initialized')
+                    client = DeliveryClient(client)
+                    subscription = client.subscribe(b'path-diagnostic', 'mesh.messages', 'demo/playground')['subscriptionId']
+                    result = subscription
+                elif action == 'publish':
+                    result = publish_one(publications, request['key'], request['size'])
+                elif action == 'start-workload':
+                    if workload is not None:
+                        raise ValueError('workload already started')
+                    workload = Workload(client, subscription, request['prefix'], request['count'], request['rate'], request['size'], publications)
+                    result = {'started': workload.started}
+                elif action == 'progress':
+                    result = workload.snapshot()
+                elif action == 'end-workload':
                     workload.close()
-                pid = int(Path('/clab/state/agent.pid').read_text())
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                wait_stopped(pid)
-                result = {'stopped_pid': pid}
-            elif action == 'peerless':
-                spec = importlib.util.spec_from_file_location('delivery_agent', LIB + 'delivery-agent.py')
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                argv = module.agent_argv(request['role'])
-                while '--peer' in argv:
-                    index = argv.index('--peer')
-                    del argv[index:index + 2]
-                process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                Path('/clab/state/agent.pid').write_text(str(process.pid))
-                result = {'pid': process.pid, 'argv': argv}
-            else:
-                raise ValueError('unknown helper action')
-            print(json.dumps({'result': result}, separators=(',', ':')), flush=True)
-        except Exception as error:
-            print(json.dumps({'error': str(error)}), flush=True)
+                    result = workload.snapshot()
+                elif action == 'poll':
+                    result = []
+                    response = client.call('PollEvents', {'subscriptionId': subscription,
+                                                         'deliveryLimit': 128, 'scanLimit': 1024})
+                    for delivery in response.get('deliveries', []):
+                        event = delivery['event']
+                        result.append(event)
+                        client.call('AcknowledgeEvent', {'subscriptionId': subscription, 'eventId': event['id']})
+                elif action == 'query-witness':
+                    events, _ = client.query_events('mesh.messages', 'demo/playground', request['key'].encode())
+                    result = any(event['id'] == request['identity'] for event in events)
+                elif action == 'query':
+                    result = query_all(client, request['maximum'])
+                elif action == 'stop':
+                    if workload is not None:
+                        workload.close()
+                    pid = int(Path('/clab/state/agent.pid').read_text())
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    wait_stopped(pid)
+                    result = {'stopped_pid': pid}
+                elif action == 'peerless':
+                    spec = importlib.util.spec_from_file_location('delivery_agent', LIB + 'delivery-agent.py')
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    argv = module.agent_argv(request['role'])
+                    while '--peer' in argv:
+                        index = argv.index('--peer')
+                        del argv[index:index + 2]
+                    process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    Path('/clab/state/agent.pid').write_text(str(process.pid))
+                    result = {'pid': process.pid, 'argv': argv}
+                else:
+                    raise ValueError('unknown helper action')
+                print(json.dumps({'result': result}, separators=(',', ':')), flush=True)
+            except Exception as error:
+                print(json.dumps({'error': str(error)}), flush=True)
+    finally:
+        publications.close()
+        if workload is not None:
+            workload.close()
 
 
 class OutageRestoration:

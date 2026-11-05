@@ -117,6 +117,15 @@ Publish requires the same journal and stable identity. Recover uncertain work
 with publication-recover and publication-retry. Acknowledge applied results
 with publication-ack. Retry, acknowledgement, and explicit publication-abandon
 take \-\-sequence N. Initialization is local and requires no token.
+.PP
+Publication-worker retains one SDK owner for workload generators. It opens and
+recovers the journal once, then accepts newline-delimited JSON requests on stdin
+and flushes one JSON response per request. Requests name an action: publish
+(with a ProtoJSON intent), publication-recover, publication-show,
+publication-retry, or publication-ack (the last three take a numeric sequence).
+Responses contain result or error. Apply and acknowledge each result before
+publishing another intent. Recover original sequences after uncertainty;
+EOF exits without abandoning retained work. See the CLI README for IPC examples.
 .SH OPERATION KEYS
 Blob-publish and subscribe require
 .BR "\-\-operation\-key KEY|auto" .

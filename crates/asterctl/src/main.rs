@@ -8,6 +8,7 @@ mod journal;
 mod operation_key;
 mod output;
 mod progress;
+mod publication_worker;
 mod publish;
 mod query;
 mod subscribe;
@@ -137,6 +138,12 @@ fn run() -> Result<(), (u8, String)> {
             let rpc = RpcContext::new(options)?;
             let sdk = client::publication_sdk(rpc.address, &rpc.token, rpc.timeout, &identity)
                 .map_err(|e| (1, e))?;
+            if action == journal::Action::Worker {
+                return rpc
+                    .runtime
+                    .block_on(publication_worker::serve(sdk))
+                    .map_err(|e| (1, e));
+            }
             rpc.runtime.block_on(async {
                 if action == journal::Action::Show {
                     let intent = sdk.journaled_intent(sequence.expect("validated sequence")).map_err(journal::describe_error)?.ok_or_else(|| "sequence has no retained journaled intent".to_owned())?;
@@ -171,6 +178,7 @@ fn run() -> Result<(), (u8, String)> {
                     journal::Action::Show => unreachable!("local inspection already returned"),
                     journal::Action::ClientStatus => unreachable!("read-only status already returned"),
                     journal::Action::Initialize => unreachable!("initialization does not use RPC"),
+                    journal::Action::Worker => unreachable!("worker already dispatched"),
                 }
             }).map_err(|e| (1, e))?
         }

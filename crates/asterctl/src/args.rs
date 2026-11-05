@@ -23,6 +23,7 @@ COMMANDS:
   status            Display node status (default)
   publish           Publish a journaled numbered Event
   publication-init  Create a new journal; --journal PATH --client-id ID
+  publication-worker  Serve numbered publication JSON lines with one SDK owner
   client-status     Observe Event client ownership without takeover
   publication-recover  Recover journaled operations
   publication-show  Inspect one original journaled intent; --sequence N
@@ -174,6 +175,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             "publication-init"
             | "publication-show"
+            | "publication-worker"
             | "publication-recover"
             | "publication-retry"
             | "publication-abandon"
@@ -191,6 +193,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && journal_action.is_none() =>
             {
                 journal_action = Some(match name {
+                    "publication-worker" => crate::journal::Action::Worker,
                     "publication-init" => crate::journal::Action::Initialize,
                     "client-status" => crate::journal::Action::ClientStatus,
                     "publication-recover" => crate::journal::Action::Recover,
@@ -560,6 +563,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             action,
             crate::journal::Action::Initialize
                 | crate::journal::Action::Recover
+                | crate::journal::Action::Worker
                 | crate::journal::Action::ClientStatus
         ) {
             if sequence.is_some() {

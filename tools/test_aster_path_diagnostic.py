@@ -96,6 +96,92 @@ class DeliveryOwnershipTests(unittest.TestCase):
 
 
 class NumberedPublicationTests(unittest.TestCase):
+    def test_worker_startup_error_is_retained(self):
+        worker = diagnostic.PublicationWorker([sys.executable, '-u', '-c',
+            'import sys; print("asterctl: publication journal unavailable",file=sys.stderr); sys.exit(1)'])
+        try:
+            with self.assertRaisesRegex(ValueError, 'journal unavailable'):
+                worker.call('publication-recover')
+        finally:
+            worker.close()
+
+    def test_sdk_rejection_keeps_sanitized_error_code(self):
+        worker = diagnostic.PublicationWorker([sys.executable, '-u', '-c',
+            'import sys,json; sys.stdin.readline(); print(json.dumps({"error":"Numbered publication failed (invalid_argument)"}))'])
+        try:
+            with self.assertRaisesRegex(ValueError, 'invalid_argument'):
+                worker.call('publication-recover')
+        finally:
+            worker.close()
+
+    def test_worker_intent_preserves_one_shot_publication_defaults(self):
+        class Session:
+            def call(self, action, **arguments):
+                return arguments['intent']
+        publisher = diagnostic.DiagnosticPublisher(Path('unused'), Path('unused'), 'client')
+        publisher.session = Session()
+        intent = publisher._run('publish', ['--topic', 'mesh.messages', '--scope', 'demo/playground',
+            '--logical-key', 'k'], b'p', json_response=True)
+        self.assertEqual(intent, {'topic':'mesh.messages', 'scope':'demo/playground',
+            'logicalKey':'aw==', 'payload':'cA==', 'priority':'PRIORITY_ROUTINE'})
+
+    def test_shutdown_cancels_blocked_publication_and_prevents_restart(self):
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            cli = Path(directory) / 'cli'
+            cli.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n')
+            cli.chmod(0o700)
+            publisher = diagnostic.DiagnosticPublisher(cli, Path(directory) / 'journal', 'client')
+            publisher.connect('http://127.0.0.1:8181', Path(directory) / 'token')
+            errors = []
+            def blocked():
+                try:
+                    publisher.publish_event(b'key', b'x' * 100000)
+                except diagnostic.RpcError as error:
+                    errors.append(error)
+            thread = threading.Thread(target=blocked)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while publisher.session is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            process = publisher.session.process
+            started = time.monotonic()
+            publisher.close()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertIsNotNone(process.poll())
+            self.assertEqual(len(errors), 1)
+            with self.assertRaises(diagnostic.PublicationRpcError):
+                publisher._run('publication-recover')
+
+    def test_persistent_lane_reuses_process_and_closes_on_reconnect(self):
+        # Real subprocess/IPC adapter, with only the SDK peer replaced by a
+        # deterministic protocol fixture. Rust tests exercise the actual SDK.
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            cli = Path(directory) / 'cli'
+            cli.write_text('#!/usr/bin/env python3\nimport sys,json,os\n'
+                'if "publication-worker" not in sys.argv:\n'
+                ' print(json.dumps({"pid":os.getpid()})); sys.exit(0)\n'
+                'for line in sys.stdin:\n'
+                ' print(json.dumps({"result":{"pid":os.getpid()}}),flush=True)\n')
+            cli.chmod(0o700)
+            publisher = diagnostic.DiagnosticPublisher(cli, Path(directory) / 'journal', 'client')
+            publisher.connect('http://127.0.0.1:8181', Path(directory) / 'token')
+            first = publisher._run('publication-recover', json_response=True)
+            second = publisher._run('publication-recover', json_response=True)
+            self.assertEqual(first['pid'], second['pid'])
+            publisher.connect('http://127.0.0.1:8182', Path(directory) / 'token')
+            with self.assertRaises(ProcessLookupError):
+                os.kill(first['pid'], 0)
+            third = publisher._run('publication-recover', json_response=True)
+            self.assertNotEqual(first['pid'], third['pid'])
+            publisher.close()
+            with self.assertRaises(ProcessLookupError):
+                os.kill(third['pid'], 0)
+
     def test_lost_response_recovers_original_intent_without_new_publication(self):
         calls = []
         publisher = diagnostic.DiagnosticPublisher.__new__(diagnostic.DiagnosticPublisher)
