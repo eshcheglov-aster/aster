@@ -146,6 +146,7 @@ pub struct PublicationPacing {
     last_send: Option<tokio::time::Instant>,
     last_sequence: u64,
     max_lag: Duration,
+    benchmark_end: Option<tokio::time::Instant>,
 }
 
 impl PublicationPacing {
@@ -163,7 +164,30 @@ impl PublicationPacing {
             last_send: None,
             last_sequence: 0,
             max_lag: Duration::ZERO,
+            benchmark_end: None,
         })
+    }
+
+    /// Duration measurement: record lag, skip missed schedule slots, and stop
+    /// new frames at `end`. Existing sequence replays retain their identities.
+    pub fn benchmark(
+        first_due: tokio::time::Instant,
+        interval: Duration,
+        end: tokio::time::Instant,
+    ) -> Result<Self> {
+        if end <= first_due {
+            return Err(NumberedEventSdkError::Protocol(
+                "invalid benchmark interval".into(),
+            ));
+        }
+        let mut pacing = Self::new(first_due, interval)?;
+        pacing.benchmark_end = Some(end);
+        Ok(pacing)
+    }
+
+    fn expired(&self) -> bool {
+        self.benchmark_end
+            .is_some_and(|end| tokio::time::Instant::now() >= end)
     }
 
     pub fn trace(&self) -> &VecDeque<PublicationTrace> {
@@ -199,14 +223,23 @@ impl PublicationPacing {
     fn sending(&mut self, sequence: u64) -> Result<()> {
         let now = tokio::time::Instant::now();
         if sequence > self.last_sequence {
+            if self.expired() {
+                return Err(NumberedEventSdkError::Protocol(
+                    "benchmark admission ended".into(),
+                ));
+            }
             let lag = now.saturating_duration_since(self.next_due);
             self.max_lag = self.max_lag.max(lag);
-            if lag > Duration::from_secs(1) {
+            if self.benchmark_end.is_none() && lag > Duration::from_secs(1) {
                 return Err(NumberedEventSdkError::Protocol(
                     "bounded publisher could not maintain requested pace".to_owned(),
                 ));
             }
-            self.next_due += self.interval;
+            self.next_due = if self.benchmark_end.is_some() {
+                now + self.interval
+            } else {
+                self.next_due + self.interval
+            };
             self.last_sequence = sequence;
         }
         self.last_send = Some(now);
@@ -219,7 +252,9 @@ impl PublicationPacing {
 /// dropping it stops the stream without acknowledging the original journal row.
 pub struct RollingPublication {
     pub intent: api::PublishNumberedEventRequest,
-    pub result: api::CommittedPublicationResult,
+    /// Only benchmark pacing emits definite capacity rejections. Applying one
+    /// authorizes abandonment of that original sequence, never a replacement.
+    pub result: std::result::Result<api::CommittedPublicationResult, api::PublicErrorDetail>,
     pub applied: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -1280,7 +1315,7 @@ where
         let mut outstanding = 0;
         let mut source_closed = false;
         let mut disconnects = 0;
-        loop {
+        'sessions: loop {
             pacing.observe("open-start", 0);
             let mut stream = self.client.publish_numbered_events().await?;
             pacing.observe("open-finish", 0);
@@ -1293,13 +1328,26 @@ where
                     return Ok(());
                 }
                 let now = tokio::time::Instant::now();
+                if pacing.expired() {
+                    // Unsent assigned intents stay durable, never reidentified
+                    // or acknowledged. Only previously sent frames may replay.
+                    input.close();
+                    source_closed = true;
+                    let before = pending.len();
+                    pending.retain(|request| request.operation_sequence <= pacing.last_sequence);
+                    outstanding -= before - pending.len();
+                    if outstanding == 0 {
+                        stream.close_send();
+                        return Ok(());
+                    }
+                }
                 let backlog = !input.is_empty()
                     || pending
                         .iter()
                         .any(|request| request.operation_sequence > pacing.last_sequence);
                 let admission_deadline =
                     pacing.next_due + Duration::from_secs(1) + Duration::from_nanos(1);
-                if backlog && now >= admission_deadline {
+                if pacing.benchmark_end.is_none() && backlog && now >= admission_deadline {
                     pacing.sending(pacing.last_sequence + 1)?;
                 }
                 if now >= deadline {
@@ -1345,8 +1393,13 @@ where
                     .map(|request| pacing.ready_at(request.operation_sequence))
                     .unwrap_or(deadline)
                     .min(deadline);
-                let wake = if backlog {
+                let wake = if backlog && pacing.benchmark_end.is_none() {
                     wake.min(admission_deadline)
+                } else {
+                    wake
+                };
+                let wake = if !source_closed {
+                    pacing.benchmark_end.map_or(wake, |end| wake.min(end))
                 } else {
                     wake
                 };
@@ -1386,6 +1439,28 @@ where
                         let result = match response.outcome {
                             Some(api::publish_numbered_events_response::Outcome::Published(published)) =>
                                 published.result.into_option().ok_or_else(|| NumberedEventSdkError::Protocol("publication omitted result".into()))?,
+                            Some(api::publish_numbered_events_response::Outcome::Failure(failure))
+                                if pacing.benchmark_end.is_some()
+                                    && failure.operation == "publish_numbered_events"
+                                    && (failure.reason == api::PublicErrorReason::ResourceExhaustion
+                                        || failure.reason == api::PublicErrorReason::OperationCapacityExhausted) => {
+                                let sequence = request.operation_sequence;
+                                pacing.observe("rejected", sequence);
+                                let (applied, application) = tokio::sync::oneshot::channel();
+                                output.try_send(RollingPublication { intent: request.clone(), result: Err(*failure), applied })
+                                    .map_err(|_| NumberedEventSdkError::Protocol("application result channel closed or full; journal retained".into()))?;
+                                application.await.map_err(|_| NumberedEventSdkError::Protocol("application did not apply rejection; journal retained".into()))?;
+                                // Later frames may have received SequenceGap. Discard
+                                // this stream and replay their exact original identities
+                                // after the rejected sequence is durably retired.
+                                drop(stream);
+                                self.abandon(sequence).await?;
+                                pacing.observe("abandoned", sequence);
+                                pending.pop_front();
+                                outstanding -= 1;
+                                disconnects = 0;
+                                continue 'sessions;
+                            }
                             _ => return Err(NumberedEventSdkError::Protocol("publication rejected; original intent retained".into())),
                         };
                         validate_committed_result(&result)?;
@@ -1399,7 +1474,7 @@ where
                         sent -= 1;
                         let sequence = result.operation_sequence;
                         let (applied, application) = tokio::sync::oneshot::channel();
-                        output.try_send(RollingPublication { intent, result, applied })
+                        output.try_send(RollingPublication { intent, result: Ok(result), applied })
                             .map_err(|_| NumberedEventSdkError::Protocol("application result channel closed or full; journal retained".into()))?;
                         acknowledgements.push(async move {
                             application.await.map_err(|_| NumberedEventSdkError::Protocol("application did not apply result; journal retained".into()))?;
@@ -2569,6 +2644,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn benchmark_pacing_records_lag_without_catchup_and_stops_at_deadline() {
+        let start = tokio::time::Instant::now();
+        let end = start + Duration::from_secs(5);
+        let mut pacing =
+            PublicationPacing::benchmark(start, Duration::from_millis(100), end).unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        pacing.sending(1).unwrap();
+        assert_eq!(pacing.max_schedule_lag(), Duration::from_secs(2));
+        assert_eq!(pacing.ready_at(2), start + Duration::from_millis(2100));
+        assert!(!pacing.expired());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(pacing.expired());
+        assert!(pacing.sending(2).is_err());
+        assert_eq!(pacing.last_sequence, 1);
+        // Original-sequence replay remains legal during the bounded drain.
+        pacing.sending(1).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pacing_two_ms_wake_jitter_does_not_accumulate_over_600_events() {
         let start = tokio::time::Instant::now();
         let mut pacing = PublicationPacing::new(start, Duration::from_millis(100)).unwrap();
@@ -2995,6 +3089,38 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_benchmark_cutoff_keeps_unsent_originals_and_settles_sent_results() {
+        rolling_stream_case(4).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_benchmark_capacity_rejection_continues_original_sequences() {
+        rolling_stream_case(5).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_benchmark_repeated_quota_runs_to_cutoff() {
+        rolling_stream_case(6).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_benchmark_does_not_suppress_other_failures() {
+        for mode in 7..=10 {
+            rolling_stream_case(mode).await;
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn rolling_benchmark_operation_capacity_continues() {
+        rolling_stream_case(11).await;
+    }
+
+    #[cfg(feature = "server")]
     async fn rolling_stream_case(mode: u8) {
         let disconnect = mode == 1;
         let interval = Duration::from_millis(if mode == 2 { 1100 } else { 100 });
@@ -3028,6 +3154,27 @@ mod tests {
                         if sequence == 9 {
                             arrived.notify_waiters();
                         }
+                        if mode >= 5 && (sequence == 1 || mode == 6) {
+                            return Ok(api::PublishNumberedEventsResponse {
+                                outcome: Some(
+                                    api::publish_numbered_events_response::Outcome::Failure(
+                                        Box::new(api::PublicErrorDetail {
+                                            reason: match mode {
+                                                7 => api::PublicErrorReason::MalformedInput,
+                                                8 => api::PublicErrorReason::StateUnavailable,
+                                                9 => api::PublicErrorReason::AuthenticationFailed,
+                                                11 => api::PublicErrorReason::OperationCapacityExhausted,
+                                                _ => api::PublicErrorReason::ResourceExhaustion,
+                                            }.into(),
+                                            operation: if mode == 10 { "wrong_operation" } else { "publish_numbered_events" }.into(),
+                                            retryable: true,
+                                            ..Default::default()
+                                        }),
+                                    ),
+                                ),
+                                ..Default::default()
+                            });
+                        }
                         Ok(api::PublishNumberedEventsResponse {
                             outcome: Some(
                                 api::publish_numbered_events_response::Outcome::Published(
@@ -3047,7 +3194,7 @@ mod tests {
             move |_ctx, request: api::AcknowledgeEventPublicationResultRequest| {
                 let ninth = ninth.clone();
                 async move {
-                    if (2..=8).contains(&request.operation_sequence) {
+                    if mode != 4 && (2..=8).contains(&request.operation_sequence) {
                         ninth.notified().await;
                     }
                     Ok(connectrpc::Response::new(
@@ -3066,6 +3213,18 @@ mod tests {
                 api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
                 "AcknowledgeEventPublicationResult",
                 ack,
+            )
+            .route(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "AbandonEventPublication",
+                connectrpc::handler_fn(
+                    |_ctx, request: api::AbandonEventPublicationRequest| async move {
+                        assert!((1..=3).contains(&request.operation_sequence));
+                        Ok(connectrpc::Response::new(
+                            api::AbandonEventPublicationResponse::default(),
+                        ))
+                    },
+                ),
             );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
@@ -3082,7 +3241,14 @@ mod tests {
         let (input, receive) = tokio::sync::mpsc::channel(8);
         let (output, mut results) = tokio::sync::mpsc::channel::<RollingPublication>(8);
         let start = tokio::time::Instant::now();
-        let mut pacing = PublicationPacing::new(start, interval).unwrap();
+        let mut pacing = if mode >= 5 && mode != 6 {
+            PublicationPacing::benchmark(start, interval, start + Duration::from_secs(2)).unwrap()
+        } else if mode == 4 || mode == 6 {
+            PublicationPacing::benchmark(start, interval, start + Duration::from_millis(250))
+                .unwrap()
+        } else {
+            PublicationPacing::new(start, interval).unwrap()
+        };
         let application = async {
             for _ in 0..8 {
                 input.send(intent()).await.unwrap();
@@ -3091,12 +3257,16 @@ mod tests {
             let mut unapplied = Vec::new();
             while let Some(publication) = results.recv().await {
                 count += 1;
+                assert_eq!(
+                    publication.result.is_err(),
+                    (mode == 5 || mode == 11) && count == 1 || mode == 6
+                );
                 if mode == 3 {
                     unapplied.push(publication.applied);
                 } else {
                     publication.applied.send(()).unwrap();
                 }
-                if count == 1 {
+                if count == 1 && mode != 4 {
                     input.send(intent()).await.unwrap();
                 }
                 if count == 9 {
@@ -3104,7 +3274,18 @@ mod tests {
                 }
             }
             drop(input);
-            assert_eq!(count, if mode == 3 { 8 } else { 9 });
+            assert_eq!(
+                count,
+                if mode == 3 {
+                    8
+                } else if mode == 4 || mode == 6 {
+                    3
+                } else if (7..=10).contains(&mode) {
+                    0
+                } else {
+                    9
+                }
+            );
         };
         let (published, ()) = tokio::time::timeout(Duration::from_secs(12), async {
             tokio::join!(
@@ -3139,7 +3320,28 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             return;
         }
+        if (7..=10).contains(&mode) {
+            assert!(matches!(published, Err(NumberedEventSdkError::Protocol(_))));
+            assert!(sdk.journal.entry(1).unwrap().unwrap().result.is_none());
+            drop(sdk);
+            std::fs::remove_file(path).unwrap();
+            return;
+        }
         published.unwrap();
+        if mode == 4 || mode == 6 {
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 3);
+            assert!(
+                observed
+                    .iter()
+                    .all(|(_, at)| *at < start + Duration::from_millis(250))
+            );
+            assert!(sdk.journal.entry(1).unwrap().is_none());
+            assert!(sdk.journal.entry(4).unwrap().unwrap().result.is_none());
+            drop(sdk);
+            std::fs::remove_file(path).unwrap();
+            return;
+        }
         if mode == 2 {
             assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 2);
         }

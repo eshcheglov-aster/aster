@@ -58,6 +58,7 @@ run = [
   "python3 tools/test_aster_path_lab.py",
   "python3 tools/aster_path_lab.py docker/path-lab/scenarios/netem-readback-smoke.json",
   "python3 tools/test_aster_path_delivery.py",
+  "python3 tools/test_aster_benchmark.py",
   "python3 tools/test_aster_path_diagnostic.py",
   "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json",
   "sh -n docker/lan-scale/init-state.sh",

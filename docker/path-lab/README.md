@@ -13,30 +13,40 @@ four independent two-agent workloads by default, with 2..20 agents supported:
 | reorder | The impaired profile plus 10% reordering |
 | outage | Baseline, then 100% loss for 10 seconds starting after 20 seconds |
 
-Each endpoint attempts 600 durable 1-KiB Events at 10 Events/second, continuously
-polls and acknowledges deliveries, and requires every admitted Event's exact ID,
-logical key and payload at every other agent. All agents publish and configure
-all other agents as peers, with one routed WAN segment per agent. Each publishing lane owns a durable SDK
-journal and stable client identity. Lost replies are recovered through the
-numbered session and original journaled intent, never a new publication. The
-CLI does not expose structured capacity-rejection details, so resource
-exhaustion alone is not counted as a definite rejection; unresolved outcomes
-fail the run. Journals remain available to the helper's recovery path during the
-run; final owned-state cleanup removes them together with the disposable mission
-credentials, including on failure. Retained receipts are not resumable journals.
-Each agent uses one publication stream with at most eight outstanding journal
-entries, alongside an independent consumer and controller. This is not a
-server-socket count: connection teardown may overlap. Send-admission lag must stay
-within one second of the original scheduled time; insufficient CPU/rate capacity
-fails rather than quietly reducing the requested load.
-A run with no admitted Events cannot pass. The outage publishes
-new witness Events only after all 100%-loss qdiscs are read back, checks them
-absent at every other agent before restoration, and allows 120 seconds after restoration
-for delivery. Restoration is armed after the loss replacements, before qdisc
-readback; late or failed readback cannot extend the timer or establish negative
-witness evidence. All interface change times are retained. Finally all agents
-stop, reopen **without peers**, with WAN still
-cut, and query every accepted Event using bounded advancing pagination.
+Each endpoint offers durable 1-KiB Events at 10 Events/second for 60 seconds
+by default. Use `--events-per-second max` for unpaced publication. All agents
+publish and configure all other agents as peers, with one routed WAN segment
+per agent. Consumers poll and acknowledge deliveries alongside the publishers.
+
+The benchmark starts after initial SDK recovery. One monotonic interval bounds
+new publications; already sent operations can settle during the bounded delivery
+observation window. Backpressure reduces the measured rate without a one-second
+lag failure or a catch-up burst. The eight-entry durable journal window, stream
+rotation, original-sequence replay, authentication and acknowledgement rules remain.
+
+The report separates attempts submitted by the generator, accepted responses
+observed during the interval, later accepted responses, definite rejections and
+unknown outcomes. Unknown includes queued submissions without a confirmed result
+at cutoff, not just transmitted requests. Actual Events/s divides accepted-during
+by the configured duration. In duration mode, structured resource-exhaustion and
+operation-capacity rejections are counted and the interval continues. After the
+application records a rejection, the SDK durably abandons that original sequence
+and replays any later outstanding intents unchanged. Malformed, authentication,
+infrastructure and transport failures remain explicit run errors, never inferred
+rejections. A completed run has no throughput or delivery pass/fail threshold.
+Content mismatches, agent failures, cleanup and provenance errors produce nonzero exits.
+
+Delivery observation ends at publication end plus `--restore-deadline-seconds`,
+including for outage runs. Each agent's unique deliveries and missing accepted
+Events use that cutoff. The duration outage profile applies and restores loss
+while ordinary workload Events continue; it does not inject separate witness
+publications into the active SDK stream. Finally agents stop and reopen without
+peers, with WAN cut, to check retained contents. Cleanup removes disposable
+credentials and journals; telemetry artifacts are not resumable journals.
+
+`--events-per-agent` retains the legacy count-driven correctness diagnostic,
+including its one-second pacing failure and outage witnesses. Do not combine
+that option with `max`; the manual Actions form uses duration mode only.
 
 ```sh
 docker build --file docker/path-lab/Dockerfile.delivery \
@@ -48,12 +58,12 @@ python3 tools/test_aster_path_diagnostic.py
 ### Workload and resource controls
 
 ```sh
-# Five agents, each publishing 100 Events over ten seconds.
+# Five agents offering 10 Events/s each for 60 seconds.
 python3 tools/aster_path_diagnostic.py --output artifacts/scale-5 \
-  --agents 5 --events-per-agent 100 --profiles baseline
-# 10,000 Events per agent, with CPU and RAM constrained per container.
+  --agents 5 --duration-seconds 60 --profiles baseline
+# Unpaced load, with CPU and RAM constrained per container.
 python3 tools/aster_path_diagnostic.py --output artifacts/load-limited \
-  --events-per-agent 10000 --events-per-second 20 --profiles baseline \
+  --duration-seconds 60 --events-per-second max --profiles baseline \
   --cpu-limit 1 --memory-mib 1024 --restore-deadline-seconds 600 \
   --storage-max-items 50000 --storage-mib 512
 ```
@@ -61,9 +71,10 @@ python3 tools/aster_path_diagnostic.py --output artifacts/load-limited \
 | Option | Default | Bounds |
 | --- | --- | --- |
 | `--agents` | 2 | 2..20 |
-| `--events-per-agent` | duration × rate (600) | 1..10000 |
+| `--duration-seconds` | 60 | 1..1800; combined budgets apply |
+| `--events-per-agent` | omitted | Legacy count mode, 1..10000 |
 | `--payload-bytes` | 1024 | 1..4096 |
-| `--events-per-second` | 10 | 1..100 per agent |
+| `--events-per-second` | 10 | 1..100 per agent, or `max` |
 | `--bandwidth-kbit` | omitted (profile default) | integer 0..1000000 kbit/s per WAN egress; 0 = no limit |
 | `--cpu-limit` | 0 (unrestricted) | 0, or 0.1..64 cores |
 | `--memory-mib` | 0 (unrestricted) | 0, or 64..16384 MiB |
@@ -96,18 +107,21 @@ rate, deadline or RAM budget will pass. The legacy evaluation agent accepts the
 paired `--storage-max-items` / `--storage-max-payload-bytes` flags; the supported
 customer configuration already exposes `storage.max_items/max_payload_bytes`.
 
-An explicit Event count derives the publication window from count/rate;
-`--duration-seconds` remains available for existing callers. Publication takes
+An explicit legacy Event count derives its publication window from count/rate.
+Duration mode is the default. Publication takes
 at most 1800 seconds. The sum of publication and delivery windows across
 profiles cannot exceed 2400 seconds. The controller rejects combinations whose
 `agents² × (Events + 1) × (3 × payload bytes + 1024)` exceed its 256-MiB
-receipt/IPC budget. These harness bounds do not assert product capacities.
+receipt/IPC budget. For `max`, preflight estimates 100 Events/s; a runtime
+telemetry guard rejects runs exceeding the smaller of 10,000 submissions per
+agent and the receipt budget. That diagnostic-capacity error invalidates a run,
+not a product throughput result. These harness bounds do not assert product capacities.
 
 CPU/RAM limits apply to each agent container, including its local publication
 and consumption helpers, not just the agent PID. RAM-limited containers have no
 swap allowance. Docker HostConfig readback must match CPU, memory and swap
 settings before publication, together with Linux cgroup-v2 kernel readback.
-Unsupported cgroup layouts fail closed. Receipts retain those limits and final container
+Unsupported cgroup layouts fail closed. The controller checks final container
 exit/OOM state and cgroup OOM-kill counters; samples measure the agent PID separately. A Docker daemon that
 cannot enforce the requested limits is not a qualifying resource environment.
 
@@ -127,11 +141,20 @@ inputs or pre-existing local image dependencies.
 
 Inputs are validated before building, passed through environment variables and
 quoted arguments, and bounded again by the controller. The Job Summary contains
-only Markdown tables: step/campaign outcomes, requested inputs and per-agent
-observed counts, exact peerless checks, sampled peak RSS and same-process CPU.
-Missing evidence is not a pass. Controller timeout/failure exits remain failures;
-summary and artifact upload are always attempted, but a hard runner cancellation
-can prevent either. No HTML report or charts are generated.
+Markdown tables with run completion/errors, requested inputs and per-agent counts,
+publication-response latency and sampled peak RSS. Download `report.html` for
+offline CPU, RAM and Events/s graphs on a common timeline. Agent, Python generator
+and persistent SDK-helper processes have separate graphs. CPU uses actual elapsed
+time within the same PID/start-time lifetime; 100% means one core. An independent
+observer samples procfs each second even when status RPCs are slow. Missing
+samples stay unavailable, not zero. RSS peaks are sampled, not absolute peaks.
+
+Latency covers generator submission through the client-observed accepted response,
+including local queueing; it is not delivery latency or server-only RPC time.
+Median and nearest-rank p95 use all observed accepted responses, not a recent ring.
+`benchmark.json`, `resources.csv` and `publications.csv` contain allowlisted numeric
+telemetry without Event payloads or credentials. Summary and artifact upload are
+always attempted; hard runner cancellation can prevent either.
 
 For a fork that already registers this workflow filename on its default branch,
 dispatch the published feature ref without merging it into default:
@@ -139,7 +162,7 @@ dispatch the published feature ref without merging it into default:
 ```sh
 gh workflow run diagnostic-runtime-volume.yml --repo OWNER/aster \
   --ref feature/122-diagnostic-scale \
-  -f agents=2 -f events=1 -f payload=32 -f rate=1 -f profile=baseline \
+  -f agents=2 -f duration=3 -f payload=32 -f rate=1 -f profile=baseline \
   -f cpu=0 -f memory=0 -f deadline=30 -f storage_items=50000 -f storage_mib=512
 ```
 
@@ -172,22 +195,21 @@ smoke, the per-agent and WAN setup helpers and CHOWN-only provisioner remain for
 run, so they can change impairments and reclaim private credentials. Agents and
 namespace holders remain UID/GID 10001 with all capabilities dropped. No network
 path bypasses WAN. The diagnostic source helper is bound read-only into nodes;
-the production executable comes from the delivery image. All four local Python
-helpers (diagnostic, numbered publisher, Connect client, and Docker controller)
+the production executable comes from the delivery image. All five local Python
+helpers (diagnostic, benchmark reporting, numbered publisher, Connect client, and Docker controller)
 are copied at campaign start and mounted read-only; every container is created
 from the resolved immutable image ID, not the mutable tag.
 
 `--help` lists bounded workload, impairment, sampling and recovery parameters.
 `--profiles baseline` selects a shorter development run; the default runs all
-four profiles. Samples contain actual agent-PID CPU ticks, RSS and application
-status counters/capacities. Application delivery backlog is **not an Iroh send
-queue**. Monotonic phase timings, configured arguments, qdisc readback, accepted
-and rejected publications, exact deliveries, restart results and cleanup errors
-are retained in JSON even when a profile fails. `receipt.json` records the image
+four profiles. Duration receipts contain allowlisted counters, response timings,
+resource histories, configuration and completion/error indicators. Legacy count
+receipts also retain application status, qdisc readbacks and exact Event contents.
+Application delivery backlog is **not an Iroh send queue**. `receipt.json` records the image
 ID, source HEAD, complete tracked delta against HEAD (including staged changes),
 and individual helper digests (including relevant untracked helpers). Source
-and helper identities are rechecked throughout and after cleanup; profile PASS
-receipts are withheld until final campaign validation succeeds. The provisioner
+and helper identities are rechecked throughout and after cleanup; completed
+receipts require final campaign validation. The provisioner
 wipes private credentials;
 owned-resource cleanup must then succeed before ownership metadata is removed.
 Failed cleanup retains its ownership locator. No credentials are included in the receipt.
@@ -202,7 +224,11 @@ journaled before exposure, and the controller applies it before signalling the
 SDK to acknowledge it. One-off witnesses and the unary CLI remain unary.
 
 The network window is eight unacknowledged stream frames, **not** six concurrent
-unary lanes and not a reservation of unauthenticated connection slots. At 10
+unary lanes and not a reservation of unauthenticated connection slots. Duration
+mode spaces fresh sends from their actual previous send, records lag and skips
+missed slots. It never creates a queue of missed deadlines to catch up later.
+
+In legacy count mode, at 10
 Events/s each fresh frame is due at `start + index / 10`; the SDK retains this
 absolute schedule throughout the source and its eight-second stream rotations.
 Wake jitter can shorten subsequent intervals rather than accumulate as drift;
@@ -216,8 +242,8 @@ Authentication remains per stream under the existing server contract.
 Failed streams retry only the original numbered intent within the SDK's bounded
 retry budget. After exhaustion, recovery records committed results but leaves
 pending intents journaled for explicit recovery; it does not publish replacements
-or turn a failed pacing run into a pass. Closing a workload cancels its helper
-and retains uncertain journal entries. Telemetry includes maximum `schedule-lag`
+or turn a legacy pacing failure into a pass. Closing a workload cancels its helper
+and retains uncertain journal entries. Legacy telemetry includes maximum `schedule-lag`
 and the final 128 payload-free SDK boundary timestamps (journaled, send, receipt,
 saved, acknowledged, and stream opening). Their clock starts at schedule creation.
 Receipt wait includes transport and server work; saved-to-ack includes application
@@ -232,7 +258,9 @@ writes run off the async reactor. A large receipt cannot deadlock a caller still
 filling the input window; IPC deadlines and terminate/kill cleanup remain active.
 
 Connect JSON calls have a 30-second timeout; the persistent numbered helper uses
-`asterctl --timeout 10` with a 35-second IPC bound per command. The peerless query
+`asterctl --timeout 10` with a 35-second IPC bound per command. Duration-stream
+observation instead ends at publication end plus the configured drain, retaining
+unresolved results as unknown without a new publication or late recovery attempt. The peerless query
 has a separate 180-second deadline per node, and each profile has an overall
 publication + restoration + 420-second deadline. These are diagnostic bounds,
 not changed application capacities.

@@ -7,17 +7,17 @@ on:
         description: 'Agent count (2..20), all-to-all peers'
         type: number
         default: 2
-      events:
-        description: 'Events per agent (1..10000); combined receipt/time budgets apply'
+      duration:
+        description: 'Measurement duration in seconds (1..1800); combined memory/time budgets apply'
         type: number
-        default: 600
+        default: 60
       payload:
         description: 'Payload bytes per Event (1..4096)'
         type: number
         default: 1024
       rate:
-        description: 'Publication rate per agent (1..100 Events/s)'
-        type: number
+        description: 'Offered Events/s per agent (1..100), or max for unpaced load'
+        type: string
         default: 10
       bandwidth_kbit:
         description: 'Bandwidth limit per WAN egress in kbit/s (0 = no limit; blank = profile default; integer 0..1000000)'
@@ -38,7 +38,7 @@ on:
         type: number
         default: 0
       deadline:
-        description: 'Delivery deadline seconds after publication or outage restoration (1..600)'
+        description: 'Observation seconds after publication ends (1..600)'
         type: number
         default: 120
       storage_items:
@@ -64,7 +64,7 @@ jobs:
     timeout-minutes: 90
     env:
       AGENTS: ${{ inputs.agents }}
-      EVENTS: ${{ inputs.events }}
+      DURATION: ${{ inputs.duration }}
       PAYLOAD: ${{ inputs.payload }}
       RATE: ${{ inputs.rate }}
       BANDWIDTH_KBIT: ${{ inputs.bandwidth_kbit }}
@@ -91,10 +91,12 @@ jobs:
             uname -r &&
             docker version &&
             python3 --version &&
+            python3 tools/test_aster_benchmark.py &&
+            python3 tools/test_aster_pacing_telemetry.py &&
             python3 tools/test_aster_path_diagnostic.py &&
             python3 tools/test_aster_path_delivery.py &&
             python3 tools/test_aster_path_summary.py &&
-            PYTHONPATH=tools python3 -c 'import os; from aster_path_diagnostic import parse_config; keys={"AGENTS":"agents","EVENTS":"events-per-agent","PAYLOAD":"payload-bytes","RATE":"events-per-second","CPU":"cpu-limit","MEMORY":"memory-mib","DEADLINE":"restore-deadline-seconds","STORAGE_ITEMS":"storage-max-items","STORAGE_MIB":"storage-mib"}; parse_config(["--output","unused"] + [v for k,flag in keys.items() for v in ("--"+flag,os.environ[k])] + (["--bandwidth-kbit",os.environ["BANDWIDTH_KBIT"]] if os.environ["BANDWIDTH_KBIT"] != "" else []) + ["--profiles"] + (["baseline","impaired","reorder","outage"] if os.environ["PROFILE"] == "all" else [os.environ["PROFILE"]]))'
+            PYTHONPATH=tools python3 -c 'import os; from aster_path_diagnostic import parse_config; keys={"AGENTS":"agents","DURATION":"duration-seconds","PAYLOAD":"payload-bytes","RATE":"events-per-second","CPU":"cpu-limit","MEMORY":"memory-mib","DEADLINE":"restore-deadline-seconds","STORAGE_ITEMS":"storage-max-items","STORAGE_MIB":"storage-mib"}; parse_config(["--output","unused"] + [v for k,flag in keys.items() for v in ("--"+flag,os.environ[k])] + (["--bandwidth-kbit",os.environ["BANDWIDTH_KBIT"]] if os.environ["BANDWIDTH_KBIT"] != "" else []) + ["--profiles"] + (["baseline","impaired","reorder","outage"] if os.environ["PROFILE"] == "all" else [os.environ["PROFILE"]]))'
           } 2>&1 | tee artifacts/path-diagnostic/preflight.log
 
       - name: Set up diagnostic BuildKit builder
@@ -149,7 +151,7 @@ jobs:
           timeout --signal=TERM --kill-after=300s 50m \
             python3 -u tools/aster_path_diagnostic.py \
               --output artifacts/path-diagnostic "${bandwidth[@]}" \
-              --agents "$AGENTS" --events-per-agent "$EVENTS" \
+              --agents "$AGENTS" --duration-seconds "$DURATION" \
               --payload-bytes "$PAYLOAD" --events-per-second "$RATE" \
               --profiles "${profiles[@]}" --cpu-limit "$CPU" \
               --memory-mib "$MEMORY" --restore-deadline-seconds "$DEADLINE" \

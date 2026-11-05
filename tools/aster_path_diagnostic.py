@@ -28,12 +28,13 @@ from contextlib import contextmanager
 from aster_lan_mvp import ConnectJsonClient as BaseConnectJsonClient, RpcError, read_token_file, canonical_event_id, OperatorError
 from aster_mesh_playground import NumberedPublisher, RpcError as PublicationRpcError, safe_text
 from aster_path_delivery import OwnedDocker, ExecutionError, _run_command, _pinned_docker
+from aster_benchmark import PublicationStatistics, ResourceObserver, public_report, write_artifacts
 
 LIB = '/usr/local/libexec/aster/'
 # Complete local Python import closure, including the numbered publisher.
 # Image-resident delivery entrypoints are instead bound by the immutable image ID.
 HELPER_FILES = ('aster_path_diagnostic.py', 'aster_mesh_playground.py',
-                'aster_lan_mvp.py', 'aster_path_delivery.py')
+                'aster_lan_mvp.py', 'aster_path_delivery.py', 'aster_benchmark.py')
 
 
 def source_identity(root):
@@ -44,6 +45,11 @@ def source_identity(root):
         'helper_files_sha256': {name: hashlib.sha256((root / 'tools' / name).read_bytes()).hexdigest()
                                 for name in HELPER_FILES},
     }
+
+
+def artifact_json(report):
+    benchmark = report.get('benchmark_mode') or report.get('configuration', {}).get('benchmark')
+    return json.dumps(public_report(report) if benchmark else report, indent=2) + '\n'
 
 
 
@@ -79,6 +85,13 @@ def query_all(client, maximum):
             raise ValueError('query made no progress')
         marker = next_marker
     raise ValueError('query page bound exceeded')
+
+
+def delivery_observation(expected, actual, timestamps, deadline):
+    for identity in expected.keys() & actual.keys():
+        verify_events({identity: expected[identity]}, actual)
+    observed = {identity for identity in actual if timestamps.get(identity, float('inf')) <= deadline}
+    return {'unique': len(observed), 'missing': len(expected.keys() - observed)}
 
 
 def netem_args(profile, delay, jitter, loss, rate, reorder, *, bandwidth_kbit=None):
@@ -219,40 +232,20 @@ class PublicationWorker(Worker):
 
     def read(self, action='stream-result', timeout=35):
         deadline = time.monotonic() + timeout
-        while not self.cancelled.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('publication IPC deadline')
-            try:
-                response = self.responses.get(timeout=min(.1, remaining))
-            except queue.Empty:
-                continue
-            if isinstance(response, Exception):
-                raise response
-            return response
-        raise ValueError('publication worker cancelled')
-
-    def _read_response(self, action='stream-result', timeout=35):
-        deadline = time.monotonic() + timeout
-        with selectors.DefaultSelector() as selector:
-            selector.register(self.process.stdout, selectors.EVENT_READ)
-            with TELEMETRY.span('ipc-response', action):
-                while b'\n' not in self.buffer:
-                    self._ready(selector, deadline)
-                    try:
-                        chunk = os.read(self.process.stdout.fileno(), 65536)
-                    except BlockingIOError:
-                        continue
-                    if not chunk:
-                        try:
-                            detail = os.read(self.process.stderr.fileno(), 4096).decode('utf-8', errors='replace')
-                        except BlockingIOError:
-                            detail = ''
-                        raise ValueError('publication worker closed: ' + safe_text(detail, 400))
-                    self.buffer += chunk
-                    if len(self.buffer) > 4 * 1024 * 1024:
-                        raise ValueError('publication response bound exceeded')
-                line, self.buffer = self.buffer.split(b'\n', 1)
+        # Attribute observation and parsing to the caller's action, not the
+        # background pipe drainer. A valid error frame must not stop draining
+        # subsequent recovery responses on the persistent protocol.
+        with TELEMETRY.span('ipc-response', action):
+            while not self.cancelled.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('publication IPC deadline')
+                try:
+                    line = self.responses.get(timeout=min(.1, remaining))
+                except queue.Empty:
+                    continue
+                if isinstance(line, Exception):
+                    raise line
                 response = json.loads(line)
                 if isinstance(response, dict):
                     TELEMETRY.sdk_timings(response.get('timing_seconds'), response.get('phase_outcomes'))
@@ -262,6 +255,29 @@ class PublicationWorker(Worker):
                 if not isinstance(response, dict) or 'result' not in response:
                     raise ValueError('publication worker rejected request; journal retained')
                 return response['result']
+            raise ValueError('publication worker cancelled')
+
+    def _read_response(self, timeout=35):
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.process.stdout, selectors.EVENT_READ)
+            while b'\n' not in self.buffer:
+                self._ready(selector, deadline)
+                try:
+                    chunk = os.read(self.process.stdout.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    try:
+                        detail = os.read(self.process.stderr.fileno(), 4096).decode('utf-8', errors='replace')
+                    except BlockingIOError:
+                        detail = ''
+                    raise ValueError('publication worker closed: ' + safe_text(detail, 400))
+                self.buffer += chunk
+                if len(self.buffer) > 4 * 1024 * 1024:
+                    raise ValueError('publication response bound exceeded')
+            line, self.buffer = self.buffer.split(b'\n', 1)
+            return line
 
 
 def sample(client):
@@ -443,13 +459,17 @@ class DiagnosticPublisher(NumberedPublisher):
         result = self._call(action, **arguments)
         return result if json_response else None
 
-    def publish_stream(self, items, rate, due, apply):
+    def publish_stream(self, items, rate, due, apply, *, duration=None, statistics=None, settle_seconds=120):
         items = iter(items)
         expected = {}
         exhausted = False
         def refill():
             nonlocal exhausted
             if exhausted:
+                return
+            if duration is not None and time.monotonic() >= due + duration:
+                exhausted = True
+                self.session.send('stream-finish')
                 return
             try:
                 key, payload = next(items)
@@ -462,34 +482,88 @@ class DiagnosticPublisher(NumberedPublisher):
                 'payload': base64.b64encode(payload).decode()}
             if intent['logicalKey'] in expected:
                 raise ValueError('duplicate stream logical key')
+            submitted = time.monotonic()
+            if duration is not None and submitted >= due + duration:
+                exhausted = True
+                self.session.send('stream-finish')
+                return
             expected[intent['logicalKey']] = intent
+            if statistics is not None:
+                statistics.attempt(intent['logicalKey'], submitted)
             self.session.send('stream-item', intent=intent)
-        def accept(intent, result):
+        settlement_deadline = due + duration + settle_seconds if duration is not None else None
+        def accept(intent, result, observed=None):
+            observed = time.monotonic() if observed is None else observed
+            if settlement_deadline is not None and observed >= settlement_deadline:
+                return False
             original = expected.get(intent.get('logicalKey'))
             if original is None or any(intent.get(k) != v for k, v in original.items()):
                 raise ValueError('stream receipt does not match original intent')
             identity = canonical_event_id(result['receipt']['eventId'])
             apply({'id': identity, 'logicalKey': original['logicalKey'], 'payload': original['payload']})
+            if statistics is not None:
+                statistics.complete(intent['logicalKey'], 'accepted', observed)
+            return True
         try:
-            ready = self._call('stream-start', interval_seconds=1 / rate,
-                               first_delay_seconds=due - time.monotonic())
+            options = {'duration_seconds': duration} if duration is not None else {}
+            ready = self._call('stream-start', interval_seconds=1 / rate if rate else .000001,
+                               first_delay_seconds=due - time.monotonic(), **options)
             if ready != {'ready': True}:
                 raise ValueError('stream did not start')
             for _ in range(8):
                 refill()
             while True:
-                response = self.session.read()
+                if duration is None:
+                    response = self.session.read()
+                else:
+                    remaining = settlement_deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._close_session()
+                        return 0.0
+                    try:
+                        response = self.session.read(timeout=remaining)
+                    except TimeoutError:
+                        if time.monotonic() < settlement_deadline:
+                            raise
+                        # Observation ended; originals stay durable and outcomes
+                        # stay unknown. Do not recover/retry beyond this bound.
+                        self._close_session()
+                        return 0.0
+                observed = time.monotonic()
+                if settlement_deadline is not None and observed >= settlement_deadline:
+                    # Buffered IPC is not an observation before the cutoff. Do not
+                    # acknowledge an unapplied result; retain its durable journal.
+                    self._close_session()
+                    return 0.0
                 if response.get('telemetry'):
                     with TELEMETRY.lock:
                         TELEMETRY.publication_trace = response.get('publication_trace', [])[-128:]
                     continue
                 if response.get('finished'):
-                    if expected or not exhausted:
+                    if duration is None and (expected or not exhausted):
                         raise ValueError('stream omitted results')
                     return response['max_schedule_lag_seconds']
-                intent, result = response['intent'], response['publication']
-                accept(intent, result)
-                self.session.send('stream-applied', sequence=int(result['operationSequence']))
+                intent = response['intent']
+                if 'rejected' in response:
+                    failure = response['rejected']
+                    original = expected.get(intent.get('logicalKey'))
+                    if (duration is None or 'publication' in response or original is None
+                            or any(intent.get(k) != v for k, v in original.items())
+                            or failure.get('operation') != 'publish_numbered_events'
+                            or failure.get('reason') not in ('PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION',
+                                'PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED')):
+                        raise ValueError('invalid stream capacity rejection')
+                    sequence = int(response['operationSequence'])
+                    if sequence <= 0:
+                        raise ValueError('invalid rejected sequence')
+                    apply({'rejected': failure['reason'], 'logicalKey': original['logicalKey']})
+                    if statistics is not None:
+                        statistics.complete(intent['logicalKey'], 'rejected', observed)
+                else:
+                    result = response['publication']
+                    accept(intent, result, observed)
+                    sequence = int(result['operationSequence'])
+                self.session.send('stream-applied', sequence=sequence)
                 del expected[intent['logicalKey']]
                 refill()
         except Exception as failure:
@@ -505,7 +579,9 @@ class DiagnosticPublisher(NumberedPublisher):
                         # Already-applied results whose ack was uncertain are safe to
                         # apply idempotently; validate against the original source.
                         if intent.get('logicalKey') in expected:
-                            accept(intent, operation['result'])
+                            if not accept(intent, operation['result']):
+                                # Keep unobserved results durable for a later owner.
+                                break
                         else:
                             # The original durable journal also retains already
                             # applied entries whose server ack response was lost.
@@ -628,8 +704,8 @@ class PublicationLanes:
             publisher._run('publication-recover', json_response=True)
         return publisher
 
-    def publish_stream(self, items, rate, due, apply):
-        return self._get().publish_stream(items, rate, due, apply)
+    def publish_stream(self, items, rate, due, apply, **options):
+        return self._get().publish_stream(items, rate, due, apply, **options)
 
     def publish_batch(self, items, rate, due, apply):
         return self._get().publish_batch(items, rate, due, apply)
@@ -677,21 +753,42 @@ class DeliveryClient:
 
 class Workload:
     """Bounded paced publishers and independent continuous consumption."""
-    def __init__(self, client, subscription, prefix, count, rate, size, publisher=None):
+    def __init__(self, client, subscription, prefix, count, rate, size, publisher=None, *, duration=None, started=None, settle_seconds=120, maximum_attempts=10000):
         self.client, self.subscription = client, subscription
         self.publications = publisher if publisher is not None else client
         self.accepted, self.deliveries, self.rejected, self.errors = {}, {}, [], []
+        self.delivery_times = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.done = False
-        self.started = time.monotonic()
+        self.started = time.monotonic() if started is None else started
+        self.duration = duration
+        self.settle_seconds = settle_seconds
+        self.statistics = PublicationStatistics(self.started, duration, maximum_attempts) if duration is not None else None
         self.finished = None
         self.max_schedule_lag = 0.0
         self.failure_telemetry = None
+        self.observer = ResourceObserver(self.resource_processes, self.resource_counters) if duration is not None else None
         self.publisher = threading.Thread(target=self.publish_loop, args=(prefix, count, rate, size), daemon=True)
         self.consumer = threading.Thread(target=self.consume_loop, daemon=True)
         self.consumer.start()
         self.publisher.start()
+
+    def resource_processes(self):
+        processes = {'generator': os.getpid()}
+        try:
+            processes['agent'] = int(Path('/clab/state/agent.pid').read_text())
+        except (OSError, ValueError):
+            pass
+        publisher = getattr(self.publications, 'publisher', None)
+        session = getattr(publisher, 'session', None)
+        if session is not None:
+            processes['sdk'] = session.process.pid
+        return processes
+
+    def resource_counters(self):
+        with self.lock:
+            return {'accepted': len(self.accepted), 'delivered': len(self.deliveries)}
 
     def publish_loop(self, prefix, count, rate, size):
         # One persistent rolling stream, not a finite receipt/ack batch loop.
@@ -705,13 +802,15 @@ class Workload:
 
         try:
             def items():
-                for index in range(count):
+                for index in range(count if self.duration is None else 2 ** 63):
                     if self.stop.is_set():
                         return
                     key = f'{prefix}-{index:06d}'.encode()
                     yield key, (key + b':' + b'x' * size)[:size]
             with TELEMETRY.span('publication', 'rolling-stream'):
-                lag = self.publications.publish_stream(items(), rate, self.started, apply)
+                options = {'duration': self.duration, 'statistics': self.statistics, 'settle_seconds': self.settle_seconds} if self.duration is not None else {}
+                self.stop.wait(max(0, self.started - time.monotonic()))
+                lag = self.publications.publish_stream(items(), rate, self.started, apply, **options)
             with self.lock:
                 self.max_schedule_lag = max(self.max_schedule_lag, lag)
         except Exception as error:
@@ -735,6 +834,7 @@ class Workload:
                     event = delivery['event']
                     with self.lock:
                         self.deliveries[event['id']] = event
+                        self.delivery_times.setdefault(event['id'], time.monotonic())
                     self.client.call('AcknowledgeEvent', {'subscriptionId': self.subscription, 'eventId': event['id']})
                     if self.stop.is_set():
                         return
@@ -747,13 +847,18 @@ class Workload:
         telemetry = TELEMETRY.snapshot()
         with self.lock:
             return {'accepted': dict(self.accepted), 'deliveries': dict(self.deliveries),
+                    'delivery_times': dict(self.delivery_times),
                     'rejected': list(self.rejected), 'errors': list(self.errors), 'done': self.done,
                     'started': self.started, 'finished': self.finished,
                     'max_schedule_lag_seconds': self.max_schedule_lag,
-                    'pacing_telemetry': telemetry, 'failure_telemetry': self.failure_telemetry}
+                    'pacing_telemetry': telemetry, 'failure_telemetry': self.failure_telemetry,
+                    'statistics': self.statistics.summary() if self.statistics else None,
+                    'resources': self.observer.snapshot() if self.observer else []}
 
     def close(self):
         self.stop.set()
+        if self.observer is not None:
+            self.observer.close()
         if isinstance(self.publications, PublicationLanes):
             self.publications.close()
         self.publisher.join(10)
@@ -803,10 +908,15 @@ def worker_main():
                     result = subscription
                 elif action == 'publish':
                     result = publish_one(publications, request['key'], request['size'])
+                elif action == 'prepare':
+                    publications._get()
+                    result = {'ready': True}
                 elif action == 'start-workload':
                     if workload is not None:
                         raise ValueError('workload already started')
-                    workload = Workload(client, subscription, request['prefix'], request['count'], request['rate'], request['size'], publications)
+                    workload = Workload(client, subscription, request['prefix'], request['count'], request['rate'], request['size'], publications,
+                                        duration=request.get('duration'), started=request.get('started'), settle_seconds=request.get('settle_seconds', 120),
+                                        maximum_attempts=request.get('maximum_attempts', 10000))
                     result = {'started': workload.started}
                 elif action == 'progress':
                     result = workload.snapshot()
@@ -974,6 +1084,7 @@ def run_profile(config, profile, report):
     lab.mkdir(mode=0o700)
     report.update(profile=profile, status='running', phases=[], samples=[], accepted={},
                   rejected={}, deliveries={}, qdiscs=[], ownership_directory=str(directory))
+    report['benchmark_mode'] = getattr(config, 'benchmark', False)
     start = time.monotonic()
 
     validate = getattr(config, 'validate_provenance', lambda: None)
@@ -982,7 +1093,7 @@ def run_profile(config, profile, report):
         if name != 'cleanup':
             validate()
         report['phases'].append({'phase': name, 'elapsed': time.monotonic() - start})
-        (config.output / (profile + '.json')).write_text(json.dumps(report) + '\n')
+        (config.output / (profile + '.json')).write_text(artifact_json(report))
         print(json.dumps({'profile': profile, **report['phases'][-1]}), flush=True)
 
     def command(*args, timeout=30):
@@ -1055,7 +1166,12 @@ def run_profile(config, profile, report):
             progress = worker.call(action)
             report['accepted'][role].update(progress['accepted'])
             report['deliveries'][role].update(progress['deliveries'])
+            if progress.get('delivery_times') is not None:
+                report.setdefault('delivery_times', {})[role] = progress['delivery_times']
             report['rejected'][role] = progress['rejected']
+            if progress.get('statistics') is not None:
+                report.setdefault('benchmark', {})[role] = progress['statistics']
+                report.setdefault('benchmark_resources', {})[role] = progress['resources']
             report.setdefault('workload_timing', {})[role] = {key: progress[key] for key in
                 ('done', 'started', 'finished', 'max_schedule_lag_seconds')}
             if 'pacing_telemetry' in progress:
@@ -1083,7 +1199,7 @@ def run_profile(config, profile, report):
     def sample_all():
         validate()
         report['samples'].append({role: worker.call('status') for role, worker in workers.items()})
-        (config.output / (profile + '.json')).write_text(json.dumps(report) + '\n')
+        (config.output / (profile + '.json')).write_text(artifact_json(report))
         print(json.dumps({'profile': profile, 'elapsed': time.monotonic() - start,
                           'accepted': {role: len(events) for role, events in report['accepted'].items()},
                           'rejected': {role: len(events) for role, events in report['rejected'].items()},
@@ -1174,17 +1290,29 @@ def run_profile(config, profile, report):
         report['capabilities'] = 'verified holders and initial agent PIDs'
         sample_all()
         phase('publish-and-continuous-consume')
-        publish_start = time.monotonic()
+        benchmark = getattr(config, 'benchmark', False)
+        if benchmark:
+            for worker in workers.values():
+                worker.call('prepare')
+        publish_start = time.monotonic() + (2 if benchmark else 0)
+        publication_end = publish_start + config.duration_seconds
+        report['measurement'] = {'start_monotonic': publish_start, 'end_monotonic': publication_end,
+                                 'duration_seconds': config.duration_seconds}
         count = getattr(config, 'events_per_agent', int(config.duration_seconds * config.events_per_second))
         outage_start = None
         restored = None
         witnesses = {}
         next_sample = publish_start
         for role, worker in workers.items():
+            options = {'duration': config.duration_seconds, 'started': publish_start,
+                       'settle_seconds': config.restore_deadline_seconds,
+                       'maximum_attempts': config.maximum_attempts} if benchmark else {}
             worker.call('start-workload', prefix=f'{profile}-{role}', count=count,
-                        rate=config.events_per_second, size=config.payload_bytes)
+                        rate=config.events_per_second, size=config.payload_bytes, **options)
         while True:
-            if time.monotonic() - publish_start > config.duration_seconds + 15:
+            if time.monotonic() - publish_start > config.duration_seconds + (config.restore_deadline_seconds if benchmark else 15):
+                if benchmark:
+                    break
                 raise TimeoutError('paced publication completion deadline')
             if profile == 'outage' and outage_start is None and time.monotonic() - publish_start >= config.outage_at_seconds:
                 report['outage_restoration'] = {}
@@ -1199,8 +1327,8 @@ def run_profile(config, profile, report):
                 outage_start = report['outage_restoration']['applied_monotonic']
                 report['outage_witness'] = {'ids': witnesses, 'absent_before_restore': False,
                                             'publications': {}}
-                phase('confirmed-outage-witness')
-                for role in workers:
+                phase('outage-applied' if benchmark else 'confirmed-outage-witness')
+                for role in (() if benchmark else workers):
                     timing = {'started_monotonic': time.monotonic()}
                     report['outage_witness']['publications'][role] = timing
                     try:
@@ -1212,7 +1340,8 @@ def run_profile(config, profile, report):
                 # Keep workload/unknown-outcome failures primary. The final
                 # receipt separately records any missing negative evidence.
                 consume()
-                outage.require_active()
+                if not benchmark:
+                    outage.require_active()
                 for role, identity in witnesses.items():
                     for other in workers:
                         if other == role:
@@ -1221,7 +1350,7 @@ def run_profile(config, profile, report):
                         outage.require_active()
                         if present or identity in report['deliveries'][other]:
                             raise ValueError('outage witness reached peer before restore')
-                report['outage_witness'].update(absent_before_restore=True,
+                report['outage_witness'].update(absent_before_restore=not benchmark,
                     verified_monotonic=time.monotonic())
             if outage is not None:
                 outage.check()
@@ -1230,7 +1359,7 @@ def run_profile(config, profile, report):
             if time.monotonic() >= next_sample:
                 sample_all()
                 next_sample = time.monotonic() + config.sample_seconds
-            if done:
+            if done and (not benchmark or time.monotonic() >= publication_end):
                 if outage is not None:
                     outage.finish()
                     outage.check()
@@ -1240,7 +1369,7 @@ def run_profile(config, profile, report):
         report['publish_elapsed_seconds'] = time.monotonic() - publish_start
         for role in workers:
             expected_attempts = count + (1 if role in witnesses else 0)
-            if len(report['accepted'][role]) + len(report['rejected'][role]) != expected_attempts:
+            if not benchmark and len(report['accepted'][role]) + len(report['rejected'][role]) != expected_attempts:
                 raise ValueError('publication attempt accounting mismatch')
         if profile == 'outage' and restored is None:
             raise ValueError('workload ended before outage restore')
@@ -1248,7 +1377,7 @@ def run_profile(config, profile, report):
             outage.finish()
             outage.check()
         phase('drain')
-        deadline = (restored or time.monotonic()) + config.restore_deadline_seconds
+        deadline = (publication_end if benchmark else restored or time.monotonic()) + config.restore_deadline_seconds
         while True:
             consume()
             complete = True
@@ -1258,7 +1387,15 @@ def run_profile(config, profile, report):
                     if other == role:
                         continue
                     try:
-                        verify_events(report['accepted'][role], report['deliveries'][other], deadline=deadline)
+                        if benchmark:
+                            accepted = report['accepted'][role]
+                            actual = report['deliveries'][other]
+                            for identity in accepted.keys() & actual.keys():
+                                verify_events({identity: accepted[identity]}, actual)
+                            if not accepted.keys() <= actual.keys():
+                                raise ValueError('missing delivery')
+                        else:
+                            verify_events(report['accepted'][role], report['deliveries'][other], deadline=deadline)
                     except ValueError:
                         complete = received_all = False
                 if received_all:
@@ -1269,6 +1406,8 @@ def run_profile(config, profile, report):
             if complete:
                 break
             if time.monotonic() >= deadline:
+                if benchmark:
+                    break
                 raise TimeoutError('admitted Events not delivered before deadline')
             if time.monotonic() >= next_sample:
                 sample_all()
@@ -1282,6 +1421,13 @@ def run_profile(config, profile, report):
         # Drain observes deliveries before their acknowledgement RPC returns.
         # Join all workloads and check their final errors before reopening.
         consume('end-workload')
+        if benchmark:
+            # Final snapshots may contain pre-cutoff observations not yet polled
+            # by the controller. Freeze both accepted expectations and deliveries
+            # only after joining, without moving their observation deadline.
+            expected_events = {identity: event for events in report['accepted'].values() for identity, event in events.items()}
+            report['delivery_counts'] = {role: delivery_observation(expected_events, events,
+                report['delivery_times'].get(role, {}), deadline) for role, events in report['deliveries'].items()}
         for worker in workers.values():
             worker.call('stop')
         # Keep all WAN egresses completely cut across peerless reopen too.
@@ -1293,14 +1439,21 @@ def run_profile(config, profile, report):
             restart = worker.call('peerless', role=role)
             ready(worker)
             execute(nodes[role], LIB + 'delivery-agent.py', 'verify', role)
-            actual = worker.call('query', maximum=(count + 1) * len(roles), timeout=180)
-            report['peerless'][role] = {'restart': restart, 'exact_events': verify_events(expected, actual, exact=True)}
+            actual = worker.call('query', maximum=max(len(expected) + 8 * len(roles), (count + 1) * len(roles)), timeout=180)
+            if benchmark:
+                for identity in expected.keys() & actual.keys():
+                    verify_events({identity: expected[identity]}, actual)
+                report['peerless'][role] = {'unique': len(actual), 'missing': len(expected.keys() - actual.keys())}
+            else:
+                report['peerless'][role] = {'restart': restart, 'exact_events': verify_events(expected, actual, exact=True)}
         sample_all()
         validate()
         report['status'] = 'verified' if hasattr(config, 'validate_provenance') else 'pass'
     except (Exception, KeyboardInterrupt) as error:
         report['status'] = 'fail'
         report['error'] = str(error) or 'interrupted'
+        report['error_kind'] = type(error).__name__
+        report['error_stage'] = report['phases'][-1]['phase'] if report['phases'] else 'setup'
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_alarm)
@@ -1313,7 +1466,7 @@ def run_profile(config, profile, report):
             try:
                 outage.finish()
                 witness = report.get('outage_witness')
-                if witness is not None and not witness['absent_before_restore']:
+                if witness is not None and not report.get('benchmark_mode') and not witness['absent_before_restore']:
                     witness['error'] = 'outage witness not verified before scheduled restore'
                 restored_at = report['outage_restoration'].get('restored_monotonic')
                 if restored_at is not None:
@@ -1389,7 +1542,7 @@ def run_profile(config, profile, report):
             validate()
         except Exception as error:
             report.update(status='fail', provenance_error=str(error))
-        (config.output / (profile + '.json')).write_text(json.dumps(report) + '\n')
+        (config.output / (profile + '.json')).write_text(artifact_json(report))
     return report
 
 
@@ -1403,9 +1556,16 @@ def parse_config(argv=None):
                         default=['baseline', 'impaired', 'reorder', 'outage'])
     parser.add_argument('--events-per-agent', type=int)
     parser.add_argument('--cpu-limit', type=float, default=0)
+    def offered_rate(value):
+        if value == 'max':
+            return 0
+        if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 100:
+            raise argparse.ArgumentTypeError('rate must be 1..100 Events/s or max')
+        return int(value)
+    parser.add_argument('--events-per-second', type=offered_rate, default=10)
     bounds = {'agents': (2, 2, 20), 'memory-mib': (0, 0, 16384),
               'storage-max-items': (10000, 4161, 1000000), 'storage-mib': (64, 64, 4096),
-              'duration-seconds': (60, 1, 1800), 'events-per-second': (10, 1, 100),
+              'duration-seconds': (60, 1, 1800),
               'payload-bytes': (1024, 1, 4096), 'delay-ms': (40, 1, 1000),
               'jitter-ms': (5, 0, 100), 'loss-percent': (1, 0, 50),
               'rate-mbit': (100, 1, 1000), 'reorder-percent': (10, 0, 100),
@@ -1430,14 +1590,18 @@ def parse_config(argv=None):
         parser.error('cpu-limit must be 0 (unrestricted) or 0.1..64')
     if config.memory_mib != 0 and config.memory_mib < 64:
         parser.error('memory-mib must be 0 (unrestricted) or 64..16384')
-    if config.events_per_agent is None:
-        config.events_per_agent = config.duration_seconds * config.events_per_second
+    config.benchmark = config.events_per_agent is None
+    if config.benchmark:
+        config.events_per_agent = config.duration_seconds * (config.events_per_second or 100)
     else:
+        if not config.events_per_second:
+            parser.error('max rate requires duration mode')
         config.duration_seconds = (config.events_per_agent + config.events_per_second - 1) // config.events_per_second
     if not 1 <= config.events_per_agent <= 10000 or config.duration_seconds > 1800:
         parser.error('workload must contain 1..10000 Events per agent and take at most 1800 seconds')
     if config.agents ** 2 * (config.events_per_agent + 1) * (config.payload_bytes * 3 + 1024) > 256 * 1024 * 1024:
         parser.error('combined workload exceeds 256 MiB receipt/IPC budget')
+    config.maximum_attempts = min(10000, 256 * 1024 * 1024 // (config.agents ** 2 * (config.payload_bytes * 3 + 1024)) - 1)
     if len(set(config.profiles)) != len(config.profiles):
         parser.error('duplicate profiles')
     if len(config.profiles) * (config.duration_seconds + config.restore_deadline_seconds) > 2400:
@@ -1495,7 +1659,7 @@ def main():
                 report['profiles'].append(row)
                 run_profile(config, profile, row)
                 validate_provenance()
-                (config.output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+                (config.output / 'receipt.json').write_text(artifact_json(report))
             # No profile publishes PASS until the whole campaign's final identity
             # check. Failed campaigns retain individually verified (not PASS) rows.
             validate_provenance()
@@ -1503,13 +1667,19 @@ def main():
             if report['status'] == 'pass':
                 for row in report['profiles']:
                     row['status'] = 'pass'
-                    (config.output / (row['profile'] + '.json')).write_text(json.dumps(row) + '\n')
+                    (config.output / (row['profile'] + '.json')).write_text(artifact_json(row))
     except Exception as error:
-        report.update(status='fail', error=str(error))
+        report.update(status='fail', error=str(error), error_kind=type(error).__name__, error_stage='campaign')
     finally:
-        (config.output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+        if config.benchmark:
+            report['status'] = 'completed' if report['status'] == 'pass' else 'error'
+            for row in report['profiles']:
+                row['status'] = 'completed' if row['status'] == 'pass' else 'error'
+                (config.output / (row['profile'] + '.json')).write_text(artifact_json(row))
+            write_artifacts(config.output, report)
+        (config.output / 'receipt.json').write_text(artifact_json(report))
     print(json.dumps({'status': report['status'], 'receipt': str(config.output / 'receipt.json')}))
-    return 0 if report['status'] == 'pass' else 1
+    return 0 if report['status'] in ('pass', 'completed') else 1
 
 
 if __name__ == '__main__':

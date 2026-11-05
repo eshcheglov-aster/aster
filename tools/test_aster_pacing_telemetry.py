@@ -34,30 +34,51 @@ class TelemetryTests(unittest.TestCase):
 
     def test_pacing_failure_keeps_pending_operations_before_cleanup(self):
         import threading
-        import time
         class Client:
             def call(self, *args):
                 return {'deliveries': []}
-            def publish_event(self, key, payload):
-                release.wait(3)
-                return {'id': key.decode()}
+        cleanup_started = threading.Event()
         release = threading.Event()
         telemetry = diagnostic.PacingTelemetry()
+        sent = []
+        class Session:
+            def send(self, action, **arguments):
+                sent.append(action)
+            def read(self):
+                telemetry.sdk_timings({'sdk-stream': .2, 'schedule-lag': 1.2},
+                                      {'sdk-stream': 'error'})
+                raise ValueError('schedule lag exceeded')
+            def close(self):
+                cleanup_started.set()
+                release.wait(3)
+        publisher = diagnostic.DiagnosticPublisher.__new__(diagnostic.DiagnosticPublisher)
+        publisher.session = Session()
+        publisher.session_lock = threading.Lock()
+        publisher._call = lambda *args, **kwargs: {'ready': True}
+        publisher._run = lambda *args, **kwargs: {'operations': []}
         with patch.object(diagnostic, 'TELEMETRY', telemetry):
-            workload = diagnostic.Workload(Client(), 'sub', 'probe', 7, 1000, 1)
+            workload = diagnostic.Workload(Client(), 'sub', 'probe', 9, 1000, 1, publisher)
             try:
-                deadline = time.monotonic() + 2
-                while not workload.snapshot()['errors'] and time.monotonic() < deadline:
-                    time.sleep(.01)
-                failed = workload.snapshot()
-                self.assertTrue(failed['errors'])
-                self.assertIn('failure_telemetry', failed)
-                self.assertEqual(sum(row['operation'] == 'publication:complete-lane-cycle'
-                                     for row in failed['failure_telemetry']['active']), 6)
+                self.assertTrue(cleanup_started.wait(2))
+                # The real stream catches the failure before closing/recovering;
+                # the outer rolling-stream operation is still active then.
                 release.set()
                 workload.publisher.join(2)
-                self.assertEqual(workload.snapshot()['failure_telemetry'], failed['failure_telemetry'])
-                self.assertIn('pacing_telemetry', failed)
+                self.assertFalse(workload.publisher.is_alive())
+                failed = workload.snapshot()
+                self.assertEqual(failed['errors'], ['schedule lag exceeded'])
+                frozen = failed['failure_telemetry']
+                self.assertEqual(sum(row['operation'] == 'publication:rolling-stream'
+                                     for row in frozen['active']), 1)
+                self.assertEqual(sent, ['stream-item'] * 8)
+                self.assertEqual(frozen['operations']['sdk:sdk-stream']['errors'], 1)
+                self.assertEqual(failed['max_schedule_lag_seconds'], 1.2)
+                self.assertEqual(failed['pacing_telemetry']['active'], [])
+                self.assertEqual(failed['pacing_telemetry']['operations']
+                                 ['publication:rolling-stream']['errors'], 1)
+                telemetry.sdk_timings({'sdk-recover': .1}, {'sdk-recover': 'success'})
+                self.assertEqual(workload.snapshot()['failure_telemetry'], frozen)
+                self.assertNotIn('sdk:sdk-recover', frozen['operations'])
             finally:
                 release.set()
                 workload.close()

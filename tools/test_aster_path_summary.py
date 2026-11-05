@@ -10,6 +10,21 @@ import unittest
 
 
 class SummaryTests(unittest.TestCase):
+    def test_duration_summary_distinguishes_counts_and_run_completion(self):
+        import aster_path_summary as summary
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'receipt.json').write_text(json.dumps({'schema': 'aster-duration-benchmark/v1', 'status': 'completed', 'profiles': [{
+                'profile': 'baseline', 'status': 'completed', 'benchmark': {'node-a': {
+                    'attempts': 4, 'accepted_during': 1, 'accepted_later': 2, 'unknown': 1, 'rejected': 0,
+                    'actual_events_per_second': .5, 'latency_seconds': {'median': 1, 'p95': 2, 'max': 2}}},
+                'delivery_counts': {'node-a': {'unique': 3, 'missing': 1}}}]}))
+            text = summary.render(root, {'DURATION': '2', 'RATE': 'max'})
+            self.assertIn('Accepted during', text)
+            self.assertIn('| Campaign | completed |', text)
+            self.assertIn('| RATE | max |', text)
+            self.assertIn('No performance thresholds', text)
+
     def test_selected_bandwidth_is_labeled_and_allowlisted(self):
         import aster_path_summary as summary
         with tempfile.TemporaryDirectory() as directory:

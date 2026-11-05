@@ -8,9 +8,10 @@ import math
 from pathlib import Path
 import re
 import os
+from aster_benchmark import public_report, display, COUNTS
 
 PROFILES = ('baseline', 'impaired', 'reorder', 'outage')
-STATUSES = ('pass', 'fail', 'verified', 'running', 'success', 'failure', 'cancelled', 'skipped')
+STATUSES = ('completed', 'error', 'pass', 'fail', 'verified', 'running', 'success', 'failure', 'cancelled', 'skipped')
 
 
 def number(value):
@@ -59,14 +60,29 @@ def render(root, env):
     except (OSError, ValueError):
         lines.append('| Campaign | No receipt or unreadable receipt; no PASS established |')
     lines += ['', '| Requested input | Value |', '| --- | --- |']
-    for key in ('AGENTS', 'EVENTS', 'PAYLOAD', 'RATE', 'CPU', 'MEMORY', 'DEADLINE', 'STORAGE_ITEMS', 'STORAGE_MIB', 'PROFILE'):
+    for key in ('AGENTS', 'DURATION', 'EVENTS', 'PAYLOAD', 'RATE', 'CPU', 'MEMORY', 'DEADLINE', 'STORAGE_ITEMS', 'STORAGE_MIB', 'PROFILE'):
         value = env.get(key, '')
-        if (key == 'PROFILE' and value in (*PROFILES, 'all')) or (key != 'PROFILE' and re.fullmatch(r'[0-9]{1,12}(\.[0-9]{1,6})?', value)):
+        if (key == 'RATE' and value == 'max') or (key == 'PROFILE' and value in (*PROFILES, 'all')) or (key != 'PROFILE' and re.fullmatch(r'[0-9]{1,12}(\.[0-9]{1,6})?', value)):
             lines.append(f'| {key} | {value} |')
     bandwidth = env.get('BANDWIDTH_KBIT')
     if bandwidth == '' or (isinstance(bandwidth, str) and re.fullmatch(r'[0-9]{1,7}', bandwidth) and int(bandwidth) <= 1000000):
         value = 'profile default' if bandwidth == '' else 'no limit' if int(bandwidth) == 0 else bandwidth
         lines.append(f'| Bandwidth per WAN egress (kbit/s) | {value} |')
+    if (receipt or {}).get('schema') == 'aster-duration-benchmark/v1':
+        lines += ['', '| Profile | Run | Agent | Attempts | Accepted during | Accepted later | Rejected | Unknown | Actual Events/s | Delivered unique | Missing | Median s | p95 s | Max s | Peak RSS MiB |',
+                  '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+        for row in public_report(receipt).get('profiles', []):
+            for role, stats in row['benchmark'].items():
+                delivery = row['delivery_counts'].get(role, {})
+                rss = [s['rss_bytes'] for sample in row['benchmark_resources'].get(role, [])
+                       if (s := sample.get('processes', {}).get('agent')) and s.get('rss_bytes') is not None]
+                values = [row['profile'], row.get('status', 'unknown'), role] + [stats.get(k) for k in COUNTS] + [delivery.get(k) for k in ('unique', 'missing')] + [stats['latency_seconds'].get(k) for k in ('median', 'p95', 'max')] + [max(rss)/1048576 if rss else None]
+                lines.append('| ' + ' | '.join(display(v) for v in values) + ' |')
+        lines += ['', '| Measurement boundary | Meaning |', '| --- | --- |',
+                  '| No performance thresholds | Completed means a valid run, not a target throughput or delivery result. Errors remain nonzero exits. |',
+                  '| Latency | Generator submission to client-observed accepted response, including queueing; exact median, nearest-rank p95, maximum. |',
+                  '| Resources | Independent one-second observations; 100% CPU = one core. Download report.html for agent and generator CPU/RSS and Events/s graphs; benchmark.json and resources.csv contain raw telemetry. |']
+        return '\n'.join(lines) + '\n'
     lines += ['', '| Profile | Status | Agent | Accepted | Observed deliveries | Peerless exact | Sampled peak RSS MiB | CPU % (one core) |',
               '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |']
     rows = {r.get('profile'): r for r in (receipt or {}).get('profiles', []) if isinstance(r, dict)}

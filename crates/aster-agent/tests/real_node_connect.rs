@@ -2290,12 +2290,13 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
             let apply = async {
                 let mut sequences = Vec::new();
                 while let Some(publication) = receive.recv().await {
+                    let result = publication.result.expect("accepted publication");
                     assert_eq!(
                         publication.intent.payload,
-                        vec![publication.result.operation_sequence as u8]
+                        vec![result.operation_sequence as u8]
                     );
-                    assert_eq!(publication.result.receipt.event_id.len(), 32);
-                    sequences.push(publication.result.operation_sequence);
+                    assert_eq!(result.receipt.event_id.len(), 32);
+                    sequences.push(result.operation_sequence);
                     publication.applied.send(()).unwrap();
                 }
                 assert_eq!(sequences, (9..=20).collect::<Vec<_>>());

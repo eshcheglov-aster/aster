@@ -32,6 +32,8 @@ enum Request {
     StreamStart {
         interval_seconds: f64,
         first_delay_seconds: f64,
+        #[serde(default)]
+        duration_seconds: Option<f64>,
     },
     #[serde(rename = "stream-item")]
     StreamItem {
@@ -120,6 +122,7 @@ pub async fn serve(sdk: NumberedEventSdk<HttpClient>) -> Result<(), String> {
         if let Ok(Request::StreamStart {
             interval_seconds,
             first_delay_seconds,
+            duration_seconds,
         }) = request
         {
             let result = serve_stream(
@@ -129,6 +132,7 @@ pub async fn serve(sdk: NumberedEventSdk<HttpClient>) -> Result<(), String> {
                 received_at,
                 interval_seconds,
                 first_delay_seconds,
+                duration_seconds,
             )
             .await;
             let failed = result.is_err();
@@ -205,12 +209,15 @@ async fn serve_stream(
     received_at: tokio::time::Instant,
     interval: f64,
     delay: f64,
+    duration: Option<f64>,
 ) -> Result<f64, String> {
     if !pending.is_empty()
         || !interval.is_finite()
         || !(0.000001..=3600.0).contains(&interval)
         || !delay.is_finite()
         || delay.abs() > 3600.0
+        || duration
+            .is_some_and(|seconds| !seconds.is_finite() || !(0.001..=1800.0).contains(&seconds))
     {
         return Err("invalid stream pace or unapplied journal work".into());
     }
@@ -220,8 +227,16 @@ async fn serve_stream(
     } else {
         received_at + offset
     };
-    let mut pacing = PublicationPacing::new(due, std::time::Duration::from_secs_f64(interval))
-        .map_err(describe_error)?;
+    let interval = std::time::Duration::from_secs_f64(interval);
+    let mut pacing = match duration {
+        Some(seconds) => PublicationPacing::benchmark(
+            due,
+            interval,
+            due + std::time::Duration::from_secs_f64(seconds),
+        ),
+        None => PublicationPacing::new(due, interval),
+    }
+    .map_err(describe_error)?;
     let (input, source) = tokio::sync::mpsc::channel(8);
     let mut input = Some(input);
     let (output, mut results) =
@@ -236,16 +251,21 @@ async fn serve_stream(
                 result = &mut run => break result.map_err(describe_error),
                 publication = results.recv() => {
                     if let Some(publication) = publication {
-                        let sequence = publication.result.operation_sequence;
+                        let sequence = publication.intent.operation_sequence;
+                        let response = rolling_response(&publication);
                         applied.insert(sequence, publication.applied);
-                        write_response(json!({"result":{"intent":publication.intent,"publication":publication.result}})).await?;
+                        write_response(response).await?;
                     }
                 }
                 request = receive.recv() => {
                     let (_, request) = request.ok_or("stream input closed; journal retained")?;
                     match request? {
-                        Request::StreamItem { intent } => input.as_ref().ok_or("stream input already finished")?
-                            .try_send(*intent).map_err(|_| "stream input window exceeded")?,
+                        Request::StreamItem { intent } => {
+                            if !duration.is_some_and(|seconds| tokio::time::Instant::now() >= due + std::time::Duration::from_secs_f64(seconds)) {
+                                input.as_ref().ok_or("stream input already finished")?
+                                    .try_send(*intent).map_err(|_| "stream input window exceeded")?;
+                            }
+                        }
                         Request::StreamApplied { sequence } => applied.remove(&sequence.get())
                             .ok_or("application acknowledged an unknown result")?.send(())
                             .map_err(|_| "publication stream stopped; journal retained")?,
@@ -261,6 +281,14 @@ async fn serve_stream(
     ).await?;
     result?;
     Ok(pacing.max_schedule_lag().as_secs_f64())
+}
+
+fn rolling_response(publication: &aster_agent::sdk::RollingPublication) -> Value {
+    match &publication.result {
+        Ok(result) => json!({"result":{"intent":publication.intent,"publication":result}}),
+        Err(failure) => json!({"result":{"intent":publication.intent,"rejected":failure,
+            "operationSequence":publication.intent.operation_sequence.to_string()}}),
+    }
 }
 
 async fn execute(
@@ -396,6 +424,44 @@ async fn execute(
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    #[test]
+    fn capacity_outcome_is_separate_from_a_later_successful_receipt() {
+        let (applied, _) = tokio::sync::oneshot::channel();
+        let mut publication = aster_agent::sdk::RollingPublication {
+            intent: api::PublishNumberedEventRequest {
+                operation_sequence: 41,
+                logical_key: b"original".to_vec(),
+                ..Default::default()
+            },
+            result: Err(api::PublicErrorDetail {
+                reason: api::PublicErrorReason::ResourceExhaustion.into(),
+                operation: "publish_numbered_events".into(),
+                retryable: true,
+                ..Default::default()
+            }),
+            applied,
+        };
+        let rejected = rolling_response(&publication);
+        assert_eq!(rejected["result"]["operationSequence"], "41");
+        assert_eq!(
+            rejected["result"]["rejected"]["reason"],
+            "PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION"
+        );
+        assert!(rejected["result"].get("publication").is_none());
+        publication.intent.operation_sequence = 42;
+        publication.result = Ok(api::CommittedPublicationResult {
+            operation_sequence: 42,
+            ..Default::default()
+        });
+        let accepted = rolling_response(&publication);
+        assert_eq!(accepted["result"]["publication"]["operationSequence"], "42");
+        assert!(accepted["result"].get("rejected").is_none());
+        assert_eq!(
+            rejected["result"]["intent"]["logicalKey"],
+            accepted["result"]["intent"]["logicalKey"]
+        );
+    }
 
     struct SlowOutput;
     impl Write for SlowOutput {

@@ -175,6 +175,43 @@ class NumberedPublicationTests(unittest.TestCase):
         self.assertEqual(calls.count('stream-item'), 9)
         self.assertEqual(calls.count('stream-applied'), 9)
 
+    def test_duration_capacity_rejection_then_success_has_exact_metrics(self):
+        calls, applied = [], []
+        class Session:
+            def __init__(self):
+                self.intents, self.index = [], 0
+            def call(self, action, **kwargs):
+                return {'ready': True}
+            def send(self, action, **kwargs):
+                calls.append((action, kwargs))
+                if action == 'stream-item':
+                    self.intents.append(kwargs['intent'])
+            def read(self, **kwargs):
+                if self.index == 2:
+                    return {'finished': True, 'max_schedule_lag_seconds': 0}
+                intent = self.intents[self.index]
+                self.index += 1
+                if self.index == 1:
+                    return {'intent': intent, 'rejected': {'reason': 'PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION',
+                        'operation': 'publish_numbered_events', 'retryable': True}, 'operationSequence': '1'}
+                return {'intent': intent, 'publication': {'operationSequence': '2',
+                    'receipt': {'eventId': diagnostic.base64.b64encode(b'x' * 32).decode()}}}
+            def close(self):
+                pass
+        publisher = diagnostic.DiagnosticPublisher(Path('unused'), Path('unused'), 'client')
+        publisher.session = Session()
+        publisher._run = lambda *a, **kw: {'operations': []}
+        due = diagnostic.time.monotonic()
+        stats = diagnostic.PublicationStatistics(due, 1)
+        publisher.publish_stream([(b'rejected', b'p'), (b'accepted', b'p')], 10, due,
+            applied.append, duration=1, statistics=stats)
+        counts = stats.summary()
+        self.assertEqual([counts[k] for k in ('attempts', 'accepted_during', 'accepted_later', 'rejected', 'unknown')], [2, 1, 0, 1, 0])
+        self.assertEqual(len(applied), 2)
+        self.assertIn('rejected', applied[0])
+        self.assertIn('id', applied[1])
+        self.assertEqual([kw['sequence'] for action, kw in calls if action == 'stream-applied'], [1, 2])
+
     def test_rolling_failure_recovers_original_committed_only_without_replacement(self):
         calls, applied = [], []
         class Session:
@@ -1281,18 +1318,18 @@ class ProvenanceTests(unittest.TestCase):
         code, report, used = self.run_campaign()
         self.assertEqual(code, 0)
         self.assertEqual(used, [report['image_id']] * 4)
-        self.assertEqual(report['status'], 'pass')
+        self.assertEqual(report['status'], 'completed')
 
     def test_source_drift_fails_before_normal_receipts(self):
         code, report, used = self.run_campaign('source')
         self.assertEqual(code, 1)
-        self.assertIn('source/helper drift', report['error'])
+        self.assertEqual(report['error_code'], 'source-drift')
         self.assertEqual(len(used), 1)
 
     def test_helper_drift_fails_before_normal_receipts(self):
         code, report, used = self.run_campaign('helper')
         self.assertEqual(code, 1)
-        self.assertIn('source/helper drift', report['error'])
+        self.assertEqual(report['error_code'], 'source-drift')
         self.assertEqual(len(used), 1)
 
     def test_staged_only_change_is_in_source_diff_identity(self):
@@ -1342,7 +1379,7 @@ class WorkflowTests(unittest.TestCase):
                          if line.strip().startswith('PYTHONPATH=tools'))
         python_code = shlex.split(preflight)[3]
         root = str(Path(__file__).resolve().parents[1])
-        base = dict(os.environ, PYTHONPATH=root + '/tools', AGENTS='2', EVENTS='600',
+        base = dict(os.environ, PYTHONPATH=root + '/tools', AGENTS='2', DURATION='60',
                     PAYLOAD='1024', RATE='10', CPU='0', MEMORY='0', DEADLINE='120',
                     STORAGE_ITEMS='10000', STORAGE_MIB='64', PROFILE='all')
         for value in ('', '0', '3', '1000000', '-1', '3.5', '1000001', '$(id)'):
@@ -1448,10 +1485,10 @@ class WorkflowTests(unittest.TestCase):
         argv = shlex.split(script)
         start = argv.index('tools/aster_path_diagnostic.py')
         argv = argv[start:argv.index('2>&1')]
-        for name in ('agents', 'events-per-agent', 'payload-bytes', 'events-per-second',
+        for name in ('agents', 'duration-seconds', 'payload-bytes', 'events-per-second',
                      'cpu-limit', 'memory-mib', 'restore-deadline-seconds'):
             self.assertIn('--' + name, argv)
-        for name in ('AGENTS', 'EVENTS', 'PAYLOAD', 'RATE', 'CPU', 'MEMORY', 'DEADLINE', 'PROFILE'):
+        for name in ('AGENTS', 'DURATION', 'PAYLOAD', 'RATE', 'CPU', 'MEMORY', 'DEADLINE', 'PROFILE'):
             self.assertIn('"$' + name + '"', self.scripts[2])
         argv = ['diagnostic', '--output', 'artifacts/path-diagnostic']
         configurations = []
