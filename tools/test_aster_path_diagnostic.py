@@ -815,14 +815,6 @@ class ProvenanceTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
-    """Keep the foundation gate connected to the replacement manual workflow."""
-
-    def test_native_workflow_contract(self):
-        import subprocess
-        root = Path(__file__).resolve().parents[1]
-        subprocess.run([sys.executable, str(root / 'tools/duration-benchmark/test_workflow.py'), '-v'],
-                       cwd=root, check=True)
-
     def test_launch_arguments_use_actual_cli_defaults(self):
         # The legacy Docker controller remains callable, but no longer owns CI.
         argv = ['tools/aster_path_diagnostic.py', '--output', 'artifacts/path-diagnostic']

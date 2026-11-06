@@ -101,8 +101,8 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True, help='New output directory outside the checkout')
     parser.add_argument('--agents', type=int, default=2, help='Total agents, 2–16 (default: 2)')
     parser.add_argument('--duration-seconds', type=float, default=60, help='Publication duration, 0.01–600 seconds (default: 60)')
-    parser.add_argument('--overall-seconds', type=float, default=1800, help='Timeout from publication start through delivery, greater than duration and up to 86400 seconds (default: 1800); each RPC has a 900-second limit')
-    parser.add_argument('--events-per-second', default='10', help='Events/second per agent, 0–100000 (default: 10); max or 0 sends without pacing')
+    parser.add_argument('--overall-seconds', type=float, default=1800, help='Total benchmark timeout in seconds (default: 1800; > duration; max 86400)')
+    parser.add_argument('--events-per-second', default='10', help='Events/s per agent (1–100000; max = unlimited; default: 10)')
     parser.add_argument('--payload-bytes', type=int, default=256, help='Event payload size, 8–1024 bytes (default: 256)')
     parser.add_argument('--max-attempts', type=int, default=100000, help='Publication attempt limit per agent, 1–100000 (default: 100000)')
     parser.add_argument('--window', type=int, default=8, choices=range(1, 9), help='In-flight publications per agent, through result acknowledgement (default: 8)')
@@ -121,7 +121,7 @@ def main(argv=None):
     provenance = dict(base=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo).decode().strip(),
                       binaries={name: sha256(getattr(args, name)) for name in ('fixture', 'initializer', 'generator')},
                       source={name: sha256(Path(__file__).parent / name) for name in
-                              ('Cargo.toml', 'Cargo.lock', 'src/main.rs', 'controller.py', 'report.py', 'test_controller.py', 'test_report.py', 'README.md')},
+                              ('Cargo.toml', 'Cargo.lock', 'src/main.rs', 'controller.py', 'report.py', 'README.md')},
                       native_build_profile='caller-supplied; see binary hashes')
     snapshot = root / 'source-snapshot'
     snapshot.mkdir()

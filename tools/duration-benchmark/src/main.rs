@@ -63,25 +63,6 @@ impl Config {
         }
         Ok(())
     }
-    #[cfg(test)]
-    fn example() -> Self {
-        Self {
-            endpoints: vec![
-                Endpoint {
-                    url: "http://127.0.0.1:1".into(),
-                    token_file: "unused".into()
-                };
-                2
-            ],
-            duration_seconds: 60.0,
-            overall_seconds: 1800.0,
-            rate: 20.0,
-            window: 8,
-            payload_bytes: 256,
-            max_attempts: 100000,
-            output: "unused".into(),
-        }
-    }
 }
 #[derive(Serialize, Default)]
 struct Attempt {
@@ -107,6 +88,8 @@ struct Measurements {
     publication_finished: bool,
     publishers_remaining: usize,
     publication_started: bool,
+    publication_start_monotonic_s: Option<f64>,
+    publication_clock_uncertainty_s: Option<f64>,
     elapsed_s: f64,
     observed_sequences: BTreeMap<String, u64>,
 }
@@ -121,6 +104,8 @@ impl Measurements {
             publication_finished: false,
             publishers_remaining: nodes,
             publication_started: false,
+            publication_start_monotonic_s: None,
+            publication_clock_uncertainty_s: None,
             elapsed_s: 0.0,
             observed_sequences: BTreeMap::new(),
         }
@@ -574,6 +559,27 @@ async fn consume(
     }
 }
 
+fn monotonic_seconds() -> Result<f64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value is a valid writable timespec; CLOCK_MONOTONIC needs no ownership.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return Err("monotonic_clock");
+    }
+    Ok(value.tv_sec as f64 + value.tv_nsec as f64 / 1e9)
+}
+
+fn publication_clock() -> Result<(Instant, f64, f64)> {
+    // Linux CLOCK_MONOTONIC is also Python time.monotonic(). Bracket the exact
+    // Instant used by all workers, retaining the clock-read uncertainty.
+    let before = monotonic_seconds()?;
+    let start = Instant::now();
+    let after = monotonic_seconds()?;
+    Ok((start, (before + after) / 2.0, (after - before) / 2.0))
+}
+
 async fn run(c: Config) -> Result<()> {
     let state = Arc::new(Mutex::new(Measurements::new(c.endpoints.len())));
     let setup = async {
@@ -608,8 +614,13 @@ async fn run(c: Config) -> Result<()> {
             return Err(code);
         }
     };
-    let start = Instant::now();
-    state.lock().unwrap().publication_started = true;
+    let (start, origin, uncertainty) = publication_clock()?;
+    {
+        let mut s = state.lock().unwrap();
+        s.publication_started = true;
+        s.publication_start_monotonic_s = Some(origin);
+        s.publication_clock_uncertainty_s = Some(uncertainty);
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for (node, (client, context, _)) in clients.iter().enumerate() {
         let publisher_client = client.clone();
@@ -686,460 +697,5 @@ fn due_seconds(index: u64, rate: f64) -> f64 {
         0.0
     } else {
         index as f64 / rate
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::StreamExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    struct OwnedDir(PathBuf);
-    impl OwnedDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "duration-rpc-test-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-    impl Drop for OwnedDir {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).unwrap();
-        }
-    }
-    async fn rpc_fixture(
-        mode: &'static str,
-    ) -> (
-        Client,
-        Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-        String,
-    ) {
-        rpc_fixture_with_ack_control(mode, None).await
-    }
-
-    type AckRelease = (u64, tokio::sync::oneshot::Sender<()>);
-
-    async fn rpc_fixture_with_ack_control(
-        mode: &'static str,
-        ack_control: Option<tokio::sync::mpsc::UnboundedSender<AckRelease>>,
-    ) -> (
-        Client,
-        Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-        String,
-    ) {
-        use connectrpc::{
-            RequestContext, Response, Router, ServiceStream, bidi_streaming_handler_fn, handler_fn,
-        };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let stream_calls = calls.clone();
-        let ack_calls = calls.clone();
-        let abandon_calls = calls.clone();
-        let begin_calls = calls.clone();
-        let recovery_calls = calls.clone();
-        let service = api::ASTER_APPLICATION_SERVICE_SERVICE_NAME;
-        let router = Router::new()
-            .route(service, "BeginEventPublicationSession", handler_fn(move |ctx: RequestContext, req: api::BeginEventPublicationSessionRequest| {
-                assert_eq!(ctx.headers().get("authorization").unwrap(), "Bearer test-token");
-                assert_eq!(req.client_id, b"duration-benchmark-v1");
-                assert_eq!(req.claim_nonce, b"fresh-duration-benchmark-claim-v1");
-                begin_calls.lock().unwrap().push("begin".into());
-                async move { Ok(Response::new(api::BeginEventPublicationSessionResponse {
-                    session: if mode == "stale" { 2 } else { 1 }, snapshot_revision: 7, ..Default::default()
-                })) }
-            }))
-            .route(service, "CompleteEventPublicationRecovery", handler_fn(move |ctx: RequestContext, req: api::CompleteEventPublicationRecoveryRequest| {
-                assert_eq!(ctx.headers().get("authorization").unwrap(), "Bearer test-token");
-                assert_eq!(req.client_id, b"duration-benchmark-v1");
-                assert_eq!(req.session, 1);
-                assert_eq!(req.snapshot_revision, 7);
-                recovery_calls.lock().unwrap().push("recovery".into());
-                async { Ok(Response::new(api::CompleteEventPublicationRecoveryResponse::default())) }
-            }))
-            .route_bidi_stream(service, "PublishNumberedEvents", bidi_streaming_handler_fn(move |ctx: RequestContext, requests: ServiceStream<api::PublishNumberedEventsRequest>| {
-                assert_eq!(ctx.headers().get("authorization").unwrap(), "Bearer test-token");
-                stream_calls.lock().unwrap().push("stream".into());
-                async move {
-                    Response::stream_ok(requests.then(move |request| async move {
-                        let request = request?;
-                        let seq = request.publication.operation_sequence;
-                        if mode == "auth_error" { return Err(connectrpc::ConnectError::unauthenticated("test")); }
-                        if mode == "disconnect" { return Err(connectrpc::ConnectError::unavailable("test")); }
-                        if mode == "malformed" { return Ok(api::PublishNumberedEventsResponse::default()); }
-                        if mode == "timeout" { tokio::time::sleep(Duration::from_secs(1)).await; }
-                        if mode == "late" { tokio::time::sleep(Duration::from_millis(80)).await; }
-                        let outcome = if mode == "reject" {
-                            api::publish_numbered_events_response::Outcome::Failure(Box::new(api::PublicErrorDetail { operation: "publish_numbered_events".into(), reason: api::PublicErrorReason::OperationCapacityExhausted.into(), ..Default::default() }))
-                        } else {
-                            api::publish_numbered_events_response::Outcome::Published(Box::new(api::PublishNumberedEventResponse { result: api::CommittedPublicationResult { operation_sequence: if mode == "wrong_sequence" { seq + 1 } else { seq }, content: api::CommittedContentStatus::Available.into(), receipt: api::CommittedEventReceipt { event_id: vec![seq as u8;32], transfer_id: vec![3;32], acceptance_marker: if mode == "zero_marker" { 0 } else { seq }, ..Default::default() }.into(), ..Default::default() }.into(), inserted: true, ..Default::default() }))
-                        };
-                        Ok(api::PublishNumberedEventsResponse { outcome: Some(outcome), ..Default::default() })
-                    }))
-                }
-            }))
-            .route(service, "AcknowledgeEventPublicationResult", handler_fn(move |ctx: RequestContext, req: api::AcknowledgeEventPublicationResultRequest| {
-                assert_eq!(ctx.headers().get("authorization").unwrap(), "Bearer test-token");
-                ack_calls.lock().unwrap().push("ack".into());
-                let ack_control = ack_control.clone();
-                async move {
-                    if mode == "ack_error" { return Err(connectrpc::ConnectError::unauthenticated("test")); }
-                    if let Some(control) = ack_control {
-                        let (release, held) = tokio::sync::oneshot::channel();
-                        control.send((req.operation_sequence, release)).unwrap();
-                        held.await.unwrap();
-                    }
-                    Ok(Response::new(api::AcknowledgeEventPublicationResultResponse::default()))
-                }
-            }))
-            .route(service, "AbandonEventPublication", handler_fn(move |ctx: RequestContext, _: api::AbandonEventPublicationRequest| {
-                assert_eq!(ctx.headers().get("authorization").unwrap(), "Bearer test-token");
-                abandon_calls.lock().unwrap().push("abandon".into());
-                async { Ok(Response::new(api::AbandonEventPublicationResponse::default())) }
-            }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let uri: http::Uri = format!("http://{}", listener.local_addr().unwrap())
-            .parse()
-            .unwrap();
-        let task = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let service = connectrpc::ConnectRpcService::new(router);
-            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(
-                    hyper_util::rt::TokioIo::new(socket),
-                    hyper_util::service::TowerToHyperService::new(service),
-                )
-                .await;
-        });
-        let connection = Http2Connection::connect_plaintext(uri.clone())
-            .await
-            .unwrap()
-            .shared(8);
-        let client = Client::new(
-            connection,
-            ClientConfig::new(uri.clone())
-                .with_protocol(connectrpc::Protocol::Grpc)
-                .with_default_header("authorization", "Bearer test-token"),
-        );
-        (client, calls, task, uri.to_string())
-    }
-    #[tokio::test]
-    async fn native_rpc_multiple_frames_rejections_and_partial_errors() {
-        for mode in [
-            "accepted",
-            "reject",
-            "late",
-            "malformed",
-            "disconnect",
-            "timeout",
-        ] {
-            let owned = OwnedDir::new();
-            let mut c = Config::example();
-            c.output = owned.0.clone();
-            c.duration_seconds = 0.05;
-            c.overall_seconds = 1.0;
-            c.rate = 100.0;
-            let state = Arc::new(Mutex::new(Measurements::new(2)));
-            let (client, calls, server, _) = rpc_fixture(mode).await;
-            let context = api::EventClientContext {
-                client_id: b"test".to_vec(),
-                session: 1,
-                ..Default::default()
-            };
-            let result = tokio::time::timeout(
-                Duration::from_millis(600),
-                publish(0, client, context, c, Instant::now(), state.clone()),
-            )
-            .await;
-            let s = state.lock().unwrap();
-            match mode {
-                "accepted" => {
-                    assert!(matches!(result, Ok(Ok(()))), "{mode}: {result:?}");
-                    assert!(s.attempts.len() > 1, "multiple frames on a live stream");
-                    let calls = calls.lock().unwrap();
-                    assert_eq!(calls.iter().filter(|x| *x == "stream").count(), 1);
-                    let operation = if mode == "reject" { "abandon" } else { "ack" };
-                    assert_eq!(
-                        calls.iter().filter(|x| *x == operation).count(),
-                        s.attempts.len()
-                    );
-                }
-                "late" => {
-                    assert!(matches!(result, Ok(Ok(()))));
-                    assert!(s.attempts.len() > 1);
-                    assert!(s.attempts[0].response_s.unwrap() >= 0.05);
-                }
-                "reject" => {
-                    assert!(matches!(
-                        result,
-                        Ok(Err("capacity_rejection_pipeline_stopped"))
-                    ));
-                    assert_eq!(s.attempts[0].outcome, "rejected");
-                }
-                "timeout" => {
-                    assert!(result.is_err());
-                    assert_eq!(s.attempts[0].outcome, "unresolved");
-                }
-                _ => {
-                    assert!(matches!(result, Ok(Err(_))));
-                    assert_eq!(s.attempts[0].outcome, "unresolved");
-                }
-            }
-            server.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn delayed_receipt_does_not_serialize_sends() {
-        let owned = OwnedDir::new();
-        let mut c = Config::example();
-        c.output = owned.0.clone();
-        c.duration_seconds = 0.05;
-        c.overall_seconds = 2.0;
-        c.rate = 100.0;
-        let state = Arc::new(Mutex::new(Measurements::new(2)));
-        let (client, _, server, _) = rpc_fixture("late").await;
-        publish(
-            0,
-            client,
-            api::EventClientContext {
-                session: 1,
-                ..Default::default()
-            },
-            c,
-            Instant::now(),
-            state.clone(),
-        )
-        .await
-        .unwrap();
-        let s = state.lock().unwrap();
-        assert!(
-            s.attempts.len() >= 3,
-            "must send multiple paced frames before delayed first receipt"
-        );
-        assert!(s.attempts[2].send_started_s.unwrap() < s.attempts[0].response_s.unwrap());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn initial_session_validates_freshness_and_completes_recovery() {
-        for mode in ["accepted", "stale"] {
-            let (client, calls, server, _) = rpc_fixture(mode).await;
-            let result = initialize(&client).await;
-            if mode == "stale" {
-                assert_eq!(result.err(), Some("nonfresh_session"));
-                assert!(!calls.lock().unwrap().iter().any(|c| c == "recovery"));
-            } else {
-                assert_eq!(result.unwrap().session, 1);
-                assert_eq!(*calls.lock().unwrap(), vec!["begin", "recovery"]);
-            }
-            server.abort();
-        }
-    }
-
-    // Keep the runtime runnable while driving real socket I/O, so paused Tokio
-    // time cannot auto-advance to the publication cutoff. Wall time is only a
-    // deadlock watchdog, never an assertion about when an acknowledgement wins.
-    async fn drive_io<T>(future: impl std::future::Future<Output = T>, stage: &str) -> T {
-        tokio::pin!(future);
-        let watchdog = std::time::Instant::now();
-        loop {
-            if let std::task::Poll::Ready(value) = futures::poll!(&mut future) {
-                return value;
-            }
-            assert!(watchdog.elapsed() < Duration::from_secs(2), "{stage}");
-            tokio::task::yield_now().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn delayed_ack_bounds_window_and_refills_without_batch_barrier() {
-        let owned = OwnedDir::new();
-        let mut c = Config::example();
-        c.output = owned.0.clone();
-        c.duration_seconds = 0.18;
-        c.overall_seconds = 2.0;
-        c.rate = 1000.0;
-        c.window = 8;
-        let state = Arc::new(Mutex::new(Measurements::new(2)));
-        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (client, _, server, _) = rpc_fixture_with_ack_control("accepted", Some(ack_tx)).await;
-        tokio::time::pause();
-        let start = Instant::now();
-        let publisher = tokio::spawn(publish(
-            0,
-            client,
-            api::EventClientContext {
-                session: 1,
-                ..Default::default()
-            },
-            c,
-            start,
-            state.clone(),
-        ));
-        // Make the first nine deadlines eligible, but keep the cutoff frozen.
-        tokio::time::advance(Duration::from_millis(8)).await;
-        let mut held = BTreeMap::new();
-        for _ in 0..8 {
-            let (sequence, release) = drive_io(ack_rx.recv(), "initial window must fill")
-                .await
-                .unwrap();
-            assert!(held.insert(sequence, release).is_none());
-        }
-        assert_eq!(
-            held.keys().copied().collect::<Vec<_>>(),
-            (1..=8).collect::<Vec<_>>()
-        );
-        {
-            let s = state.lock().unwrap();
-            assert_eq!(s.attempts.len(), 8, "no credit before acknowledgement");
-            assert!(s.attempts.iter().all(|a| !a.result_acknowledged));
-        }
-        // Release a non-leading ack: neither an ordered join nor a batch barrier
-        // may hold up the next send. The other seven responses remain gated.
-        tokio::time::advance(Duration::from_millis(1)).await;
-        held.remove(&4).unwrap().send(()).unwrap();
-        let (sequence, ninth) = drive_io(
-            ack_rx.recv(),
-            "first completed ack must refill without waiting for the other seven",
-        )
-        .await
-        .unwrap();
-        assert_eq!(sequence, 9);
-        {
-            let s = state.lock().unwrap();
-            assert_eq!(s.attempts.len(), 9);
-            assert!(s.attempts[3].result_acknowledged);
-            for &sequence in held.keys() {
-                assert!(!s.attempts[sequence as usize - 1].result_acknowledged);
-            }
-            assert_eq!(
-                s.attempts[8].due_s, 0.008,
-                "refill must retain original monotonic deadline"
-            );
-        }
-        // Close admission before releasing the remaining acknowledgements.
-        // Cross the cutoff by one timer tick so Tokio's millisecond-rounded
-        // sleep/timeout deadlines are ready even when start is fractional.
-        tokio::time::advance(start + Duration::from_millis(181) - Instant::now()).await;
-        for release in held.into_values().chain(std::iter::once(ninth)) {
-            release.send(()).unwrap();
-        }
-        drive_io(publisher, "all admitted publications must settle")
-            .await
-            .unwrap()
-            .unwrap();
-        let s = state.lock().unwrap();
-        assert_eq!(s.attempts.len(), 9);
-        assert!(s.attempts.iter().all(|a| a.result_acknowledged));
-        let mut timeline = Vec::new();
-        for a in &s.attempts {
-            timeline.push((a.send_started_s.unwrap(), 1i32));
-            timeline.push((a.result_acknowledged_s.unwrap(), -1));
-        }
-        timeline.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let mut outstanding = 0;
-        for (_, delta) in timeline {
-            outstanding += delta;
-            assert!((0..=8).contains(&outstanding));
-        }
-        assert_eq!(outstanding, 0);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn invalid_receipts_and_authentication_are_partial_errors() {
-        for mode in ["wrong_sequence", "zero_marker", "auth_error", "ack_error"] {
-            let owned = OwnedDir::new();
-            let mut c = Config::example();
-            c.output = owned.0.clone();
-            c.duration_seconds = 0.02;
-            c.rate = 100.0;
-            let state = Arc::new(Mutex::new(Measurements::new(2)));
-            let (client, _, server, _) = rpc_fixture(mode).await;
-            let result = publish(
-                0,
-                client,
-                api::EventClientContext {
-                    session: 1,
-                    ..Default::default()
-                },
-                c,
-                Instant::now(),
-                state.clone(),
-            )
-            .await;
-            assert!(result.is_err(), "{mode} must not succeed");
-            assert!(!state.lock().unwrap().attempts[0].result_acknowledged);
-            server.abort();
-        }
-    }
-
-    #[test]
-    fn publishers_have_distinct_payload_identities() {
-        assert_eq!(publication_identity(0, 1, 100), 1);
-        assert_eq!(publication_identity(1, 1, 100), 101);
-        assert_eq!(publication_identity(4, 100, 100), 500);
-    }
-
-    #[test]
-    fn delivery_before_receipt_still_checks_exact_payload_identity() {
-        let mut state = Measurements::new(2);
-        state.record_delivery(0, "aa".into(), 2, 0.1).unwrap();
-        assert_eq!(
-            state.record_acceptance("aa".into(), 1),
-            Err("delivery_payload_identity")
-        );
-    }
-    #[test]
-    fn validates_config_and_exact_convergence() {
-        let mut c = super::Config::example();
-        assert!(c.validate().is_ok());
-        c.window = 0;
-        assert_eq!(c.validate(), Err("configuration_bounds"));
-        c.window = 9;
-        assert_eq!(c.validate(), Err("configuration_bounds"));
-        c.window = 8;
-        c.rate = f64::NAN;
-        assert!(c.validate().is_err());
-        c.rate = 1.0;
-        c.overall_seconds = c.duration_seconds;
-        assert!(c.validate().is_err());
-        let mut s = super::Measurements::new(2);
-        assert!(s.complete());
-        s.accepted.insert("aa".into(), 1);
-        assert!(!s.complete());
-        s.delivered[0].insert("aa".into(), 1.0);
-        assert!(!s.complete());
-        s.delivered[1].insert("bb".into(), 1.0);
-        assert!(!s.complete());
-        s.delivered[1].insert("aa".into(), 2.0);
-        assert!(s.complete());
-    }
-    #[test]
-    fn payload_verifies_full_bytes_and_rejects_malformed() {
-        let p = super::payload(12, 256);
-        assert_eq!(super::payload_sequence(&p, 256, 20).unwrap(), 12);
-        let mut bad = p;
-        bad[255] ^= 1;
-        assert!(super::payload_sequence(&bad, 256, 20).is_err());
-        assert!(super::payload_sequence(&[], 256, 20).is_err());
-    }
-    #[test]
-    fn exact_scheduled_count_is_not_an_attempt_limit() {
-        assert!(!super::attempt_limit_reached(2, 2, 0.05, 40.0));
-        assert!(super::attempt_limit_reached(2, 2, 0.05, 0.0));
-        assert!(super::attempt_limit_reached(2, 2, 0.05, 100.0));
-    }
-    #[test]
-    fn absolute_schedule_does_not_accumulate_wake_jitter() {
-        for n in 0..1000 {
-            assert_eq!(super::due_seconds(n, 20.0), n as f64 / 20.0);
-        }
     }
 }

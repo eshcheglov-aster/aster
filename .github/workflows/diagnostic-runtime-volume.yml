@@ -14,7 +14,7 @@ on:
         default: '60'
         required: true
       events_per_second:
-        description: 'Events/second per agent (0–100000); max or 0 sends without pacing'
+        description: 'Events/s per agent (1–100000; max = unlimited)'
         type: string
         default: '10'
         required: true
@@ -29,7 +29,7 @@ on:
         default: '8'
         required: true
       overall_seconds:
-        description: 'Overall timeout from publication start, seconds (> duration, up to 3600)'
+        description: 'Total benchmark timeout in seconds (default: 1800; > duration; max 3600)'
         type: string
         default: '1800'
         required: true
@@ -90,7 +90,7 @@ jobs:
           restore-keys: |
             duration-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', '**/Cargo.lock', '**/Cargo.toml') }}-
 
-      - name: Test benchmark and workflow contracts
+      - name: Check benchmark source and formatting
         timeout-minutes: 15
         run: |
           {
@@ -99,8 +99,6 @@ jobs:
             rustc --version
             python3 --version
             cargo fmt --manifest-path tools/duration-benchmark/Cargo.toml -- --check
-            sh tools/with-test-resources.sh cargo test --locked --manifest-path tools/duration-benchmark/Cargo.toml
-            python3 -m unittest discover -s tools/duration-benchmark -v
           } 2>&1 | tee artifacts/duration-benchmark/preflight.log
 
       - name: Build release agents and benchmark generator

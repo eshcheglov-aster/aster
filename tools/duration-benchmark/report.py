@@ -58,21 +58,78 @@ def summarize(source):
     return result
 
 
+def chart_data(source, resources, summary):
+    """Keep raw exports intact; align plots only with an explicit clock anchor."""
+    m = source.get('measurements', {})
+    duration = source.get('duration_seconds', 0)
+    observed = [t for seen in m.get('delivered', []) for t in seen.values()]
+    xmax = m.get('elapsed_s') or max([duration, *observed], default=1) or 1
+    origin = m.get('publication_start_monotonic_s')
+    roles = sorted(set(r['role'] for r in resources))
+    charts = []
+    for field, label, scale, units in [
+            ('cpu_percent', 'Process CPU (100% = one core)', 1, '%'),
+            ('rss_bytes', 'Process memory (RSS)', 1024**2, 'MiB')]:
+        series = [] if origin is None else [
+            (role, [(r['monotonic_s'] - origin, r[field] / scale) for r in resources
+                    if r['role'] == role and r[field] is not None
+                    and 0 <= r['monotonic_s'] - origin <= xmax]) for role in roles]
+        charts.append((label, series, units))
+    # Each bin covers only its publication interval, never the delivery drain.
+    eps = [(x, count / (min(i + 1, duration) - i))
+           for i, count in enumerate(summary['eps'])
+           for x in (i, min(i + 1, duration)) if x <= xmax]
+    charts.append(('Accepted Events per second (all agents)', [('All publishers', eps)], 'Events/s'))
+    delivery = []
+    for node, seen in enumerate(m.get('delivered', [])):
+        times = sorted(seen[k] for k in m.get('accepted', {}) if k in seen and 0 <= seen[k] <= xmax)
+        delivery.append((f'agent-{node}', [(0, 0)] + [(t, i + 1) for i, t in enumerate(times)]))
+    charts.append(('Confirmed Event deliveries by agent', delivery, 'Events'))
+    return xmax, charts
+
+
 def coordinates(points, xmax, ymax):
-    return ' '.join(f'{40 + 720*x/max(xmax, 1e-12):.3f},{220 - 200*y/max(ymax, 1e-12):.3f}' for x, y in points)
+    return ' '.join(f'{80 + 660*x/max(xmax, 1e-12):.3f},{240 - 200*y/max(ymax, 1e-12):.3f}' for x, y in points)
 
 
-def chart(title, series, units):
+def nice_step(maximum):
+    raw = max(maximum, 1e-12) / 5
+    power = 10 ** math.floor(math.log10(raw))
+    return next(n * power for n in (1, 2, 2.5, 5, 10) if n * power >= raw)
+
+
+def chart(title, series, units, xmax, publication_end):
     points = [p for _, seq in series for p in seq]
-    xmax = max((p[0] for p in points), default=1) or 1
-    ymax = max((p[1] for p in points), default=1) or 1
+    maximum = max((p[1] for p in points), default=1) or 1
+    ystep = nice_step(maximum)
+    ymax = math.ceil(maximum / ystep) * ystep
+    xstep = nice_step(xmax)
     colors = ['#135aba', '#b43a28', '#24874b', '#8a46ab', '#a5750e', '#277b86']
-    out = [f'<h2>{html.escape(title)}</h2>', '<svg viewBox="0 0 800 260" role="img">',
-           '<path d="M40 20 V220 H760" fill="none" stroke="#777"/>',
-           f'<text x="40" y="250">0</text><text x="630" y="250">{xmax:.2f} seconds</text>',
-           f'<text x="40" y="15">{ymax:.2f} {html.escape(units)}</text>']
+    out = [f'<h2>{html.escape(title)}</h2>',
+           f'<svg viewBox="0 0 820 330" role="img" aria-label="{html.escape(title)}" data-xmax="{xmax}">',
+           '<style>.grid{stroke:#d5dbe0;stroke-width:1}text{font:13px system-ui}.publication-end{stroke:#555;stroke-dasharray:5 4}</style>']
+    for i in range(math.floor(xmax / xstep) + 1):
+        value = i * xstep
+        x = 80 + 660 * value / xmax
+        out.append(f'<g class="x-tick" data-value="{value:g}"><line class="grid" x1="{x:.3f}" y1="40" x2="{x:.3f}" y2="240"/><text x="{x:.3f}" y="263" text-anchor="middle">{value:g}</text></g>')
+    for i in range(round(ymax / ystep) + 1):
+        value = i * ystep
+        y = 240 - 200 * value / ymax
+        out.append(f'<g class="y-tick"><line class="grid" x1="80" y1="{y:.3f}" x2="740" y2="{y:.3f}"/><text x="69" y="{y + 4:.3f}" text-anchor="end">{value:g}</text></g>')
+    out.extend(['<path d="M80 40 V240 H740" fill="none" stroke="#555"/>',
+                '<text x="410" y="302" text-anchor="middle">Seconds since publication start</text>',
+                f'<text x="18" y="140" text-anchor="middle" transform="rotate(-90 18 140)">{html.escape(units)}</text>'])
+    if 0 <= publication_end <= xmax:
+        x = 80 + 660 * publication_end / xmax
+        out.append(f'<line class="publication-end" x1="{x:.3f}" x2="{x:.3f}" y1="35" y2="240"/>')
+        out.append(f'<text x="740" y="22" text-anchor="end">Publication end ({publication_end:g} s), dashed line</text>')
     for i, (name, seq) in enumerate(series):
-        out.append(f'<polyline data-series="{html.escape(name)}" points="{coordinates(seq, xmax, ymax)}" fill="none" stroke="{colors[i % len(colors)]}"/>')
+        out.append(f'<polyline data-series="{html.escape(name)}" points="{coordinates(seq, xmax, ymax)}" fill="none" stroke="{colors[i % len(colors)]}" stroke-width="2"/>')
+        if len(seq) == 1:
+            x, y = coordinates(seq, xmax, ymax).split(',')
+            out.append(f'<circle cx="{x}" cy="{y}" r="3" fill="{colors[i % len(colors)]}"/>')
+    if not points:
+        out.append('<text x="410" y="140" text-anchor="middle">Aligned data unavailable</text>')
     out.append('</svg><p>' + ' · '.join(f'<span style="color:{colors[i % len(colors)]}">{html.escape(name)}</span>' for i, (name, _) in enumerate(series)) + '</p>')
     return ''.join(out)
 
@@ -125,21 +182,16 @@ def render(root):
              f'<p>Median: {display(summary["latency_median_s"])} s; p95 (nearest rank): {display(summary["latency_p95_s"])} s.</p>',
              '<p>From send start to client response, including local queues, transport and server work. Includes accepted responses after publication ends; excludes delivery to consumers.</p>']
     parts.append(f'<p>Scheduled attempts not generated: {display(summary["not_generated"]) if source.get("rate") != 0 else "not applicable without a paced schedule"}.</p>')
-    origin = min((r['monotonic_s'] for r in resources), default=0)
-    roles = sorted(set(r['role'] for r in resources))
-    for field, label, scale, units in [('cpu_percent', 'Process CPU (100% = one core; includes setup)', 1, '%'), ('rss_bytes', 'Process memory (RSS; includes setup)', 1024**2, 'MiB')]:
-        series = [(role, [(r['monotonic_s']-origin, r[field]/scale) for r in resources if r['role'] == role and r[field] is not None]) for role in roles]
-        parts.append(chart(label, series, units))
-    parts.append(chart('Accepted Events per second (all agents)', [('All publishers', list(enumerate(summary['eps'])))], 'Events'))
-    series = []
-    for node, seen in enumerate(m.get('delivered', [])):
-        times = sorted(seen[k] for k in m.get('accepted', {}) if k in seen)
-        series.append((f'agent-{node}', [(0, 0)] + [(t, i+1) for i, t in enumerate(times)]))
-    parts.append(chart('Confirmed Event deliveries by agent', series, 'Events'))
-    parts.append('<h2>Delivery of confirmed accepted Events</h2><table><tr><th>Agent</th><th>Observed</th><th>Not yet observed</th><th>Completion after publication (s)</th><th>Latency median (s)</th><th>Latency p95 (s)</th></tr>')
+    xmax, charts = chart_data(source, resources, summary)
+    parts.append('<p>Charts share publication start (0 s) and the measurement completion time, including delivery drain. Dashed lines mark publication end. Resource lines stop at the last available sample; accepted-rate bins stop at publication end.</p>')
+    if m.get('publication_start_monotonic_s') is None:
+        parts.append('<p>Aligned resource data unavailable: this measurement has no publication-start clock anchor. Raw resource samples remain in JSON and CSV.</p>')
+    for label, series, units in charts:
+        parts.append(chart(label, series, units, xmax, source.get('duration_seconds', 0)))
+    parts.append('<h2>Delivery of confirmed accepted Events</h2><table><tr><th>Agent</th><th>Observed</th><th>Pending</th><th>Completion after publication (s)</th><th>Latency median (s)</th><th>Latency p95 (s)</th></tr>')
     for row in summary['delivery']:
         parts.append('<tr>' + ''.join(f'<td>{display(row[k])}</td>' for k in ['node', 'delivered', 'pending', 'completion_after_publication_s', 'latency_median_s', 'latency_p95_s']) + '</tr>')
-    parts.append('</table><p>Delivery latency runs from send start to first consumer observation, including polling delay. Percentiles use observed confirmed IDs only. Completion measures time after publication ends until the agent has observed all confirmed IDs, with a minimum of zero. No accepted Events means no completion time. Resource charts start at the first sample; publication and delivery charts start at publication. Unavailable means no measurement; JSON and CSV retain full precision.</p>')
+    parts.append('</table><p>Pending means confirmed accepted Events not yet observed by that agent. Delivery latency runs from send start to first consumer observation, including polling delay. Percentiles use observed confirmed IDs only. Completion measures time after publication ends until the agent has observed all confirmed IDs, with a minimum of zero. No accepted Events means no completion time. Unavailable means no measurement; JSON and CSV retain full precision.</p>')
     (root / 'report.html').write_text(''.join(parts))
     lines = ['| Status | Accepted during publication | Accepted after publication | Capacity rejected | Outcome unknown | Not sent |', '|---|---:|---:|---:|---:|---:|', '| ' + status + ' | ' + ' | '.join(display(summary[k]) for k in ['accepted_within', 'accepted_after', 'rejected', 'unresolved', 'unsent']) + ' |', '', 'Counts combine all publishers. Outcome unknown: send started without a confirmed outcome. Not sent: generated intent with no send start. Incomplete does not establish Event loss. See report.html for rates, latency and delivery progress.']
     (root / 'summary.md').write_text('\n'.join(lines) + '\n')

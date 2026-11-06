@@ -171,10 +171,8 @@ version = "0.0.0"
 dependencies = [
  "aster-agent",
  "connectrpc",
- "futures",
  "http",
- "hyper",
- "hyper-util",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -515,7 +513,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "libc",
  "percent-encoding",
  "pin-project",
  "serde",
@@ -525,7 +522,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
- "tower-http",
  "tracing",
  "wasm-bindgen-futures",
 ]
@@ -3613,12 +3609,10 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "pin-project-lite",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

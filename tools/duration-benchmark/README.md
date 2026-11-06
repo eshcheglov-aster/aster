@@ -36,9 +36,9 @@ unprotected test credentials; do not use them in production.
 |---|---:|---|
 | `--agents` | 2 | Total agents, 2–16 |
 | `--duration-seconds` | 60 | Publication duration, 0.01–600 seconds |
-| `--events-per-second` | 10 | Events/second **per agent**, 0–100000; `max` or `0` sends without pacing |
+| `--events-per-second` | 10 | Events/s **per agent**, 1–100000; `max` = unlimited (no pacing). `0` remains a supported alias; positive fractional rates below 1 also remain accepted |
 | `--window` | 8 | In-flight publications per agent, 1–8; each holds a slot through result acknowledgement |
-| `--overall-seconds` | 1800 | Timeout from publication start through settlement and delivery, greater than duration and at most 86400 seconds |
+| `--overall-seconds` | 1800 | Total benchmark timeout in seconds, greater than duration and at most 86400 |
 | `--payload-bytes` | 256 | Full Event payload size, 8–1024 bytes |
 | `--max-attempts` | 100000 | Publication attempt limit per agent, 1–100000; also bounds retained measurements |
 
@@ -109,8 +109,21 @@ to observe all confirmed accepted IDs, up to the overall timeout.
 
 Open `report.html` offline. It contains SVG charts for per-process CPU and memory
 (RSS), aggregate accepted Events in each publication second, and delivery progress
-per agent. Resource charts start at the first sample and include generator setup.
-Publication and delivery charts start at publication.
+per agent. Every chart starts at publication (0 s), ends at measurement completion
+including delivery drain, and uses the same X ticks. A dashed line marks the
+configured publication end. Rate bins cover only the publication interval;
+a fractional final bin divides its count by its interval length. CSV retains
+raw bin counts. Resource lines stop at their last available sample.
+
+New measurements record `publication_start_monotonic_s` by bracketing the actual
+Rust publication `Instant` with Linux `CLOCK_MONOTONIC` reads. The anchor is the
+bracket midpoint; `publication_clock_uncertainty_s` retains its half-width.
+Python `time.monotonic()` uses the same host clock. Resource X coordinates subtract
+that anchor; setup samples and samples after `elapsed_s` are omitted from plots,
+not raw exports. CPU values remain averages over their original sampling intervals,
+so the first plotted value can span publication start. Old measurements without
+an explicit anchor show aligned resource data as unavailable; the report never
+estimates publication start from the first sample or process launch.
 
 The controller samples `/proc/PID/stat` once per second and at process completion,
 without waiting for RPCs. It computes CPU changes only between samples with the
@@ -151,6 +164,8 @@ Publication response latency runs from send start to the client-observed respons
 including local queues, transport and server work. Its median and nearest-rank p95
 include accepted responses after publication ends.
 
+**Pending** means confirmed accepted Events not yet observed by that agent.
+
 Delivery latency runs from that same send start to the consumer's first
 observation, including polling delay. Each agent's median and nearest-rank p95 use
 only observed confirmed IDs; `delivery.csv` retains each sample. Delivery
@@ -166,21 +181,6 @@ when it has no measurement; JSON and CSV keep full numeric precision.
 configurations and raw process logs. The controller keeps it for diagnosis, stops
 only its own child processes, and leaves fixture directories on disk.
 
-## Tests
-
-```sh
-mise exec -- cargo test --locked --manifest-path tools/duration-benchmark/Cargo.toml
-python3 -m unittest discover -s tools/duration-benchmark -v
-```
-
-Rust tests exercise the generated client against a local HTTP/2 fixture: multiple
-frames on one stream, per-request authentication, capacity rejection and
-abandonment, late acceptance, malformed outcomes, disconnects and timeouts. They
-also check exact-ID delivery, payload validation before receipt arrival, absolute
-scheduling and configuration bounds. Python tests check CPU process identity,
-process exit, publication-cutoff counts, empty intervals, and agreement between
-JSON, CSV and SVG output. Real multi-agent runs require separate verification.
-
 The benchmark uses an independent Cargo workspace and leaves the production SDK,
 CLI, runtime, protobuf definitions and root manifests unchanged.
 
@@ -193,7 +193,7 @@ for no pacing), payload bytes, in-flight window and overall timeout. Defaults ma
 the local controller, including **1800 seconds** overall. CI caps that timeout at
 3600 seconds and fixes the per-agent attempt limit at 100000.
 
-The workflow validates inputs, tests the benchmark, then builds the acceptance
+The workflow validates inputs, checks formatting, then builds the acceptance
 fixture, initializer and generator in release mode with `--locked`. Cargo caches
 contain downloads and build outputs. Agents run as native Linux processes on
 loopback. This workflow does not run the former Docker profiles, resource limits,
@@ -211,6 +211,3 @@ files. It excludes `private/`, raw agent and generator logs, publication/deliver
 journals and `source-snapshot/`. The local source snapshot contains only benchmark
 sources listed in `provenance.json`; the published ref supplies those sources in
 CI. The nested `.gitignore` excludes local `*.log` files from staging.
-
-Run `python3 tools/duration-benchmark/test_workflow.py -v` to check input mapping,
-shell argument boundaries, failure propagation and the upload allowlist.
