@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native-only fixture orchestration and independent one-second procfs sampling."""
+"""Benchmark Event publication and delivery between local agents; sample process CPU and memory once per second."""
 import argparse
 import hashlib
 import json
@@ -95,17 +95,17 @@ def prepare(root, agents, fixture, initializer):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--fixture', type=Path, required=True)
-    parser.add_argument('--initializer', type=Path, required=True)
-    parser.add_argument('--generator', type=Path, required=True)
-    parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--agents', type=int, default=2)
-    parser.add_argument('--duration-seconds', type=float, default=60)
-    parser.add_argument('--overall-seconds', type=float, default=1800)
-    parser.add_argument('--events-per-second', default='10', help='Offered rate PER AGENT, or max')
-    parser.add_argument('--payload-bytes', type=int, default=256)
-    parser.add_argument('--max-attempts', type=int, default=100000)
-    parser.add_argument('--window', type=int, default=8, choices=range(1, 9), help='Per-agent sent-through-result-ack window')
+    parser.add_argument('--fixture', type=Path, required=True, help='Acceptance-fixture executable')
+    parser.add_argument('--initializer', type=Path, required=True, help='Aster executable for playground initialization')
+    parser.add_argument('--generator', type=Path, required=True, help='Benchmark generator executable')
+    parser.add_argument('--output', type=Path, required=True, help='New output directory outside the checkout')
+    parser.add_argument('--agents', type=int, default=2, help='Total agents, 2–16 (default: 2)')
+    parser.add_argument('--duration-seconds', type=float, default=60, help='Publication duration, 0.01–600 seconds (default: 60)')
+    parser.add_argument('--overall-seconds', type=float, default=1800, help='Timeout from publication start through delivery, greater than duration and up to 86400 seconds (default: 1800); each RPC has a 900-second limit')
+    parser.add_argument('--events-per-second', default='10', help='Events/second per agent, 0–100000 (default: 10); max or 0 sends without pacing')
+    parser.add_argument('--payload-bytes', type=int, default=256, help='Event payload size, 8–1024 bytes (default: 256)')
+    parser.add_argument('--max-attempts', type=int, default=100000, help='Publication attempt limit per agent, 1–100000 (default: 100000)')
+    parser.add_argument('--window', type=int, default=8, choices=range(1, 9), help='In-flight publications per agent, through result acknowledgement (default: 8)')
     args = parser.parse_args(argv)
     rate = 0.0 if args.events_per_second == 'max' else float(args.events_per_second)
     validate(args.agents, args.duration_seconds, args.overall_seconds, rate, args.payload_bytes, args.max_attempts)

@@ -41,7 +41,7 @@ python3 tools/test_aster_path_diagnostic.py
 
 ### Manual GitHub Actions launch
 
-Choose **Actions → Diagnostic: manual runtime-volume test → Run workflow**, then
+Choose **Actions → Benchmark: Event publication and delivery → Run workflow**, then
 select the source branch. `.github/workflows/diagnostic-runtime-volume.yml` must exist on
 the default branch before GitHub exposes the launch button. This replaces the
 archived runtime-volume launch; it does not revive that implementation or run

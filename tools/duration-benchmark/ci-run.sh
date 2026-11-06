@@ -15,7 +15,7 @@ try:
     if not 1 <= int(os.environ['WINDOW']) <= 8 or overall > 3600:
         raise ValueError('ci_bounds')
 except (KeyError, ValueError, OverflowError):
-    sys.exit('Invalid benchmark inputs; see tools/duration-benchmark/README.md')
+    sys.exit('Invalid input. Check ranges and units in tools/duration-benchmark/README.md')
 PY
 if [[ "${1:-}" == validate ]]; then
   exit 0

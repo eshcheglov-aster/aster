@@ -103,31 +103,45 @@ def render(root):
     delivery_rows = [dict(node=i, event_id=id, observed_s=seen[id],
                           latency_s=seen[id] - sent[id] if id in sent else None) for i, seen in enumerate(m.get('delivered', [])) for id in m.get('accepted', {}) if id in seen]
     write_csv(root / 'delivery.csv', delivery_rows, ['node', 'event_id', 'observed_s', 'latency_s'])
-    parts = ['<!doctype html><meta charset="utf-8"><title>Aster duration benchmark</title>',
+    def display(value):
+        if value is None:
+            return 'unavailable'
+        return f'{value:.3f}' if isinstance(value, float) else str(value)
+
+    status = 'Completed' if summary['status'] == 'completed' else 'Incomplete'
+    parts = ['<!doctype html><meta charset="utf-8"><title>Aster Event publication and delivery benchmark</title>',
              '<style>body{font:16px system-ui;max-width:1050px;margin:2em auto;padding:1em}svg{width:100%;background:#f4f6f8}table{border-collapse:collapse}td,th{border:1px solid #aaa;padding:.5em}</style>',
-             '<h1>Aster duration benchmark</h1>', f'<p>Status: <b>{summary["status"]}</b></p>',
-             '<p>Each agent publishes independently at the configured per-agent rate. Aggregate accepted rate divides by publication duration, not agent count. Response latency runs from native stream send invocation to response observation, including local/transport queues; it is not server execution or delivery latency. 100% CPU means one core. Empty and missing observations remain unavailable.</p>',
-             '<table><tr><th>Within publication interval</th><th>After interval</th><th>Rejected</th><th>Unresolved</th><th>Unsent</th></tr>',
-             '<tr>' + ''.join(f'<td>{summary[k]}</td>' for k in ['accepted_within', 'accepted_after', 'rejected', 'unresolved', 'unsent']) + '</tr></table>',
-             f'<p>Accepted-response median: {summary["latency_median_s"]} s; nearest-rank p95: {summary["latency_p95_s"]} s.</p>']
-    parts.append(f'<p>Scheduled positions never generated: {summary["not_generated"] if summary["not_generated"] is not None else "not defined in max mode"}. Unsent counts only durably recorded intents that never entered the send call.</p>')
+             '<h1>Event publication and delivery benchmark</h1>', f'<p>Status: <b>{status}</b></p>',
+             '<p>Each agent publishes to every agent, including itself. Counts below combine all publishers. Incomplete means the run stopped before completing its checks; it does not establish Event loss.</p>',
+             f'<p>Agents: {display(source.get("publisher_nodes"))}. Publication duration: {display(source.get("duration_seconds"))} s. '
+             f'Offered rate per agent: {"unpaced" if source.get("rate") == 0 else display(source.get("rate")) + " Events/s"}. '
+             f'In-flight limit per agent: {display(source.get("application_window"))} publications, through result acknowledgement.</p>',
+             '<h2>Publication outcomes (all agents)</h2>',
+             '<table><tr><th>Accepted during publication</th><th>Accepted after publication</th><th>Capacity rejected</th><th>Outcome unknown</th><th>Not sent</th></tr>',
+             '<tr>' + ''.join(f'<td>{display(summary[k])}</td>' for k in ['accepted_within', 'accepted_after', 'rejected', 'unresolved', 'unsent']) + '</tr></table>',
+             '<p>Acceptance counts use client response times: during publication means [0, duration); after publication means at or after duration. Outcome unknown means the generator recorded a send start without a confirmed acceptance or capacity rejection. A send start does not prove server receipt. Not sent counts generated intents with no send start.</p>',
+             f'<p>Aggregate accepted rate during publication: {display(summary["accepted_per_second"])} Events/s (total accepted divided by publication duration).</p>',
+             '<h2>Publication response latency</h2>',
+             f'<p>Median: {display(summary["latency_median_s"])} s; p95 (nearest rank): {display(summary["latency_p95_s"])} s.</p>',
+             '<p>From send start to client response, including local queues, transport and server work. Includes accepted responses after publication ends; excludes delivery to consumers.</p>']
+    parts.append(f'<p>Scheduled attempts not generated: {display(summary["not_generated"]) if source.get("rate") != 0 else "not applicable without a paced schedule"}.</p>')
     origin = min((r['monotonic_s'] for r in resources), default=0)
     roles = sorted(set(r['role'] for r in resources))
-    for field, label, scale, units in [('cpu_percent', 'CPU by process (includes setup)', 1, '%'), ('rss_bytes', 'RSS by process (includes setup)', 1024**2, 'MiB')]:
+    for field, label, scale, units in [('cpu_percent', 'Process CPU (100% = one core; includes setup)', 1, '%'), ('rss_bytes', 'Process memory (RSS; includes setup)', 1024**2, 'MiB')]:
         series = [(role, [(r['monotonic_s']-origin, r[field]/scale) for r in resources if r['role'] == role and r[field] is not None]) for role in roles]
         parts.append(chart(label, series, units))
-    parts.append(chart('Accepted Events per publication second', [('accepted', list(enumerate(summary['eps'])))], 'Events'))
+    parts.append(chart('Accepted Events per second (all agents)', [('All publishers', list(enumerate(summary['eps'])))], 'Events'))
     series = []
     for node, seen in enumerate(m.get('delivered', [])):
         times = sorted(seen[k] for k in m.get('accepted', {}) if k in seen)
         series.append((f'agent-{node}', [(0, 0)] + [(t, i+1) for i, t in enumerate(times)]))
-    parts.append(chart('Confirmed accepted Event delivery progress', series, 'Events'))
-    parts.append('<h2>Delivery completion after publication ends</h2><table><tr><th>Agent</th><th>Delivered</th><th>Pending</th><th>Seconds</th><th>Delivery median (s)</th><th>Delivery p95 (s)</th></tr>')
+    parts.append(chart('Confirmed Event deliveries by agent', series, 'Events'))
+    parts.append('<h2>Delivery of confirmed accepted Events</h2><table><tr><th>Agent</th><th>Observed</th><th>Not yet observed</th><th>Completion after publication (s)</th><th>Latency median (s)</th><th>Latency p95 (s)</th></tr>')
     for row in summary['delivery']:
-        parts.append('<tr>' + ''.join(f'<td>{row[k] if row[k] is not None else "unavailable"}</td>' for k in ['node', 'delivered', 'pending', 'completion_after_publication_s', 'latency_median_s', 'latency_p95_s']) + '</tr>')
-    parts.append('</table><p>Delivery latency runs from publication send invocation to first consumer observation, including polling delay. Partial-run percentiles include only observed confirmed IDs. Pending at timeout is an incomplete observation, not proof of loss. Zero accepted Events has no delivery completion time.</p>')
+        parts.append('<tr>' + ''.join(f'<td>{display(row[k])}</td>' for k in ['node', 'delivered', 'pending', 'completion_after_publication_s', 'latency_median_s', 'latency_p95_s']) + '</tr>')
+    parts.append('</table><p>Delivery latency runs from send start to first consumer observation, including polling delay. Percentiles use observed confirmed IDs only. Completion measures time after publication ends until the agent has observed all confirmed IDs, with a minimum of zero. No accepted Events means no completion time. Resource charts start at the first sample; publication and delivery charts start at publication. Unavailable means no measurement; JSON and CSV retain full precision.</p>')
     (root / 'report.html').write_text(''.join(parts))
-    lines = ['| Status | Accepted within | Accepted later | Rejected | Unresolved | Unsent |', '|---|---:|---:|---:|---:|---:|', '| ' + ' | '.join(str(summary[k]) for k in ['status', 'accepted_within', 'accepted_after', 'rejected', 'unresolved', 'unsent']) + ' |']
+    lines = ['| Status | Accepted during publication | Accepted after publication | Capacity rejected | Outcome unknown | Not sent |', '|---|---:|---:|---:|---:|---:|', '| ' + status + ' | ' + ' | '.join(display(summary[k]) for k in ['accepted_within', 'accepted_after', 'rejected', 'unresolved', 'unsent']) + ' |', '', 'Counts combine all publishers. Outcome unknown: send started without a confirmed outcome. Not sent: generated intent with no send start. Incomplete does not establish Event loss. See report.html for rates, latency and delivery progress.']
     (root / 'summary.md').write_text('\n'.join(lines) + '\n')
     return summary
 

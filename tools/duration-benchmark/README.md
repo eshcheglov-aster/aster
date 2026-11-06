@@ -1,9 +1,9 @@
-# Native duration benchmark
+# Event publication and delivery benchmark
 
-Run unchanged Aster agents on loopback, publish Events through the existing
-`AsterApplicationServiceClient::publish_numbered_events` stream, and verify each
-confirmed Event's ID and complete payload on every agent. This is an observational
-benchmark: failing to sustain the offered rate does not fail the run.
+Run Aster agents on loopback, publish Events through
+`AsterApplicationServiceClient::publish_numbered_events`, and check each confirmed
+Event's ID and full payload on every agent, including its publisher. Each agent
+publishes at the configured rate. Missing that rate does not fail the run.
 
 ## Build and run
 
@@ -22,140 +22,149 @@ python3 tools/duration-benchmark/controller.py \
   --agents 5 --duration-seconds 60 --events-per-second 10
 ```
 
-The output directory must not exist. Keep it outside the checkout. These commands
-produce release measurements. Earlier debug runs are correctness evidence only. The nested crate
-matches the repository's size-optimized release settings. Do not mix debug and
-release measurements.
+Choose a new output directory outside the checkout. These commands build release
+binaries with the repository's size-optimized settings. Compare release results
+with release results; debug runs check correctness, not release performance.
 
-The controller calls the existing `aster playground-init` for distinct participant
-identities and mission bundles. It then prepares each unchanged acceptance fixture,
-installs those test credentials, and configures a loopback full mesh. It does not
-implement signing or change host networking. These unprotected synthetic fixtures
-are not a production credential provider.
-
-Options:
+The controller uses `aster playground-init` to create participant identities and
+mission bundles. It installs those test credentials in each acceptance fixture
+and connects every agent to every other agent over loopback. It uses the existing
+signing implementation and leaves host networking unchanged. These fixtures use
+unprotected test credentials; do not use them in production.
 
 | Option | Default | Meaning |
 |---|---:|---|
 | `--agents` | 2 | Total agents, 2–16 |
-| `--duration-seconds` | 60 | Publication interval, 0.01–600 seconds |
-| `--events-per-second` | 10 | Offered rate **per agent**; `max` or `0` removes pacing |
-| `--window` | 8 | Per-agent send-through-result-ack credit bound, configurable 1–8 |
-| `--overall-seconds` | 1800 | Publication start through settlement and delivery, greater than duration, at most 86400 seconds |
-| `--payload-bytes` | 256 | Deterministic complete Event payload, 8–1024 bytes |
-| `--max-attempts` | 100000 | Per-agent bound on generated intents and retained Event measurements, 1–100000 |
+| `--duration-seconds` | 60 | Publication duration, 0.01–600 seconds |
+| `--events-per-second` | 10 | Events/second **per agent**, 0–100000; `max` or `0` sends without pacing |
+| `--window` | 8 | In-flight publications per agent, 1–8; each holds a slot through result acknowledgement |
+| `--overall-seconds` | 1800 | Timeout from publication start through settlement and delivery, greater than duration and at most 86400 seconds |
+| `--payload-bytes` | 256 | Full Event payload size, 8–1024 bytes |
+| `--max-attempts` | 100000 | Publication attempt limit per agent, 1–100000; also bounds retained measurements |
 
-The overall clock excludes builds, provisioning and initial session/subscription
-setup. Setup has a separate 120-second bound. Reaching the attempt bound before
-all scheduled work produces an incomplete measurement; already accepted Events
-still drain. Max mode has this same explicit bound.
+The overall timeout excludes builds, provisioning and initial session/subscription
+setup. The generator allows 120 seconds for that setup. Reaching the attempt limit
+before completing the offered schedule produces an incomplete measurement; the
+generator still waits for accepted Events. The same attempt limit applies without
+pacing.
 
-The old implementation offered a TOTAL rate from agent 0: 60 seconds at 20/s
-meant 1200 scheduled positions, not 1200 per agent. The corrected workload offers
-10/s independently from each of five agents: 600 each, 3000 total, 50/s aggregate.
-Every accepted Event must be observed on every agent, including its publisher.
-Payload identities include the publisher; operation sequences remain contiguous
-and local to each fresh publication session. All latency timestamps share the
-Rust generator's monotonic origin; they do not subtract independent process clocks.
+The example offers 10 Events/second from each of five agents for 60 seconds:
+600 attempts per agent, 3000 total, at 50 Events/second in aggregate. Each payload
+identifies its publisher. Each fresh publication session starts its own contiguous
+operation sequence. All publication and delivery timestamps use the Rust
+generator's monotonic clock.
 
-## Stream and durability boundaries
+## Publication contract and timeouts
 
-* Each agent publishes through one retained native HTTP/2 gRPC publication stream.
-  Each agent has a persistent authenticated generated client. Bearer headers go
-  on each HTTP request, including the publication stream and acknowledgement
-  requests; a publication session is not transport authentication.
-* Fresh fixtures must return an empty initial `BeginEventPublicationSession`
-  snapshot. The generator validates session, frontier and revision, then calls
-  `CompleteEventPublicationRecovery` before any mutations. It does not reconnect,
-  reclaim sessions, or retry uncertain publications.
-* The default application window is eight per agent. The existing generated
-  client's `into_split()` allows paced sends and ordered receipt handling to run
-  concurrently. Separate result-ack RPCs also run concurrently. Each frame owns
-  one credit until its verified, synchronized receipt is acknowledged. Returning
-  one credit immediately permits the next due frame; there is no batch barrier.
-  This bounds both unreceived frames and unacknowledged results together. It is a
-  benchmark admission choice, not a negotiated wire credit or pre-auth limit.
-* The existing server buffers eight publication operations
-  (`crates/aster-agent/src/event_service.rs::PUBLISH_EVENTS_WINDOW`). Its message
-  ceiling is 1 MiB and its maximum requested RPC deadline is 900 seconds. The
-  generated clients request `min(overall, 900)` seconds. The durable Store permits
-  4096 outstanding results per client. None of these numbers comes from the
-  pre-authentication connection limit. These are baseline API limits, not limits
-  introduced by this tool. The 900-second limit applies to each RPC, including
-  the retained publication stream: it can expire before the default 1800-second
-  overall deadline if publication or settlement stalls. A longer overall timeout
-  does not extend that stream. The generator stops without reconnecting or replaying
-  uncertain work and records `incomplete` with a stage error such as
-  `publication_receive` or `publication_send` in `measurement.json`. These stage
-  errors do not distinguish a server deadline from other transport failures;
+* Each agent uses one authenticated generated client and one retained HTTP/2 gRPC
+  publication stream. The client sends bearer headers on each HTTP request,
+  including the stream and acknowledgement requests. A publication session does
+  not replace transport authentication.
+* Each fresh fixture must return an empty `BeginEventPublicationSession` snapshot.
+  The generator checks the session, frontier and revision, then calls
+  `CompleteEventPublicationRecovery` before changing data. It does not reconnect,
+  reclaim sessions or retry publications with unknown outcomes.
+* Each agent can have up to `--window` publications in flight. The generated
+  client's `into_split()` separates paced sends from ordered response handling;
+  result-acknowledgement RPCs run alongside them. A publication holds one slot
+  until the generator verifies and synchronizes its receipt and acknowledges the
+  result. Releasing one slot permits the next due send without waiting for the
+  rest of the window. This benchmark limit covers both pending responses and
+  pending result acknowledgements; it is not a negotiated protocol limit.
+* The public API buffers eight publication operations
+  (`crates/aster-agent/src/event_service.rs::PUBLISH_EVENTS_WINDOW`), permits
+  messages up to 1 MiB, and caps each requested RPC deadline at **900 seconds**.
+  The generated clients request `min(overall, 900)` seconds. The durable Store
+  permits 4096 outstanding results per client. These API limits are independent
+  of the benchmark window and pre-authentication connection limits.
+* The 900-second RPC limit also applies to the retained publication stream. That
+  stream can expire before the default 1800-second overall timeout if publication
+  or settlement stalls. Raising the overall timeout does not extend the stream.
+  The generator stops and records `incomplete` with an error such as
+  `publication_receive` or `publication_send`. Those codes identify the failed
+  stage, not whether a server deadline or another transport failure caused it.
   `overall_timeout` means the generator's own deadline expired.
-* Before sending, the generator writes and synchronizes an intent containing the
-  original sequence and deterministic payload parameters. It records and
-  synchronizes the accepted ID before acknowledging the publication result.
-  Consumers compare all payload bytes, retain first-observation timestamps, and
-  synchronize delivery records before `AcknowledgeEvent`. New journal directory
-  entries are synchronized too. These are benchmark evidence journals, not a
-  restart/recovery SDK; this benchmark does not qualify physical power-loss
-  recovery.
-* Only structured publication `ResourceExhaustion` and
-  `OperationCapacityExhausted` outcomes count as capacity rejections. The
-  generator records and abandons that rejected sequence, then stops with explicit
-  `capacity_rejection_pipeline_stopped` partial evidence. A rejection leaves the
-  Store frontier unchanged: later already-sent sequences may be gaps. This tool
-  does not silently replay them or claim their outcomes. Other application,
-  transport, framing, authentication, content and acknowledgement failures stop
-  the measurement and retain partial statistics.
+* Before sending, the generator writes and synchronizes an intent with the
+  sequence and deterministic payload parameters. It records and synchronizes each
+  accepted ID before acknowledging the publication result. Consumers check all
+  payload bytes, keep first-observation timestamps, and synchronize delivery
+  records before `AcknowledgeEvent`. The generator also synchronizes new journal
+  directory entries. These journals retain benchmark evidence; the benchmark
+  does not test restart or physical power-loss recovery.
+* Only `ResourceExhaustion` and `OperationCapacityExhausted` publication outcomes
+  count as capacity rejections. The generator records and abandons the rejected
+  sequence, then stops with `capacity_rejection_pipeline_stopped`. Rejection
+  leaves the Store frontier unchanged, so later sends may leave sequence gaps.
+  The generator does not replay them or assume their outcomes. Other application,
+  transport, framing, authentication, payload and acknowledgement errors also
+  stop the run and retain partial measurements.
 
-Pacing uses the original absolute deadline `start + index / rate`, with no minimum
-interval after an actual send and no lag failure threshold. Slow calls can delay
-later deadlines. No new send begins after the publication cutoff; an already
-started send may complete later. After the interval, the generator settles its
-in-flight operations and waits for **all confirmed accepted IDs on every agent**.
-There is no separate short delivery cutoff. The overall timeout returns incomplete
-progress, not a claim of Event loss.
+Pacing uses `start + index / rate`. Slow sends can delay later sends; the generator
+does not add a minimum interval after a send or fail on schedule lag. It starts
+no new sends at or after the publication cutoff. A send in progress may finish
+later. After publication ends, it waits for in-flight results and for every agent
+to observe all confirmed accepted IDs, up to the overall timeout.
 
 ## Reports
 
-Open `report.html` without a web server or Internet access. It contains offline SVG
-charts for per-process CPU, RSS, accepted Events in each publication second, and
-confirmed delivery progress. Resource charts use their own sample origin and
-include generator setup. Publication/delivery charts use publication start.
-Resources come from `/proc/PID/stat` once per second and at process completion,
-independently of RPCs. CPU deltas require the same PID and start ticks; 100% means
-one core. Agent processes and the Rust generator appear separately. Missing final
-process samples stay null. The Python controller is not included in generator CPU.
+Open `report.html` offline. It contains SVG charts for per-process CPU and memory
+(RSS), aggregate accepted Events in each publication second, and delivery progress
+per agent. Resource charts start at the first sample and include generator setup.
+Publication and delivery charts start at publication.
 
-* `measurement.json`: publication attempts, accepted IDs, delivery observations,
-  errors and configuration without credential paths or values.
-* `publication-*.jsonl`, `delivery-*.jsonl`: synchronized non-secret evidence.
-* `resources.jsonl`, `resources.csv`: raw per-process samples.
-* `attempts.csv`, `accepted-eps.csv`, `delivery.csv`, `summary.json`, `summary.md`:
-  numeric data and a short summary suitable for an Actions summary.
-* `provenance.json`, `source-snapshot/`: repository HEAD, binary hashes and the
-  benchmark sources present at launch. Build logs establish which sources produced
-  the supplied executables; the controller cannot infer that from an arbitrary
-  caller-supplied binary.
+The controller samples `/proc/PID/stat` once per second and at process completion,
+without waiting for RPCs. It computes CPU changes only between samples with the
+same PID and process start ticks; **100% CPU means one core**. Agent processes and
+the Rust generator have separate series. Generator CPU excludes the Python
+controller. Missing process samples remain null.
 
-Acceptance uses the half-open interval `[0, duration)`. Accepted responses observed
-later, definite capacity rejections, uncertain sends, and journaled-but-unsent
-intents have separate counts. In paced mode, `not_generated` counts scheduled
-positions across all publishers never instantiated before cutoff. Max mode has no finite offered count.
-`send_started_s` starts immediately before frame construction/submission;
-`send_completed_s` records return from the native stream's send operation, not
-proof of server receipt. Response latency subtracts the former from client-observed
-response time, including local queuing and network/server work. Median and
-nearest-rank p95 use accepted responses, including responses after publication ends.
-Per-agent delivery latency runs from the original publication send invocation to
-first consumer observation, including polling delay. `delivery.csv` retains each
-sample; the summary and HTML contain its median and nearest-rank p95. Partial-run
-percentiles include only observed confirmed IDs, not pending Events.
-Delivery completion is the last first-observation timestamp among confirmed IDs,
-minus publication end, floored at zero. An empty accepted set has no completion
-time. Consumers' first-observation timestamps survive final snapshot collection.
+| File | Contents |
+|---|---|
+| `measurement.json` | Attempts, accepted IDs, delivery observations, errors and configuration; no credential paths or values |
+| `publication-*.jsonl`, `delivery-*.jsonl` | Synchronized evidence journals without secrets |
+| `resources.jsonl`, `resources.csv` | Raw per-process resource samples |
+| `attempts.csv`, `accepted-eps.csv`, `delivery.csv` | Attempt, aggregate acceptance and delivery data |
+| `summary.json`, `summary.md` | Numeric summary and Actions table |
+| `provenance.json`, `source-snapshot/` | Repository HEAD, binary hashes and benchmark sources at launch |
 
-**Do not upload `private/`.** It contains synthetic tokens, provisioning bundles,
-state, configurations and raw process logs. The controller retains this directory
-for diagnosis, stops only its own children, and deletes no fixture directories.
+Build logs link source revisions to binaries. The controller records hashes but
+cannot infer which source produced a caller-supplied executable.
+
+### Counts and latency
+
+Publication counts combine all agents. Accepted responses within `[0, duration)`
+count toward the publication rate; responses at or after the endpoint count as
+accepted after publication. Aggregate rate divides the total accepted during
+publication by its duration, not by agent count.
+
+* **Capacity rejected** (`rejected`): the agent returned a capacity rejection.
+* **Outcome unknown** (`unresolved`): the generator recorded a send start but no
+  confirmed acceptance or capacity rejection. This does not prove server receipt.
+* **Not sent** (`unsent`): the generator created an intent but recorded no send start.
+* **Scheduled attempts not generated** (`not_generated`): in paced mode, scheduled
+  attempts across all publishers with no intent before cutoff. Unpaced mode has no
+  finite scheduled count.
+
+`send_started_s` marks the start of frame construction/submission.
+`send_completed_s` marks return from the stream send operation, not server receipt.
+Publication response latency runs from send start to the client-observed response,
+including local queues, transport and server work. Its median and nearest-rank p95
+include accepted responses after publication ends.
+
+Delivery latency runs from that same send start to the consumer's first
+observation, including polling delay. Each agent's median and nearest-rank p95 use
+only observed confirmed IDs; `delivery.csv` retains each sample. Delivery
+completion measures the time from publication end until the agent has observed
+all confirmed IDs, with a minimum of zero. No accepted Events means no completion
+time. Consumers retain first-observation timestamps through final collection.
+
+**Incomplete** means the run stopped before completing its checks. Events not yet
+observed at timeout are not evidence of loss. The report shows unavailable values
+when it has no measurement; JSON and CSV keep full numeric precision.
+
+**Do not upload `private/`.** It contains test tokens, provisioning bundles, state,
+configurations and raw process logs. The controller keeps it for diagnosis, stops
+only its own child processes, and leaves fixture directories on disk.
 
 ## Tests
 
@@ -164,48 +173,44 @@ mise exec -- cargo test --locked --manifest-path tools/duration-benchmark/Cargo.
 python3 -m unittest discover -s tools/duration-benchmark -v
 ```
 
-Rust tests drive the actual generated client against a local HTTP/2 fixture for
-multiple frames on one stream, per-request authentication, structured rejections
-and abandonment, late acceptance, malformed outcomes, disconnect and timeout.
-They also cover exact-ID convergence, delivery-before-receipt payload checking,
-absolute scheduling and configuration bounds. Python tests cover CPU identity,
-process disappearance, cutoff/empty-window accounting and offline JSON/CSV/SVG
-agreement. Real multi-agent runs remain a separate verification step.
+Rust tests exercise the generated client against a local HTTP/2 fixture: multiple
+frames on one stream, per-request authentication, capacity rejection and
+abandonment, late acceptance, malformed outcomes, disconnects and timeouts. They
+also check exact-ID delivery, payload validation before receipt arrival, absolute
+scheduling and configuration bounds. Python tests check CPU process identity,
+process exit, publication-cutoff counts, empty intervals, and agreement between
+JSON, CSV and SVG output. Real multi-agent runs require separate verification.
 
-This directory is an independent Cargo workspace. SDK, CLI, runtime, protobuf
-and root manifests remain unchanged.
+The benchmark uses an independent Cargo workspace and leaves the production SDK,
+CLI, runtime, protobuf definitions and root manifests unchanged.
 
 ## Manual GitHub Actions run
 
-Select **Diagnostic: manual runtime-volume test**
+Select **Benchmark: Event publication and delivery**
 (`.github/workflows/diagnostic-runtime-volume.yml`) and choose the published ref.
-The six inputs map to the controller options above: agents, publication duration,
-per-agent rate (including `max`), payload bytes, window and overall timeout.
-Defaults match the local controller, including **1800 seconds** overall. CI caps
-that timeout at 3600 seconds and keeps the per-agent attempt bound at 100000.
-It validates inputs before compiling, tests the benchmark, and builds both the
-unchanged acceptance fixture/initializer and the isolated generator in release
-mode with `--locked`. Cargo caches contain only downloads and build outputs.
+The six inputs set agent count, publication duration, per-agent rate (`max` or `0`
+for no pacing), payload bytes, in-flight window and overall timeout. Defaults match
+the local controller, including **1800 seconds** overall. CI caps that timeout at
+3600 seconds and fixes the per-agent attempt limit at 100000.
 
-The workflow runs native Linux processes in a loopback full mesh. The former
-Docker profiles, CPU/memory limits, bandwidth shaping, network impairments and
-outage/recovery scenarios are **not implemented by this controller** and have no
-form inputs. Adding any of them requires a separate scope decision; selecting this
-workflow does not run or qualify those old scenarios.
+The workflow validates inputs, tests the benchmark, then builds the acceptance
+fixture, initializer and generator in release mode with `--locked`. Cargo caches
+contain downloads and build outputs. Agents run as native Linux processes on
+loopback. This workflow does not run the former Docker profiles, resource limits,
+network impairments or outage/recovery scenarios.
 
-CI allows 30 minutes for the release build and 75 minutes for provisioning plus
-execution, with a process-group termination fallback and time for artifact upload.
-A hard timeout can prevent final reports; available logs and partial files remain
-eligible for upload. Normal generator deadlines retain incomplete measurements.
-The Actions summary includes the generated summary when available. An incomplete
-run exits nonzero; missing the offered rate alone does not.
+CI allows 30 minutes for the release build and 75 minutes for provisioning and
+execution, with process-group termination as a fallback and time for artifact
+upload. A hard timeout may prevent final reports. CI uploads available logs and
+partial files; normal generator deadlines retain incomplete measurements. The
+Actions summary shows results when available. Incomplete runs exit nonzero;
+missing the offered rate alone does not.
 
-Artifacts use an explicit file allowlist: JSON measurements/controller status and
-summary, CSV tables, HTML, resource samples, binary/source-hash provenance, and
-workflow build/preflight/controller logs. CI does not upload `private/`, raw agent
-or generator logs, publication/delivery journals, or `source-snapshot/`. The source
-snapshot contains only the benchmark source files listed in `provenance.json`,
-not generated fixture data; the published Git ref supplies those sources in CI.
-Local `*.log` files stay on disk but the nested `.gitignore` excludes them from
-staging. Run `python3 tools/duration-benchmark/test_workflow.py -v` to verify input
-mapping, shell argument boundaries, failure propagation and the upload allowlist.
+CI uploads only the listed JSON, CSV, HTML, resource, provenance and workflow log
+files. It excludes `private/`, raw agent and generator logs, publication/delivery
+journals and `source-snapshot/`. The local source snapshot contains only benchmark
+sources listed in `provenance.json`; the published ref supplies those sources in
+CI. The nested `.gitignore` excludes local `*.log` files from staging.
+
+Run `python3 tools/duration-benchmark/test_workflow.py -v` to check input mapping,
+shell argument boundaries, failure propagation and the upload allowlist.

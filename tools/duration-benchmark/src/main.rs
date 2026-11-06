@@ -205,7 +205,7 @@ async fn main() {
     }
     .await;
     if let Err(code) = result {
-        eprintln!("{code}");
+        eprintln!("Benchmark stopped: {code}");
         std::process::exit(2);
     }
 }

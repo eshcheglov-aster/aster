@@ -19,7 +19,7 @@ class WorkflowTests(unittest.TestCase):
                         PAYLOAD='256', WINDOW='8', OVERALL='1800')
 
     def test_manual_identity_inputs_and_pins(self):
-        self.assertTrue(self.text.startswith('name: "Diagnostic: manual runtime-volume test"\n'))
+        self.assertTrue(self.text.startswith('name: "Benchmark: Event publication and delivery"\n'))
         self.assertIn('on:\n  workflow_dispatch:\n    inputs:', self.text)
         inputs = dict(re.findall(r'^      (\w+):\n.*?        default: \'([^\']+)\'',
                                  self.text, re.M | re.S))
@@ -73,7 +73,7 @@ class WorkflowTests(unittest.TestCase):
                                         'python3', '-u', 'tools/duration-benchmark/controller.py'])
             options = dict(zip(args[6::2], args[7::2]))
             # Exercise the workflow's actual logging pipeline with Actions' Bash flags.
-            block = self.text.split('name: Run native loopback full mesh', 1)[1]
+            block = self.text.split('name: Run publication and delivery benchmark', 1)[1]
             block = block.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0]
             (directory / 'artifacts/duration-benchmark').mkdir(parents=True)
             # Keep the real script path while isolating the log output.
@@ -90,7 +90,7 @@ class WorkflowTests(unittest.TestCase):
                 '--window': '8', '--overall-seconds': '1800'})
 
     def test_upload_exact_allowlist(self):
-        block = self.text.split('name: Retain only public reports and workflow logs', 1)[1]
+        block = self.text.split('name: Upload public reports and workflow logs', 1)[1]
         self.assertIn('if: ${{ always() }}', block)
         paths = block.split('          path: |\n', 1)[1].split('          if-no-files-found:', 1)[0]
         actual = {line.strip() for line in paths.splitlines()}
