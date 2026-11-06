@@ -815,60 +815,17 @@ class ProvenanceTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
-    """Dependency-free checks for the deliberately fixed manual launch."""
+    """Keep the foundation gate connected to the replacement manual workflow."""
 
-    @classmethod
-    def setUpClass(cls):
-        import re
-        cls.workflow = (Path(__file__).resolve().parents[1] /
-                        '.github/workflows/diagnostic-runtime-volume.yml').read_text()
-        cls.scripts = re.findall(r'        run: \|\n((?:          .*\n|\n)+)', cls.workflow)
-        cls.scripts = ['\n'.join(line[10:] for line in block.splitlines())
-                       for block in cls.scripts]
-
-    def test_manual_read_only_pinned_and_always_retained(self):
-        import re
-        text = self.workflow
-        self.assertIn('on:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n', text)
-        self.assertIn('persist-credentials: false', text)
-        self.assertIn('timeout-minutes: 90', text)
-        self.assertIn('if: ${{ always() }}', text)
-        self.assertIn('path: artifacts/path-diagnostic/', text)
-        self.assertIn('retention-days: 14', text)
-        self.assertEqual(len(re.findall(r'uses: [\w/-]+@[0-9a-f]{40} ', text)), 2)
-        for forbidden in ('pull_request:', 'push:', 'inputs:', 'sudo ', '--privileged',
-                          '--network=host', 'docker system prune', 'continue-on-error:'):
-            self.assertNotIn(forbidden, text)
-
-    def test_shell_syntax_and_canonical_build(self):
+    def test_native_workflow_contract(self):
         import subprocess
-        self.assertEqual(len(self.scripts), 3)
-        for script in self.scripts:
-            subprocess.run(['bash', '-n'], input=script, text=True, check=True)
-            self.assertNotIn('${{', script)
-        self.assertIn('--file docker/path-lab/Dockerfile.delivery', self.scripts[1])
-        self.assertIn('--tag aster-path-delivery:local .', self.scripts[1])
-        self.assertIn('timeout --signal=TERM --kill-after=300s 50m', self.scripts[2])
-        self.assertIn('2>&1 | tee artifacts/path-diagnostic/controller.log', self.scripts[2])
-
-    def test_preflight_failure_survives_log_pipeline(self):
-        import subprocess
-        with tempfile.TemporaryDirectory() as directory:
-            # A failing first command must not be hidden by later checks or tee.
-            result = subprocess.run(
-                ['bash', '-e', '-o', 'pipefail', '-c',
-                 'git() { return 23; };\n' + self.scripts[0]],
-                cwd=directory, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 23)
-            self.assertTrue((Path(directory) / 'artifacts/path-diagnostic/preflight.log').is_file())
+        root = Path(__file__).resolve().parents[1]
+        subprocess.run([sys.executable, str(root / 'tools/duration-benchmark/test_workflow.py'), '-v'],
+                       cwd=root, check=True)
 
     def test_launch_arguments_use_actual_cli_defaults(self):
-        import shlex
-        script = self.scripts[2].replace('\\\n', '')
-        argv = shlex.split(script)
-        start = argv.index('tools/aster_path_diagnostic.py')
-        argv = argv[start:argv.index('2>&1')]
-        self.assertEqual(argv[1:], ['--output', 'artifacts/path-diagnostic'])
+        # The legacy Docker controller remains callable, but no longer owns CI.
+        argv = ['tools/aster_path_diagnostic.py', '--output', 'artifacts/path-diagnostic']
         configurations = []
 
         def profile(config, name, row):

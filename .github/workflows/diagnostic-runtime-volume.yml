@@ -2,6 +2,37 @@ name: "Diagnostic: manual runtime-volume test"
 
 on:
   workflow_dispatch:
+    inputs:
+      agents:
+        description: 'Total loopback agents (2–16); each publishes to the full mesh'
+        type: string
+        default: '2'
+        required: true
+      duration_seconds:
+        description: 'Publication duration in seconds (0.01–600)'
+        type: string
+        default: '60'
+        required: true
+      events_per_second:
+        description: 'Offered Events/s per agent (0–100000); max or 0 removes pacing'
+        type: string
+        default: '10'
+        required: true
+      payload_bytes:
+        description: 'Event payload bytes (8–1024)'
+        type: string
+        default: '256'
+        required: true
+      window:
+        description: 'Unacknowledged publications per agent (1–8)'
+        type: string
+        default: '8'
+        required: true
+      overall_seconds:
+        description: 'Publication through delivery timeout, seconds (> duration, max 3600)'
+        type: string
+        default: '1800'
+        required: true
 
 permissions:
   contents: read
@@ -14,7 +45,15 @@ jobs:
   diagnostic:
     name: Runtime-volume diagnostic
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 130
+    env:
+      AGENTS: ${{ inputs.agents }}
+      DURATION: ${{ inputs.duration_seconds }}
+      RATE: ${{ inputs.events_per_second }}
+      PAYLOAD: ${{ inputs.payload_bytes }}
+      WINDOW: ${{ inputs.window }}
+      OVERALL: ${{ inputs.overall_seconds }}
+      CARGO_BUILD_JOBS: '2'
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,45 +62,90 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Validate diagnostic contracts and record environment
+      - name: Validate inputs before building
         run: |
-          mkdir -p artifacts/path-diagnostic
+          mkdir -p artifacts/duration-benchmark
+          printf 'BENCHMARK_OUTPUT=%s/duration-benchmark\nTMPDIR=%s\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          bash tools/duration-benchmark/ci-run.sh validate
+
+      - name: Install repository Rust toolchain
+        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          version: 2026.4.28
+          cache: false
+          install_args: rust
+
+      - name: Cache Cargo downloads and build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tools/duration-benchmark/target
+          key: duration-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', '**/Cargo.lock', '**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            duration-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', '**/Cargo.lock', '**/Cargo.toml') }}-
+
+      - name: Test benchmark and workflow contracts
+        timeout-minutes: 15
+        run: |
           {
-            git rev-parse HEAD &&
-            uname -r &&
-            docker version &&
-            python3 --version &&
-            python3 tools/test_aster_path_diagnostic.py &&
-            python3 tools/test_aster_path_delivery.py
-          } 2>&1 | tee artifacts/path-diagnostic/preflight.log
+            git rev-parse HEAD
+            uname -r
+            rustc --version
+            python3 --version
+            cargo fmt --manifest-path tools/duration-benchmark/Cargo.toml -- --check
+            sh tools/with-test-resources.sh cargo test --locked --manifest-path tools/duration-benchmark/Cargo.toml
+            python3 -m unittest discover -s tools/duration-benchmark -v
+          } 2>&1 | tee artifacts/duration-benchmark/preflight.log
 
-      - name: Build the canonical release image from this checkout
-        # Same digest-pinned Rust toolchain and Debian snapshot as the smoke.
-        # No local-image fallback or TLS verification bypass.
+      - name: Build unchanged release agents and isolated generator
+        timeout-minutes: 30
         run: |
-          timeout --signal=TERM --kill-after=30s 30m \
-            docker build --pull=false --progress=plain \
-              --file docker/path-lab/Dockerfile.delivery \
-              --tag aster-path-delivery:local . \
-            2>&1 | tee artifacts/path-diagnostic/build.log
+          {
+            cargo build --release --locked -p aster-agent \
+              --features client,acceptance-test-provider --bin aster-agent-acceptance-fixture \
+              -p aster-node --bin aster
+            cargo build --release --locked --manifest-path tools/duration-benchmark/Cargo.toml
+          } 2>&1 | tee artifacts/duration-benchmark/build.log
 
-      - name: Run all four default profiles
-        # Controller deadlines and finally blocks own cleanup, including TERM.
-        # Leave time before the job limit for cleanup and artifact upload.
-        # Never upload the private ownership/credential directories in TMPDIR.
-        env:
-          TMPDIR: ${{ runner.temp }}
+      - name: Run native loopback full mesh
+        timeout-minutes: 77
         run: |
-          timeout --signal=TERM --kill-after=300s 50m \
-            python3 -u tools/aster_path_diagnostic.py \
-              --output artifacts/path-diagnostic \
-            2>&1 | tee artifacts/path-diagnostic/controller.log
+          bash tools/duration-benchmark/ci-run.sh run \
+            2>&1 | tee artifacts/duration-benchmark/controller.log
 
-      - name: Retain reports and logs even after failure or timeout
+      - name: Summarize available results
+        if: ${{ always() }}
+        run: |
+          if [[ -f "$BENCHMARK_OUTPUT/summary.md" ]]; then
+            cat "$BENCHMARK_OUTPUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' 'No benchmark summary; inspect the build/controller logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Retain only public reports and workflow logs
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: aster-path-diagnostic-${{ github.sha }}-${{ github.run_attempt }}
-          path: artifacts/path-diagnostic/
-          if-no-files-found: error
+          name: aster-duration-benchmark-${{ github.sha }}-${{ github.run_attempt }}
+          # No recursive output upload: private/ includes tokens, missions, state
+          # and raw process logs. Journals and source-snapshot/ stay local too.
+          path: |
+            artifacts/duration-benchmark/preflight.log
+            artifacts/duration-benchmark/build.log
+            artifacts/duration-benchmark/controller.log
+            ${{ runner.temp }}/duration-benchmark/measurement.json
+            ${{ runner.temp }}/duration-benchmark/controller.json
+            ${{ runner.temp }}/duration-benchmark/summary.json
+            ${{ runner.temp }}/duration-benchmark/summary.md
+            ${{ runner.temp }}/duration-benchmark/report.html
+            ${{ runner.temp }}/duration-benchmark/attempts.csv
+            ${{ runner.temp }}/duration-benchmark/accepted-eps.csv
+            ${{ runner.temp }}/duration-benchmark/delivery.csv
+            ${{ runner.temp }}/duration-benchmark/resources.jsonl
+            ${{ runner.temp }}/duration-benchmark/resources.csv
+            ${{ runner.temp }}/duration-benchmark/provenance.json
+          if-no-files-found: warn
           retention-days: 14
