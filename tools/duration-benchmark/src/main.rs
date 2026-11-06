@@ -720,6 +720,20 @@ mod tests {
         tokio::task::JoinHandle<()>,
         String,
     ) {
+        rpc_fixture_with_ack_control(mode, None).await
+    }
+
+    type AckRelease = (u64, tokio::sync::oneshot::Sender<()>);
+
+    async fn rpc_fixture_with_ack_control(
+        mode: &'static str,
+        ack_control: Option<tokio::sync::mpsc::UnboundedSender<AckRelease>>,
+    ) -> (
+        Client,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+        String,
+    ) {
         use connectrpc::{
             RequestContext, Response, Router, ServiceStream, bidi_streaming_handler_fn, handler_fn,
         };
@@ -772,9 +786,14 @@ mod tests {
             .route(service, "AcknowledgeEventPublicationResult", handler_fn(move |ctx: RequestContext, req: api::AcknowledgeEventPublicationResultRequest| {
                 assert_eq!(ctx.headers().get("authorization").unwrap(), "Bearer test-token");
                 ack_calls.lock().unwrap().push("ack".into());
+                let ack_control = ack_control.clone();
                 async move {
                     if mode == "ack_error" { return Err(connectrpc::ConnectError::unauthenticated("test")); }
-                    if mode == "ack_delay" { tokio::time::sleep(Duration::from_millis(if req.operation_sequence == 1 {80} else {200})).await; }
+                    if let Some(control) = ack_control {
+                        let (release, held) = tokio::sync::oneshot::channel();
+                        control.send((req.operation_sequence, release)).unwrap();
+                        held.await.unwrap();
+                    }
                     Ok(Response::new(api::AcknowledgeEventPublicationResultResponse::default()))
                 }
             }))
@@ -923,6 +942,21 @@ mod tests {
         }
     }
 
+    // Keep the runtime runnable while driving real socket I/O, so paused Tokio
+    // time cannot auto-advance to the publication cutoff. Wall time is only a
+    // deadlock watchdog, never an assertion about when an acknowledgement wins.
+    async fn drive_io<T>(future: impl std::future::Future<Output = T>, stage: &str) -> T {
+        tokio::pin!(future);
+        let watchdog = std::time::Instant::now();
+        loop {
+            if let std::task::Poll::Ready(value) = futures::poll!(&mut future) {
+                return value;
+            }
+            assert!(watchdog.elapsed() < Duration::from_secs(2), "{stage}");
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn delayed_ack_bounds_window_and_refills_without_batch_barrier() {
         let owned = OwnedDir::new();
@@ -931,9 +965,13 @@ mod tests {
         c.duration_seconds = 0.18;
         c.overall_seconds = 2.0;
         c.rate = 1000.0;
+        c.window = 8;
         let state = Arc::new(Mutex::new(Measurements::new(2)));
-        let (client, _, server, _) = rpc_fixture("ack_delay").await;
-        publish(
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (client, _, server, _) = rpc_fixture_with_ack_control("accepted", Some(ack_tx)).await;
+        tokio::time::pause();
+        let start = Instant::now();
+        let publisher = tokio::spawn(publish(
             0,
             client,
             api::EventClientContext {
@@ -941,23 +979,64 @@ mod tests {
                 ..Default::default()
             },
             c,
-            Instant::now(),
+            start,
             state.clone(),
+        ));
+        // Make the first nine deadlines eligible, but keep the cutoff frozen.
+        tokio::time::advance(Duration::from_millis(8)).await;
+        let mut held = BTreeMap::new();
+        for _ in 0..8 {
+            let (sequence, release) = drive_io(ack_rx.recv(), "initial window must fill")
+                .await
+                .unwrap();
+            assert!(held.insert(sequence, release).is_none());
+        }
+        assert_eq!(
+            held.keys().copied().collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.attempts.len(), 8, "no credit before acknowledgement");
+            assert!(s.attempts.iter().all(|a| !a.result_acknowledged));
+        }
+        // Release a non-leading ack: neither an ordered join nor a batch barrier
+        // may hold up the next send. The other seven responses remain gated.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        held.remove(&4).unwrap().send(()).unwrap();
+        let (sequence, ninth) = drive_io(
+            ack_rx.recv(),
+            "first completed ack must refill without waiting for the other seven",
         )
         .await
         .unwrap();
+        assert_eq!(sequence, 9);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.attempts.len(), 9);
+            assert!(s.attempts[3].result_acknowledged);
+            for &sequence in held.keys() {
+                assert!(!s.attempts[sequence as usize - 1].result_acknowledged);
+            }
+            assert_eq!(
+                s.attempts[8].due_s, 0.008,
+                "refill must retain original monotonic deadline"
+            );
+        }
+        // Close admission before releasing the remaining acknowledgements.
+        // Cross the cutoff by one timer tick so Tokio's millisecond-rounded
+        // sleep/timeout deadlines are ready even when start is fractional.
+        tokio::time::advance(start + Duration::from_millis(181) - Instant::now()).await;
+        for release in held.into_values().chain(std::iter::once(ninth)) {
+            release.send(()).unwrap();
+        }
+        drive_io(publisher, "all admitted publications must settle")
+            .await
+            .unwrap()
+            .unwrap();
         let s = state.lock().unwrap();
-        let starts: Vec<_> = s.attempts.iter().filter_map(|a| a.send_started_s).collect();
-        assert_eq!(starts.iter().filter(|t| **t < 0.08).count(), 8);
-        assert!(
-            starts.len() > 8,
-            "first completed ack must refill without waiting for the other seven"
-        );
-        assert!(starts[8] >= 0.08 && starts[8] < 0.18);
-        assert_eq!(
-            s.attempts[8].due_s, 0.008,
-            "refill must retain original monotonic deadline"
-        );
+        assert_eq!(s.attempts.len(), 9);
+        assert!(s.attempts.iter().all(|a| a.result_acknowledged));
         let mut timeline = Vec::new();
         for a in &s.attempts {
             timeline.push((a.send_started_s.unwrap(), 1i32));
