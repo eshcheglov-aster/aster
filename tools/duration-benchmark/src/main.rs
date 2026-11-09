@@ -28,7 +28,6 @@ struct Endpoint {
 struct Config {
     endpoints: Vec<Endpoint>,
     duration_seconds: f64,
-    overall_seconds: f64,
     rate: f64,
     payload_bytes: usize,
     max_attempts: u64,
@@ -39,9 +38,6 @@ impl Config {
         if !(2..=16).contains(&self.endpoints.len())
             || !self.duration_seconds.is_finite()
             || !(0.01..=600.0).contains(&self.duration_seconds)
-            || !self.overall_seconds.is_finite()
-            || self.overall_seconds <= self.duration_seconds
-            || self.overall_seconds > 86400.0
             || !self.rate.is_finite()
             || !(0.0..=100000.0).contains(&self.rate)
             || !(8..=1024).contains(&self.payload_bytes)
@@ -190,7 +186,7 @@ async fn main() {
     }
 }
 
-async fn connect(endpoint: &Endpoint, timeout: f64) -> Result<Client> {
+async fn connect(endpoint: &Endpoint) -> Result<Client> {
     let token = fs::read_to_string(&endpoint.token_file).map_err(|_| "token_read")?;
     let uri: http::Uri = endpoint.url.parse().map_err(|_| "endpoint_uri")?;
     let connection = Http2Connection::connect_plaintext(uri.clone())
@@ -201,7 +197,7 @@ async fn connect(endpoint: &Endpoint, timeout: f64) -> Result<Client> {
         connection,
         ClientConfig::new(uri)
             .with_protocol(connectrpc::Protocol::Grpc)
-            .with_default_timeout(Duration::from_secs_f64(timeout.min(900.0)))
+            .with_default_timeout(Duration::from_secs(900))
             .with_default_header("authorization", format!("Bearer {}", token.trim())),
     ))
 }
@@ -352,9 +348,6 @@ async fn publish(
                 .ok_or("publication_eof")?
                 .to_owned_message();
             let observed = start.elapsed().as_secs_f64();
-            if observed >= c.overall_seconds {
-                return Err("overall_timeout");
-            }
             match response.outcome.ok_or("publication_missing_outcome")? {
                 api::publish_numbered_events_response::Outcome::Published(p) => {
                     let r = p.result.as_option().ok_or("publication_missing_result")?;
@@ -484,9 +477,6 @@ async fn consume(
         .map_err(|_| "journal_directory_sync")?;
     let mut seen_sequences = BTreeMap::new();
     loop {
-        if start.elapsed().as_secs_f64() >= c.overall_seconds {
-            return Err("overall_timeout");
-        }
         let response = client
             .poll_events(api::PollEventsRequest {
                 client: context.clone().into(),
@@ -499,9 +489,6 @@ async fn consume(
             .map_err(|_| "delivery_poll")?
             .into_owned();
         let observed = start.elapsed().as_secs_f64();
-        if observed >= c.overall_seconds {
-            return Err("overall_timeout");
-        }
         for delivery in response.deliveries {
             let e = delivery.event.as_option().ok_or("delivery_missing_event")?;
             let seq = payload_sequence(
@@ -580,7 +567,7 @@ async fn run(c: Config) -> Result<()> {
     let setup = async {
         let mut clients = vec![];
         for endpoint in &c.endpoints {
-            let client = connect(endpoint, c.overall_seconds).await?;
+            let client = connect(endpoint).await?;
             let context = initialize(&client).await?;
             let sub = client
                 .create_event_subscription(api::CreateEventSubscriptionRequest {
@@ -649,23 +636,16 @@ async fn run(c: Config) -> Result<()> {
             state.clone(),
         ));
     }
-    let deadline = start + Duration::from_secs_f64(c.overall_seconds);
-    loop {
-        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-            Ok(Some(Ok(Ok(())))) => {}
-            Ok(None) => break,
-            failed => {
-                let code = match failed {
-                    Ok(Some(Ok(Err(e)))) => e,
-                    Ok(Some(Err(_))) => "worker_join",
-                    _ => "overall_timeout",
-                };
-                state.lock().unwrap().errors.push(code.into());
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                break;
-            }
-        }
+    while let Some(result) = tasks.join_next().await {
+        let code = match result {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => e,
+            Err(_) => "worker_join",
+        };
+        state.lock().unwrap().errors.push(code.into());
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        break;
     }
     state.lock().unwrap().elapsed_s = start.elapsed().as_secs_f64();
     save(&c, &state)?;
@@ -677,7 +657,7 @@ async fn run(c: Config) -> Result<()> {
 fn save(c: &Config, state: &Arc<Mutex<Measurements>>) -> Result<()> {
     let s = state.lock().unwrap();
     let complete = s.publication_finished && s.complete() && s.errors.is_empty();
-    let report = serde_json::json!({"status":if complete {"completed"} else {"incomplete"},"duration_seconds":c.duration_seconds,"overall_seconds":c.overall_seconds,"rate":c.rate,"payload_bytes":c.payload_bytes,"max_attempts":c.max_attempts,"publisher_nodes":c.endpoints.len(),"rate_scope":"per_agent","offered_total_rate":c.rate * c.endpoints.len() as f64,"application_window":APPLICATION_WINDOW,"server_stream_window":8,"measurements": &*s});
+    let report = serde_json::json!({"status":if complete {"completed"} else {"incomplete"},"duration_seconds":c.duration_seconds,"rate":c.rate,"payload_bytes":c.payload_bytes,"max_attempts":c.max_attempts,"publisher_nodes":c.endpoints.len(),"rate_scope":"per_agent","offered_total_rate":c.rate * c.endpoints.len() as f64,"application_window":APPLICATION_WINDOW,"server_stream_window":8,"measurements": &*s});
     let mut file = File::create(c.output.join("measurement.json")).map_err(|_| "report_open")?;
     serde_json::to_writer_pretty(&mut file, &report).map_err(|_| "report_write")?;
     file.sync_all().map_err(|_| "report_sync")

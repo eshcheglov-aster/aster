@@ -13,9 +13,8 @@ import subprocess
 import time
 
 
-def validate(agents, duration, overall, rate, payload, maximum):
+def validate(agents, duration, rate, payload, maximum):
     if not (2 <= agents <= 16 and math.isfinite(duration) and .01 <= duration <= 600
-            and math.isfinite(overall) and duration < overall <= 86400
             and math.isfinite(rate) and 0 <= rate <= 100000
             and 8 <= payload <= 1024 and 1 <= maximum <= 100000):
         raise ValueError('configuration_bounds')
@@ -101,13 +100,12 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True, help='New output directory outside the checkout')
     parser.add_argument('--agents', type=int, default=2, help='Total agents, 2–16 (default: 2)')
     parser.add_argument('--duration-seconds', type=float, default=60, help='Publication duration, 0.01–600 seconds (default: 60)')
-    parser.add_argument('--overall-seconds', type=float, default=1800, help='Total benchmark timeout in seconds (default: 1800; > duration; max 86400)')
     parser.add_argument('--events-per-second', default='10', help='Events/s per agent (1–100000; max = unlimited; default: 10)')
     parser.add_argument('--payload-bytes', type=int, default=256, help='Event payload size, 8–1024 bytes (default: 256)')
     parser.add_argument('--max-attempts', type=int, default=100000, help='Publication attempt limit per agent, 1–100000 (default: 100000)')
     args = parser.parse_args(argv)
     rate = 0.0 if args.events_per_second == 'max' else float(args.events_per_second)
-    validate(args.agents, args.duration_seconds, args.overall_seconds, rate, args.payload_bytes, args.max_attempts)
+    validate(args.agents, args.duration_seconds, rate, args.payload_bytes, args.max_attempts)
     os.umask(0o077)
     root = args.output.resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -148,7 +146,7 @@ def main(argv=None):
                         raise ValueError('agent_startup_timeout')
                     time.sleep(.1)
         config = dict(endpoints=endpoints, duration_seconds=args.duration_seconds,
-                      overall_seconds=args.overall_seconds, rate=rate, payload_bytes=args.payload_bytes,
+                      rate=rate, payload_bytes=args.payload_bytes,
                       max_attempts=args.max_attempts, output=str(root))
         config_path = private / 'generator.json'
         config_path.write_text(json.dumps(config))
@@ -156,8 +154,6 @@ def main(argv=None):
         generator = subprocess.Popen([str(args.generator.resolve()), str(config_path)], stdout=log, stderr=log)
         processes['generator'] = generator
         next_sample = time.monotonic()
-        # Setup is excluded from the generator's own publication-relative deadline.
-        watchdog = next_sample + 130 + args.overall_seconds
         with open(root / 'resources.jsonl', 'w') as resource:
             while True:
                 for role, process in processes.items():
@@ -169,8 +165,6 @@ def main(argv=None):
                 if generator.poll() is not None:
                     rc = generator.returncode
                     break
-                if time.monotonic() >= watchdog:
-                    raise ValueError('generator_watchdog')
                 next_sample += 1
                 time.sleep(max(0, next_sample - time.monotonic()))
     except (OSError, ValueError, subprocess.SubprocessError) as error:

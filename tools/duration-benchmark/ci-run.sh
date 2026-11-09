@@ -9,11 +9,8 @@ sys.path.insert(0, 'tools/duration-benchmark')
 from controller import validate
 try:
     rate = 0.0 if os.environ['RATE'] == 'max' else float(os.environ['RATE'])
-    overall = float(os.environ['OVERALL'])
-    validate(int(os.environ['AGENTS']), float(os.environ['DURATION']), overall,
+    validate(int(os.environ['AGENTS']), float(os.environ['DURATION']),
              rate, int(os.environ['PAYLOAD']), 100000)
-    if overall > 3600:
-        raise ValueError('ci_bounds')
 except (KeyError, ValueError, OverflowError):
     sys.exit('Invalid input. Check ranges and units in tools/duration-benchmark/README.md')
 PY
@@ -30,9 +27,5 @@ args=(
   --duration-seconds "$DURATION"
   --events-per-second "$RATE"
   --payload-bytes "$PAYLOAD"
-  --overall-seconds "$OVERALL"
 )
-# Bound provisioning as well as execution. TERM targets the entire process group.
-# The generator's own deadline normally leaves time for reports and child cleanup.
-exec timeout --signal=TERM --kill-after=60s 75m \
-  python3 -u tools/duration-benchmark/controller.py "${args[@]}"
+exec python3 -u tools/duration-benchmark/controller.py "${args[@]}"

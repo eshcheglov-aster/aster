@@ -23,11 +23,6 @@ on:
         type: string
         default: '256'
         required: true
-      overall_seconds:
-        description: 'Total benchmark timeout in seconds (default: 1800; > duration; max 3600)'
-        type: string
-        default: '1800'
-        required: true
 
 permissions:
   contents: read
@@ -46,7 +41,6 @@ jobs:
       DURATION: ${{ inputs.duration_seconds }}
       RATE: ${{ inputs.events_per_second }}
       PAYLOAD: ${{ inputs.payload_bytes }}
-      OVERALL: ${{ inputs.overall_seconds }}
       CARGO_BUILD_JOBS: '2'
     steps:
       - name: Check out source
@@ -106,7 +100,6 @@ jobs:
           } 2>&1 | tee artifacts/duration-benchmark/build.log
 
       - name: Run publication and delivery benchmark
-        timeout-minutes: 77
         run: |
           bash tools/duration-benchmark/ci-run.sh run \
             2>&1 | tee artifacts/duration-benchmark/controller.log

@@ -37,12 +37,11 @@ unprotected test credentials; do not use them in production.
 | `--agents` | 2 | Total agents, 2–16 |
 | `--duration-seconds` | 60 | Publication duration, 0.01–600 seconds |
 | `--events-per-second` | 10 | Events/s **per agent**, 1–100000; `max` = unlimited (no pacing). `0` remains a supported alias; positive fractional rates below 1 also remain accepted |
-| `--overall-seconds` | 1800 | Total benchmark timeout in seconds, greater than duration and at most 86400 |
 | `--payload-bytes` | 256 | Full Event payload size, 8–1024 bytes |
 | `--max-attempts` | 100000 | Publication attempt limit per agent, 1–100000; also bounds retained measurements |
 
-The overall timeout excludes builds, provisioning and initial session/subscription
-setup. The generator allows 120 seconds for that setup. Reaching the attempt limit
+There is no benchmark-wide elapsed-time limit. The generator allows 120 seconds
+for initial session/subscription setup. Reaching the attempt limit
 before completing the offered schedule produces an incomplete measurement; the
 generator still waits for accepted Events. The same attempt limit applies without
 pacing.
@@ -73,16 +72,15 @@ generator's monotonic clock.
 * The public API buffers eight publication operations
   (`crates/aster-agent/src/event_service.rs::PUBLISH_EVENTS_WINDOW`), permits
   messages up to 1 MiB, and caps each requested RPC deadline at **900 seconds**.
-  The generated clients request `min(overall, 900)` seconds. The durable Store
+  The generated clients request 900 seconds per RPC. The durable Store
   permits 4096 outstanding results per client. These API limits are independent
   of the benchmark window and pre-authentication connection limits.
 * The 900-second RPC limit also applies to the retained publication stream. That
-  stream can expire before the default 1800-second overall timeout if publication
-  or settlement stalls. Raising the overall timeout does not extend the stream.
+  stream can expire if publication or settlement stalls. Removing the benchmark
+  timeout does not extend this RPC deadline.
   The generator stops and records `incomplete` with an error such as
   `publication_receive` or `publication_send`. Those codes identify the failed
   stage, not whether a server deadline or another transport failure caused it.
-  `overall_timeout` means the generator's own deadline expired.
 * Before sending, the generator writes and synchronizes an intent with the
   sequence and deterministic payload parameters. It records and synchronizes each
   accepted ID before acknowledging the publication result. Consumers check all
@@ -102,7 +100,9 @@ Pacing uses `start + index / rate`. Slow sends can delay later sends; the genera
 does not add a minimum interval after a send or fail on schedule lag. It starts
 no new sends at or after the publication cutoff. A send in progress may finish
 later. After publication ends, it waits for in-flight results and for every agent
-to observe all confirmed accepted IDs, up to the overall timeout.
+to observe all confirmed accepted IDs, without an elapsed-time cutoff. RPC errors
+still stop the run. If delivery never completes locally, interrupt with Ctrl-C;
+cleanup and report generation are best effort.
 
 ## Reports
 
@@ -173,7 +173,7 @@ all confirmed IDs, with a minimum of zero. No accepted Events means no completio
 time. Consumers retain first-observation timestamps through final collection.
 
 **Incomplete** means the run stopped before completing its checks. Events not yet
-observed at timeout are not evidence of loss. The report shows unavailable values
+observed when the run stops are not evidence of loss. The report shows unavailable values
 when it has no measurement; JSON and CSV keep full numeric precision.
 
 **Do not upload `private/`.** It contains test tokens, provisioning bundles, state,
@@ -187,10 +187,9 @@ CLI, runtime, protobuf definitions and root manifests unchanged.
 
 Select **Benchmark: Event publication and delivery**
 (`.github/workflows/diagnostic-runtime-volume.yml`) and choose the published ref.
-The five inputs set agent count, publication duration, per-agent rate (`max` or `0`
-for no pacing), payload bytes and overall timeout. Defaults match
-the local controller, including **1800 seconds** overall. CI caps that timeout at
-3600 seconds and fixes the per-agent attempt limit at 100000.
+The four inputs set agent count, publication duration, per-agent rate (`max` or `0`
+for no pacing), and payload bytes. Defaults match the local controller.
+CI fixes the per-agent attempt limit at 100000.
 
 GitHub lists the workflow name and form from the default branch. Until that branch
 contains this version, dispatch the registered filename against the published ref:
@@ -198,7 +197,7 @@ contains this version, dispatch the registered filename against the published re
 ```sh
 gh workflow run diagnostic-runtime-volume.yml --repo OWNER/REPO --ref REF \
   -f agents=5 -f duration_seconds=60 -f events_per_second=0 \
-  -f payload_bytes=256 -f overall_seconds=1800
+  -f payload_bytes=256
 ```
 
 The workflow validates inputs, checks formatting, then builds the acceptance
@@ -207,12 +206,12 @@ contain downloads and build outputs. Agents run as native Linux processes on
 loopback. This workflow does not run the former Docker profiles, resource limits,
 network impairments or outage/recovery scenarios.
 
-CI allows 30 minutes for the release build and 75 minutes for provisioning and
-execution, with process-group termination as a fallback and time for artifact
-upload. A hard timeout may prevent final reports. CI uploads available logs and
-partial files; normal generator deadlines retain incomplete measurements. The
-Actions summary shows results when available. Incomplete runs exit nonzero;
-missing the offered rate alone does not.
+The CI job has a **130-minute total limit**, including setup, preflight, builds
+and execution. Preflight retains its 15-minute limit and the release build its
+30-minute limit; the benchmark run has no separate step timeout. The summary and
+artifact steps use `always()` to attempt reporting and upload of available files,
+but job timeout or cancellation can prevent final reports and artifact upload.
+Incomplete runs exit nonzero; missing the offered rate alone does not.
 
 CI uploads only the listed JSON, CSV, HTML, resource, provenance and workflow log
 files. It excludes `private/`, raw agent and generator logs, publication/delivery
