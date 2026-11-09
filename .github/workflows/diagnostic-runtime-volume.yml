@@ -125,6 +125,7 @@ jobs:
             artifacts/duration-benchmark/build.log
             artifacts/duration-benchmark/controller.log
             ${{ runner.temp }}/duration-benchmark/measurement.json
+            ${{ runner.temp }}/duration-benchmark/setup-progress.jsonl
             ${{ runner.temp }}/duration-benchmark/controller.json
             ${{ runner.temp }}/duration-benchmark/summary.json
             ${{ runner.temp }}/duration-benchmark/summary.md

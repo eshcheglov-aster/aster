@@ -202,33 +202,79 @@ async fn connect(endpoint: &Endpoint) -> Result<Client> {
     ))
 }
 
-async fn initialize(client: &Client) -> Result<api::EventClientContext> {
-    let client_id = b"duration-benchmark-v1".to_vec();
-    let begin = client
-        .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
-            client_id: client_id.clone(),
-            claim_nonce: b"fresh-duration-benchmark-claim-v1".to_vec(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| "begin_session")?
-        .into_owned();
-    if begin.session != 1
-        || begin.snapshot_revision == 0
-        || begin.allocated_through != 0
-        || !begin.outstanding.is_empty()
-    {
-        return Err("nonfresh_session");
+// Only fixed operation/error labels and the RPC status enum reach this public log.
+async fn setup_step<T>(
+    progress: &Mutex<File>,
+    node: usize,
+    operation: &'static str,
+    work: impl std::future::Future<
+        Output = std::result::Result<T, (&'static str, Option<&'static str>)>,
+    >,
+) -> Result<T> {
+    let start = Instant::now();
+    let record = |status, error_code, rpc_code: Option<&str>| {
+        let row = serde_json::json!({
+            "agent_index": node, "operation": operation, "status": status,
+            "elapsed_s": start.elapsed().as_secs_f64(),
+            "error_code": error_code, "rpc_code": rpc_code,
+        });
+        let mut file = progress.lock().unwrap();
+        serde_json::to_writer(&mut *file, &row).map_err(|_| "setup_progress_write")?;
+        file.write_all(b"\n").map_err(|_| "setup_progress_write")?;
+        file.flush().map_err(|_| "setup_progress_flush")
+    };
+    record("started", None, None)?;
+    match work.await {
+        Ok(value) => {
+            record("completed", None, None)?;
+            Ok(value)
+        }
+        Err((code, rpc_code)) => {
+            // Preserve the operation error even if the diagnostic write fails.
+            let _ = record("error", Some(code), rpc_code);
+            Err(code)
+        }
     }
-    client
-        .complete_event_publication_recovery(api::CompleteEventPublicationRecoveryRequest {
-            client_id: client_id.clone(),
-            session: begin.session,
-            snapshot_revision: begin.snapshot_revision,
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| "complete_initial_recovery")?;
+}
+
+async fn initialize(
+    client: &Client,
+    node: usize,
+    progress: &Mutex<File>,
+) -> Result<api::EventClientContext> {
+    let client_id = b"duration-benchmark-v1".to_vec();
+    let begin = setup_step(progress, node, "BeginSession", async {
+        let begin = client
+            .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
+                client_id: client_id.clone(),
+                claim_nonce: b"fresh-duration-benchmark-claim-v1".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| ("begin_session", Some(e.code.as_str())))?
+            .into_owned();
+        if begin.session != 1
+            || begin.snapshot_revision == 0
+            || begin.allocated_through != 0
+            || !begin.outstanding.is_empty()
+        {
+            return Err(("nonfresh_session", None));
+        }
+        Ok(begin)
+    })
+    .await?;
+    setup_step(progress, node, "CompleteRecovery", async {
+        client
+            .complete_event_publication_recovery(api::CompleteEventPublicationRecoveryRequest {
+                client_id: client_id.clone(),
+                session: begin.session,
+                snapshot_revision: begin.snapshot_revision,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| ("complete_initial_recovery", Some(e.code.as_str())))
+    })
+    .await?;
     Ok(api::EventClientContext {
         client_id,
         session: begin.session,
@@ -565,32 +611,57 @@ fn publication_clock() -> Result<(Instant, f64, f64)> {
 async fn run(c: Config) -> Result<()> {
     let state = Arc::new(Mutex::new(Measurements::new(c.endpoints.len())));
     let setup = async {
-        let mut clients = vec![];
-        for endpoint in &c.endpoints {
-            let client = connect(endpoint).await?;
-            let context = initialize(&client).await?;
-            let sub = client
-                .create_event_subscription(api::CreateEventSubscriptionRequest {
-                    client: context.clone().into(),
-                    operation_key: b"duration-subscription-v1".to_vec(),
-                    topic: TOPIC.into(),
-                    scope: SCOPE.into(),
-                    ..Default::default()
+        let progress = Arc::new(Mutex::new(
+            File::create(c.output.join("setup-progress.jsonl"))
+                .map_err(|_| "setup_progress_open")?,
+        ));
+        let mut tasks = tokio::task::JoinSet::new();
+        // Spawn every endpoint before awaiting results. Each task owns its session.
+        for (node, endpoint) in c.endpoints.iter().cloned().enumerate() {
+            let progress = progress.clone();
+            tasks.spawn(async move {
+                let client = setup_step(&progress, node, "Connect", async {
+                    connect(&endpoint).await.map_err(|code| (code, None))
                 })
-                .await
-                .map_err(|_| "subscription_create")?
+                .await?;
+                let context = initialize(&client, node, &progress).await?;
+                let sub = setup_step(&progress, node, "CreateSubscription", async {
+                    client
+                        .create_event_subscription(api::CreateEventSubscriptionRequest {
+                            client: context.clone().into(),
+                            operation_key: b"duration-subscription-v1".to_vec(),
+                            topic: TOPIC.into(),
+                            scope: SCOPE.into(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|e| ("subscription_create", Some(e.code.as_str())))
+                })
+                .await?
                 .into_owned();
-            clients.push((client, context, sub.subscription_id));
+                Ok::<_, &'static str>((node, (client, context, sub.subscription_id)))
+            });
         }
-        Ok::<_, &'static str>(clients)
-    };
-    let clients = match tokio::time::timeout(Duration::from_secs(120), setup).await {
-        Ok(Ok(c)) => c,
-        other => {
-            let code = match other {
-                Ok(Err(e)) => e,
-                _ => "setup_timeout",
+        let mut clients = vec![None; c.endpoints.len()];
+        while let Some(result) = tasks.join_next().await {
+            let code = match result {
+                Ok(Ok((node, client))) => {
+                    clients[node] = Some(client);
+                    continue;
+                }
+                Ok(Err(code)) => code,
+                Err(_) => "setup_join",
             };
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return Err(code);
+        }
+        // Completion order must not change publisher/delivery agent indices.
+        Ok::<_, &'static str>(clients.into_iter().map(Option::unwrap).collect::<Vec<_>>())
+    };
+    let clients = match setup.await {
+        Ok(clients) => clients,
+        Err(code) => {
             state.lock().unwrap().errors.push(code.into());
             save(&c, &state)?;
             return Err(code);

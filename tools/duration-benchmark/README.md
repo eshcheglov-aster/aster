@@ -40,8 +40,10 @@ unprotected test credentials; do not use them in production.
 | `--payload-bytes` | 256 | Full Event payload size, 8–1024 bytes |
 | `--max-attempts` | 100000 | Publication attempt limit per agent, 1–100000; also bounds retained measurements |
 
-There is no benchmark-wide elapsed-time limit. The generator allows 120 seconds
-for initial session/subscription setup. Reaching the attempt limit
+There is no benchmark-wide elapsed-time limit. The generator connects and sets up
+sessions/subscriptions concurrently across agents, without an aggregate setup
+deadline; individual RPC deadlines remain 900 seconds. Publication starts after
+all agents are ready. Reaching the attempt limit
 before completing the offered schedule produces an incomplete measurement; the
 generator still waits for accepted Events. The same attempt limit applies without
 pacing.
@@ -137,6 +139,7 @@ controller. Missing process samples remain null.
 | `resources.jsonl`, `resources.csv` | Raw per-process resource samples |
 | `attempts.csv`, `accepted-eps.csv`, `delivery.csv` | Attempt, aggregate acceptance and delivery data |
 | `summary.json`, `summary.md` | Numeric summary and Actions table |
+| `setup-progress.jsonl` | Flushed setup steps per agent: operation, started/completed/error, elapsed seconds and safe error/RPC codes; retained on setup failure |
 | `provenance.json`, `source-snapshot/` | Repository HEAD, binary hashes and benchmark sources at launch |
 
 Build logs link source revisions to binaries. The controller records hashes but
