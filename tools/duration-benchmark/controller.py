@@ -105,7 +105,6 @@ def main(argv=None):
     parser.add_argument('--events-per-second', default='10', help='Events/s per agent (1–100000; max = unlimited; default: 10)')
     parser.add_argument('--payload-bytes', type=int, default=256, help='Event payload size, 8–1024 bytes (default: 256)')
     parser.add_argument('--max-attempts', type=int, default=100000, help='Publication attempt limit per agent, 1–100000 (default: 100000)')
-    parser.add_argument('--window', type=int, default=8, choices=range(1, 9), help='In-flight publications per agent, through result acknowledgement (default: 8)')
     args = parser.parse_args(argv)
     rate = 0.0 if args.events_per_second == 'max' else float(args.events_per_second)
     validate(args.agents, args.duration_seconds, args.overall_seconds, rate, args.payload_bytes, args.max_attempts)
@@ -150,7 +149,7 @@ def main(argv=None):
                     time.sleep(.1)
         config = dict(endpoints=endpoints, duration_seconds=args.duration_seconds,
                       overall_seconds=args.overall_seconds, rate=rate, payload_bytes=args.payload_bytes,
-                      max_attempts=args.max_attempts, window=args.window, output=str(root))
+                      max_attempts=args.max_attempts, output=str(root))
         config_path = private / 'generator.json'
         config_path.write_text(json.dumps(config))
         log = open(private / 'generator.log', 'wb'); logs.append(log)

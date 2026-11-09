@@ -12,7 +12,7 @@ try:
     overall = float(os.environ['OVERALL'])
     validate(int(os.environ['AGENTS']), float(os.environ['DURATION']), overall,
              rate, int(os.environ['PAYLOAD']), 100000)
-    if not 1 <= int(os.environ['WINDOW']) <= 8 or overall > 3600:
+    if overall > 3600:
         raise ValueError('ci_bounds')
 except (KeyError, ValueError, OverflowError):
     sys.exit('Invalid input. Check ranges and units in tools/duration-benchmark/README.md')
@@ -30,7 +30,6 @@ args=(
   --duration-seconds "$DURATION"
   --events-per-second "$RATE"
   --payload-bytes "$PAYLOAD"
-  --window "$WINDOW"
   --overall-seconds "$OVERALL"
 )
 # Bound provisioning as well as execution. TERM targets the entire process group.

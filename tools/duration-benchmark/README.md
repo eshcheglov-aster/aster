@@ -37,7 +37,6 @@ unprotected test credentials; do not use them in production.
 | `--agents` | 2 | Total agents, 2–16 |
 | `--duration-seconds` | 60 | Publication duration, 0.01–600 seconds |
 | `--events-per-second` | 10 | Events/s **per agent**, 1–100000; `max` = unlimited (no pacing). `0` remains a supported alias; positive fractional rates below 1 also remain accepted |
-| `--window` | 8 | In-flight publications per agent, 1–8; each holds a slot through result acknowledgement |
 | `--overall-seconds` | 1800 | Total benchmark timeout in seconds, greater than duration and at most 86400 |
 | `--payload-bytes` | 256 | Full Event payload size, 8–1024 bytes |
 | `--max-attempts` | 100000 | Publication attempt limit per agent, 1–100000; also bounds retained measurements |
@@ -64,7 +63,7 @@ generator's monotonic clock.
   The generator checks the session, frontier and revision, then calls
   `CompleteEventPublicationRecovery` before changing data. It does not reconnect,
   reclaim sessions or retry publications with unknown outcomes.
-* Each agent can have up to `--window` publications in flight. The generated
+* Each agent can have up to eight publications in flight. The generated
   client's `into_split()` separates paced sends from ordered response handling;
   result-acknowledgement RPCs run alongside them. A publication holds one slot
   until the generator verifies and synchronizes its receipt and acknowledges the
@@ -188,10 +187,19 @@ CLI, runtime, protobuf definitions and root manifests unchanged.
 
 Select **Benchmark: Event publication and delivery**
 (`.github/workflows/diagnostic-runtime-volume.yml`) and choose the published ref.
-The six inputs set agent count, publication duration, per-agent rate (`max` or `0`
-for no pacing), payload bytes, in-flight window and overall timeout. Defaults match
+The five inputs set agent count, publication duration, per-agent rate (`max` or `0`
+for no pacing), payload bytes and overall timeout. Defaults match
 the local controller, including **1800 seconds** overall. CI caps that timeout at
 3600 seconds and fixes the per-agent attempt limit at 100000.
+
+GitHub lists the workflow name and form from the default branch. Until that branch
+contains this version, dispatch the registered filename against the published ref:
+
+```sh
+gh workflow run diagnostic-runtime-volume.yml --repo OWNER/REPO --ref REF \
+  -f agents=5 -f duration_seconds=60 -f events_per_second=0 \
+  -f payload_bytes=256 -f overall_seconds=1800
+```
 
 The workflow validates inputs, checks formatting, then builds the acceptance
 fixture, initializer and generator in release mode with `--locked`. Cargo caches

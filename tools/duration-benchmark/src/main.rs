@@ -15,6 +15,7 @@ type Client = api::AsterApplicationServiceClient<SharedHttp2Connection>;
 type Result<T> = std::result::Result<T, &'static str>;
 const TOPIC: &str = "mesh.messages";
 const SCOPE: &str = "demo/playground";
+const APPLICATION_WINDOW: usize = 8;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -29,14 +30,9 @@ struct Config {
     duration_seconds: f64,
     overall_seconds: f64,
     rate: f64,
-    #[serde(default = "default_window")]
-    window: usize,
     payload_bytes: usize,
     max_attempts: u64,
     output: PathBuf,
-}
-fn default_window() -> usize {
-    8
 }
 impl Config {
     fn validate(&self) -> Result<()> {
@@ -50,7 +46,6 @@ impl Config {
             || !(0.0..=100000.0).contains(&self.rate)
             || !(8..=1024).contains(&self.payload_bytes)
             || !(1..=100000).contains(&self.max_attempts)
-            || !(1..=8).contains(&self.window)
         {
             return Err("configuration_bounds");
         }
@@ -271,8 +266,8 @@ async fn publish(
         .map_err(|_| "publication_stream_open")?;
     let end = start + Duration::from_secs_f64(c.duration_seconds);
     let (mut send, mut receive) = stream.into_split();
-    let credits = Arc::new(tokio::sync::Semaphore::new(c.window));
-    let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel(c.window);
+    let credits = Arc::new(tokio::sync::Semaphore::new(APPLICATION_WINDOW));
+    let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel(APPLICATION_WINDOW);
     let ledger = Mutex::new(ledger);
     let sender = async {
         for sequence in 1..=c.max_attempts {
@@ -682,7 +677,7 @@ async fn run(c: Config) -> Result<()> {
 fn save(c: &Config, state: &Arc<Mutex<Measurements>>) -> Result<()> {
     let s = state.lock().unwrap();
     let complete = s.publication_finished && s.complete() && s.errors.is_empty();
-    let report = serde_json::json!({"status":if complete {"completed"} else {"incomplete"},"duration_seconds":c.duration_seconds,"overall_seconds":c.overall_seconds,"rate":c.rate,"payload_bytes":c.payload_bytes,"max_attempts":c.max_attempts,"publisher_nodes":c.endpoints.len(),"rate_scope":"per_agent","offered_total_rate":c.rate * c.endpoints.len() as f64,"application_window":c.window,"server_stream_window":8,"measurements": &*s});
+    let report = serde_json::json!({"status":if complete {"completed"} else {"incomplete"},"duration_seconds":c.duration_seconds,"overall_seconds":c.overall_seconds,"rate":c.rate,"payload_bytes":c.payload_bytes,"max_attempts":c.max_attempts,"publisher_nodes":c.endpoints.len(),"rate_scope":"per_agent","offered_total_rate":c.rate * c.endpoints.len() as f64,"application_window":APPLICATION_WINDOW,"server_stream_window":8,"measurements": &*s});
     let mut file = File::create(c.output.join("measurement.json")).map_err(|_| "report_open")?;
     serde_json::to_writer_pretty(&mut file, &report).map_err(|_| "report_write")?;
     file.sync_all().map_err(|_| "report_sync")

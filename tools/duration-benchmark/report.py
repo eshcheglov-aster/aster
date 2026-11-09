@@ -171,8 +171,7 @@ def render(root):
              '<h1>Event publication and delivery benchmark</h1>', f'<p>Status: <b>{status}</b></p>',
              '<p>Each agent publishes to every agent, including itself. Counts below combine all publishers. Incomplete means the run stopped before completing its checks; it does not establish Event loss.</p>',
              f'<p>Agents: {display(source.get("publisher_nodes"))}. Publication duration: {display(source.get("duration_seconds"))} s. '
-             f'Offered rate per agent: {"unpaced" if source.get("rate") == 0 else display(source.get("rate")) + " Events/s"}. '
-             f'In-flight limit per agent: {display(source.get("application_window"))} publications, through result acknowledgement.</p>',
+             f'Offered rate per agent: {"unpaced" if source.get("rate") == 0 else display(source.get("rate")) + " Events/s"}.</p>',
              '<h2>Publication outcomes (all agents)</h2>',
              '<table><tr><th>Accepted during publication</th><th>Accepted after publication</th><th>Capacity rejected</th><th>Outcome unknown</th><th>Not sent</th></tr>',
              '<tr>' + ''.join(f'<td>{display(summary[k])}</td>' for k in ['accepted_within', 'accepted_after', 'rejected', 'unresolved', 'unsent']) + '</tr></table>',

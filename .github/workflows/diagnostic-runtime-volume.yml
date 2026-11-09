@@ -23,11 +23,6 @@ on:
         type: string
         default: '256'
         required: true
-      window:
-        description: 'In-flight publications per agent (1–8), through result acknowledgement'
-        type: string
-        default: '8'
-        required: true
       overall_seconds:
         description: 'Total benchmark timeout in seconds (default: 1800; > duration; max 3600)'
         type: string
@@ -51,7 +46,6 @@ jobs:
       DURATION: ${{ inputs.duration_seconds }}
       RATE: ${{ inputs.events_per_second }}
       PAYLOAD: ${{ inputs.payload_bytes }}
-      WINDOW: ${{ inputs.window }}
       OVERALL: ${{ inputs.overall_seconds }}
       CARGO_BUILD_JOBS: '2'
     steps:
