@@ -100,7 +100,7 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True, help='New output directory outside the checkout')
     parser.add_argument('--agents', type=int, default=2, help='Total agents, 2–16 (default: 2)')
     parser.add_argument('--duration-seconds', type=float, default=60, help='Publication duration, 0.01–600 seconds (default: 60)')
-    parser.add_argument('--events-per-second', default='10', help='Events/s per agent (1–100000; max = unlimited; default: 10)')
+    parser.add_argument('--events-per-second', default='10', help='Events/s per agent (0 = unlimited)')
     parser.add_argument('--payload-bytes', type=int, default=256, help='Event payload size, 8–1024 bytes (default: 256)')
     parser.add_argument('--max-attempts', type=int, default=100000, help='Publication attempt limit per agent, 1–100000 (default: 100000)')
     args = parser.parse_args(argv)

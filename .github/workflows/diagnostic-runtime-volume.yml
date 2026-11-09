@@ -14,7 +14,7 @@ on:
         default: '60'
         required: true
       events_per_second:
-        description: 'Events/s per agent (1–100000; max = unlimited)'
+        description: 'Events/s per agent (0 = unlimited)'
         type: string
         default: '10'
         required: true
