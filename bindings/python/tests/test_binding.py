@@ -4,6 +4,7 @@ import pathlib
 import sys
 import subprocess
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -274,6 +275,34 @@ class BindingTests(unittest.TestCase):
             replacement.write(b"abcd")
             replacement.finish()
         old.close()
+
+    def test_blob_retirement_delivery(self):
+        node = self.open()
+        sub = node.subscribe(DataClass.BLOB, TOPIC, SCOPE, operation_key=b"finite-sub")
+        with sub.poll() as page:
+            for delivery in page.entries: sub.acknowledge(delivery)
+        with node.blob_writer(TOPIC, SCOPE, operation_key=b"finite", total_len=4, ttl_ms=2000) as writer:
+            writer.write(b"life")
+            receipt = writer.finish()
+        with sub.poll() as page:
+            self.assertEqual(page.entries[0].items[0].ttl_ms, 2000)
+            content = page.entries[0]
+            # Retirement supersedes an outstanding delivery, not an acknowledged one.
+        # Bounded maintenance rotates across multiple work classes and yields to
+        # application commands. Allow several complete rotations after expiry.
+        deadline = time.monotonic() + 30
+        while True:
+            with sub.poll() as page:
+                retirements = [d for d in page.entries if d.retirement]
+                if retirements:
+                    self.assertEqual(retirements[0].items[0].blob_id, receipt.blob_id)
+                    self.assertEqual(retirements[0].retirement_reason, 1)
+                    with self.assertRaises(AsterError): sub.acknowledge(content)
+                    sub.acknowledge(retirements[0])
+                    break
+            self.assertLess(time.monotonic(), deadline, "finite Blob retirement was not delivered")
+            time.sleep(0.2)
+        with self.assertRaises(AsterError): node.blob_reader(TOPIC, SCOPE, receipt.blob_id)
 
     def test_open_missing_provisioning_raises_error(self):
         with self.assertRaises(AsterError):
